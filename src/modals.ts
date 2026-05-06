@@ -37,7 +37,7 @@ export class InputModal extends Modal {
       }
       text.onChange((v) => (this.value = v));
       // Focus and handle Enter key
-      setTimeout(() => {
+      activeWindow.setTimeout(() => {
         text.inputEl.focus();
         text.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
           if (e.key === "Enter") {
@@ -107,7 +107,7 @@ export class CreateBoardModal extends Modal {
           this.config.folder = v;
         }
       });
-      setTimeout(() => text.inputEl.focus(), 50);
+      activeWindow.setTimeout(() => text.inputEl.focus(), 50);
     });
 
     // --- Folder ---

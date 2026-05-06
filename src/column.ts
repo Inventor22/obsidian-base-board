@@ -60,7 +60,7 @@ export class ColumnManager {
     setIcon(dragHandle, "grip-vertical");
 
     // Title + inline count badge
-    const titleEl = headerEl.createEl("span", {
+    const titleEl = headerEl.createSpan({
       text: columnName,
       cls: "base-board-column-title",
     });
@@ -69,7 +69,7 @@ export class ColumnManager {
     }
 
     // Count badge sits right after the title, inline
-    const countEl = headerEl.createEl("span", {
+    const countEl = headerEl.createSpan({
       text: String(entries.length),
       cls: "base-board-column-count",
     });
@@ -145,7 +145,7 @@ export class ColumnManager {
   public renderAddColumnButton(boardEl: HTMLElement): void {
     const addBtn = boardEl.createDiv({ cls: "base-board-add-column-btn" });
     setIcon(addBtn.createSpan(), "plus");
-    addBtn.createEl("span", { text: "Add column" });
+    addBtn.createSpan({ text: "Add column" });
     addBtn.addEventListener("click", () => this.promptAddColumn());
   }
 
@@ -180,7 +180,7 @@ export class ColumnManager {
     countEl?: HTMLElement | null,
     addCardBtn?: HTMLElement | null,
   ): void {
-    const input = document.createElement("input");
+    const input = activeDocument.createEl("input");
     input.type = "text";
     input.value = oldName;
     input.className = "base-board-column-title-input";

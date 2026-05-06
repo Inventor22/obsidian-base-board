@@ -107,7 +107,7 @@ export class CardManager {
       dragging = true;
     });
     cardEl.addEventListener("dragend", () => {
-      setTimeout(() => {
+      activeWindow.setTimeout(() => {
         dragging = false;
       }, 0);
     });
@@ -217,7 +217,7 @@ export class CardManager {
     }
 
     const titleEl = cardEl.createDiv({ cls: "base-board-card-title" });
-    titleEl.createEl("span", { text: entry.file?.basename ?? "Untitled" });
+    titleEl.createSpan({ text: entry.file?.basename ?? "Untitled" });
 
     // ---- Edit button (visible on hover) ----
     const editBtn = cardEl.createDiv({ cls: "base-board-card-edit-btn" });
@@ -256,16 +256,16 @@ export class CardManager {
       const display = formatValueForChip(val);
       if (!display) continue;
 
-      const chip = propsEl.createEl("span", {
+      const chip = propsEl.createSpan({
         cls: "base-board-card-chip",
       });
       // getDisplayName respects user-configured renames from the Base config.
       const displayName = this.view.config.getDisplayName(propId);
-      chip.createEl("span", {
+      chip.createSpan({
         text: displayName,
         cls: "base-board-chip-label",
       });
-      chip.createEl("span", {
+      chip.createSpan({
         text: display,
         cls: "base-board-chip-value",
       });
@@ -339,7 +339,7 @@ export class CardManager {
     const titleSpan = titleEl.querySelector("span");
     if (!titleSpan) return;
 
-    const input = document.createElement("input");
+    const input = activeDocument.createEl("input");
     input.type = "text";
     input.value = file.basename;
     input.className = "base-board-card-rename-input";

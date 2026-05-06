@@ -84,7 +84,7 @@ export class TagEditModal extends Modal {
         });
     });
 
-    setTimeout(() => this.inputEl.focus(), 50);
+    activeWindow.setTimeout(() => this.inputEl.focus(), 50);
   }
 
   private renderTags() {

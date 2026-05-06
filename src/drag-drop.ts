@@ -110,14 +110,14 @@ export class DragDropManager {
       // Use the header itself as drag ghost — much smaller and cleaner than the full column
       const headerRect = (headerEl as HTMLElement).getBoundingClientRect();
       e.dataTransfer.setDragImage(
-        headerEl as HTMLElement,
+        headerEl,
         e.clientX - headerRect.left,
         e.clientY - headerRect.top,
       );
 
       requestAnimationFrame(() => {
         // Insert placeholder before hiding so layout doesn't shift
-        this.placeholderEl = document.createElement("div");
+        this.placeholderEl = activeDocument.createDiv();
         this.placeholderEl.className = "base-board-column-placeholder";
         columnEl.parentElement?.insertBefore(this.placeholderEl, columnEl);
         columnEl.addClass("base-board-column--dragging");
@@ -142,7 +142,7 @@ export class DragDropManager {
 
     // Create the drag ghost
     const PAD = 20;
-    const ghostWrapper = document.createElement("div");
+    const ghostWrapper = activeDocument.createDiv();
     ghostWrapper.style.cssText = `
       position: fixed;
       top: -9999px;
@@ -154,7 +154,7 @@ export class DragDropManager {
 
     if (isMultiDrag) {
       // Stacked cards effect: offset shadow cards behind the main card
-      const stackContainer = document.createElement("div");
+      const stackContainer = activeDocument.createDiv();
       stackContainer.style.cssText = `
         position: relative;
         width: ${cardRect.width}px;
@@ -165,14 +165,14 @@ export class DragDropManager {
       const cardBg = compStyles.backgroundColor || "#1e1e2e";
       const borderColor = compStyles.borderColor || "#383850";
       const accentColor =
-        getComputedStyle(document.body).getPropertyValue(
+        getComputedStyle(activeDocument.body).getPropertyValue(
           "--interactive-accent",
         ) || "#7c3aed";
 
       // Shadow layers (bottom-most first) — visible offset behind the main card
       const layerCount = Math.min(dragCount - 1, 2);
       for (let i = layerCount; i >= 1; i--) {
-        const layer = document.createElement("div");
+        const layer = activeDocument.createDiv();
         layer.style.cssText = `
           position: absolute;
           top: ${i * 6}px;
@@ -204,7 +204,7 @@ export class DragDropManager {
       stackContainer.appendChild(ghost);
 
       // Count badge
-      const badge = document.createElement("div");
+      const badge = activeDocument.createDiv();
       badge.textContent = String(dragCount);
       badge.style.cssText = `
         position: absolute;
@@ -239,7 +239,7 @@ export class DragDropManager {
       ghostWrapper.appendChild(ghost);
     }
 
-    document.body.appendChild(ghostWrapper);
+    activeDocument.body.appendChild(ghostWrapper);
     e.dataTransfer.setDragImage(
       ghostWrapper,
       e.clientX - cardRect.left + PAD,
@@ -251,7 +251,7 @@ export class DragDropManager {
       ghostWrapper.remove();
 
       // Collapse the dragged card and insert placeholder
-      this.placeholderEl = document.createElement("div");
+      this.placeholderEl = activeDocument.createDiv();
       this.placeholderEl.className = "base-board-card-placeholder";
       this.placeholderEl.style.height = `${this.draggedCardHeight}px`;
       cardEl.parentElement?.insertBefore(this.placeholderEl, cardEl);
@@ -331,7 +331,7 @@ export class DragDropManager {
     }
 
     if (!this.placeholderEl) {
-      this.placeholderEl = document.createElement("div");
+      this.placeholderEl = activeDocument.createDiv();
       this.placeholderEl.className = "base-board-card-placeholder";
       this.placeholderEl.style.height = `${this.draggedCardHeight}px`;
     }
@@ -353,7 +353,7 @@ export class DragDropManager {
     if (!this.boardEl) return;
 
     if (!this.placeholderEl) {
-      this.placeholderEl = document.createElement("div");
+      this.placeholderEl = activeDocument.createDiv();
       this.placeholderEl.className = "base-board-column-placeholder";
     }
 

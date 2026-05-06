@@ -80,7 +80,7 @@ export class KanbanView extends BasesView implements HoverParent {
 
   onunload(): void {
     this.dragDropManager.destroy();
-    if (this.renderTimer) clearTimeout(this.renderTimer);
+    if (this.renderTimer) activeWindow.clearTimeout(this.renderTimer);
   }
 
   public focus(): void {
@@ -199,8 +199,9 @@ export class KanbanView extends BasesView implements HoverParent {
     }
     if (typeof key === "object" && key !== null && "value" in key) {
       const val = (key as Record<string, unknown>).value;
-      return String(val as { toString(): string });
+      return String(val);
     }
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
     return String(key as { toString(): string });
   }
 
@@ -428,8 +429,8 @@ export class KanbanView extends BasesView implements HoverParent {
 
   /** Debounced render — coalesces multiple calls into one. */
   public scheduleRender(): void {
-    if (this.renderTimer) clearTimeout(this.renderTimer);
-    this.renderTimer = setTimeout(() => {
+    if (this.renderTimer) activeWindow.clearTimeout(this.renderTimer);
+    this.renderTimer = activeWindow.setTimeout(() => {
       this.renderTimer = null;
       this.render();
     }, 50);
