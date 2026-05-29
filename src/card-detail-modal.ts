@@ -1,12 +1,17 @@
 import { App, ButtonComponent, Modal, TFile, WorkspaceLeaf } from "obsidian";
-import { KanbanView } from "./kanban-view";
+
+interface CardDetailView {
+  tags?: {
+    promptEditTags(file: TFile): void;
+  };
+}
 
 export class CardDetailModal extends Modal {
   private file: TFile;
-  private view: KanbanView;
+  private view: CardDetailView | undefined;
   private leaf!: WorkspaceLeaf;
 
-  constructor(app: App, file: TFile, view: KanbanView) {
+  constructor(app: App, file: TFile, view?: CardDetailView) {
     super(app);
     this.file = file;
     this.view = view;
@@ -44,13 +49,14 @@ export class CardDetailModal extends Modal {
         void leaf.openFile(this.file);
       });
 
-    // Edit Tags Button
-    new ButtonComponent(actionsEl)
-      .setButtonText("Edit tags")
-      .setIcon("lucide-tags")
-      .onClick(() => {
-        this.view.tags.promptEditTags(this.file);
-      });
+    if (this.view?.tags) {
+      new ButtonComponent(actionsEl)
+        .setButtonText("Edit tags")
+        .setIcon("lucide-tags")
+        .onClick(() => {
+          this.view?.tags?.promptEditTags(this.file);
+        });
+    }
 
     contentEl.createEl("hr", { cls: "base-board-modal-separator" });
 

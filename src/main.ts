@@ -7,6 +7,7 @@ import {
   TFile,
 } from "obsidian";
 import { KanbanView } from "./kanban-view";
+import { TimelineView } from "./timeline-view";
 import { sanitizeFilename } from "./constants";
 import { CreateBoardModal, BoardConfig } from "./modals";
 
@@ -50,6 +51,14 @@ export default class BaseBoardPlugin extends Plugin {
       factory: (controller: QueryController, containerEl: HTMLElement) =>
         new KanbanView(controller, containerEl, this),
       options: () => KanbanView.getViewOptions(),
+    });
+
+    this.registerBasesView("timeline", {
+      name: "Timeline",
+      icon: "lucide-chart-gantt",
+      factory: (controller: QueryController, containerEl: HTMLElement) =>
+        new TimelineView(controller, containerEl, this),
+      options: () => TimelineView.getViewOptions(),
     });
 
     // -- Command: Create new board --------------------------------------------

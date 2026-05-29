@@ -9,6 +9,8 @@ import {
 import { KanbanView } from "./kanban-view";
 import { InputModal } from "./modals";
 import { NO_VALUE_COLUMN } from "./constants";
+import { ColorPickerModal } from "./tags";
+import { getColumnColor, setColumnColor } from "./status-colors";
 
 export class ColumnManager {
   private view: KanbanView;
@@ -53,6 +55,10 @@ export class ColumnManager {
     // ---- Header ----
     const headerEl = columnEl.createDiv({ cls: "base-board-column-header" });
     headerEl.setAttr("draggable", "true");
+    headerEl.style.setProperty(
+      "--base-board-column-color",
+      getColumnColor(this.view.config, columnName),
+    );
 
     const dragHandle = headerEl.createDiv({
       cls: "base-board-column-drag-handle",
@@ -112,6 +118,23 @@ export class ColumnManager {
                 countEl,
                 addCardHeaderBtn,
               );
+            });
+        });
+
+        menu.addItem((item) => {
+          item
+            .setTitle("Change column color")
+            .setIcon("lucide-palette")
+            .onClick(() => {
+              new ColorPickerModal(
+                this.view.app,
+                columnName,
+                getColumnColor(this.view.config, columnName),
+                (color) => {
+                  setColumnColor(this.view.config, columnName, color);
+                  this.view.scheduleRender();
+                },
+              ).open();
             });
         });
 
