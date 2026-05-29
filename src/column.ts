@@ -10,6 +10,7 @@ import { KanbanView } from "./kanban-view";
 import { InputModal } from "./modals";
 import { NO_VALUE_COLUMN } from "./constants";
 import { ColorPickerModal } from "./tags";
+import { getColumnColor, setColumnColor } from "./status-colors";
 
 export class ColumnManager {
   private view: KanbanView;
@@ -51,16 +52,18 @@ export class ColumnManager {
     columnEl.dataset.columnName = columnName;
     columnEl.dataset.columnIndex = String(columnIndex);
 
-    const columnColor = this.view.getColumnColor(columnName);
-    if (columnColor) {
-      columnEl.style.setProperty("--column-color", columnColor);
-      const accentEl = columnEl.createDiv({ cls: "base-board-column-accent" });
-      accentEl.style.backgroundColor = columnColor;
-    }
+    const columnColor = getColumnColor(this.view.config, columnName);
+    columnEl.style.setProperty("--column-color", columnColor);
+    const accentEl = columnEl.createDiv({ cls: "base-board-column-accent" });
+    accentEl.style.backgroundColor = columnColor;
 
     // ---- Header ----
     const headerEl = columnEl.createDiv({ cls: "base-board-column-header" });
     headerEl.setAttr("draggable", "true");
+    headerEl.style.setProperty(
+      "--base-board-column-color",
+      columnColor,
+    );
 
     const dragHandle = headerEl.createDiv({
       cls: "base-board-column-drag-handle",
@@ -125,7 +128,7 @@ export class ColumnManager {
         menu.addSeparator();
       }
 
-      const currentColor = this.view.getColumnColor(columnName) ?? "";
+      const currentColor = getColumnColor(this.view.config, columnName);
       menu.addItem((item) => {
         item
           .setTitle("Change color")
@@ -136,7 +139,8 @@ export class ColumnManager {
               columnName,
               currentColor,
               (color) => {
-                this.view.setColumnColor(columnName, color);
+                setColumnColor(this.view.config, columnName, color);
+                this.view.scheduleRender();
               },
             ).open();
           });

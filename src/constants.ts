@@ -16,6 +16,12 @@ export const CONFIG_KEY_OPEN_BEHAVIOR = "cardOpenBehavior";
 /** Key used by BasesViewConfig.set/get to persist column colors in the .base file. */
 export const CONFIG_KEY_COLUMN_COLORS = "columnColors";
 
+/** Frontmatter property that controls vertical task order in Timeline. */
+export const TIMELINE_ORDER_PROPERTY = "timeline_order";
+
+/** Key used by BasesViewConfig.set/get to persist the selected Timeline zoom preset. */
+export const CONFIG_KEY_TIMELINE_PRESET = "timelinePreset";
+
 /**
  * Regex matching characters that are invalid in file/folder names.
  * Used when sanitizing user input before creating vault items.
