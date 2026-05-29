@@ -20,6 +20,14 @@ import {
   CONFIG_KEY_COLUMNS,
 } from "./constants";
 
+interface TransitionHistoryEntry {
+  from: string | null;
+  to: string | null;
+  at: string;
+  property: string;
+  source: "baseboard-drag-drop";
+}
+
 // ---------------------------------------------------------------------------
 //  Kanban View
 // ---------------------------------------------------------------------------
@@ -453,6 +461,12 @@ export class KanbanView extends BasesView implements HoverParent {
         return this.app.fileManager.processFrontMatter(
           file,
           (fm: Record<string, unknown>) => {
+            this.appendTransitionHistory(
+              fm,
+              groupByProp,
+              sourceColumn,
+              targetColumnName,
+            );
             if (targetColumnName === NO_VALUE_COLUMN) {
               delete fm[groupByProp];
             } else {
@@ -500,5 +514,39 @@ export class KanbanView extends BasesView implements HoverParent {
       }
     }
     return null;
+  }
+
+  private appendTransitionHistory(
+    fm: Record<string, unknown>,
+    groupByProp: string,
+    sourceColumn: string | null,
+    targetColumnName: string,
+  ): void {
+    const settings = this.plugin.data_.transitionHistory;
+    if (!settings.enabled) return;
+
+    const propertyName = settings.propertyName.trim();
+    if (!propertyName) return;
+
+    const existingHistory = fm[propertyName];
+    const history: unknown[] = [];
+
+    if (Array.isArray(existingHistory)) {
+      for (const item of existingHistory as unknown[]) {
+        history.push(item);
+      }
+    } else if (existingHistory !== undefined && existingHistory !== null) {
+      history.push(existingHistory);
+    }
+
+    const entry: TransitionHistoryEntry = {
+      from: sourceColumn === NO_VALUE_COLUMN ? null : sourceColumn,
+      to: targetColumnName === NO_VALUE_COLUMN ? null : targetColumnName,
+      at: new Date().toISOString(),
+      property: groupByProp,
+      source: "baseboard-drag-drop",
+    };
+
+    fm[propertyName] = [...history, entry];
   }
 }
