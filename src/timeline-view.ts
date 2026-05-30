@@ -11,7 +11,9 @@ import {
 import type BaseBoardPlugin from "./main";
 import {
   CONFIG_KEY_TAG_COLORS,
+  CONFIG_KEY_TIMELINE_LABEL_WIDTH,
   CONFIG_KEY_TIMELINE_PRESET,
+  CONFIG_KEY_TIMELINE_ZOOM_DURATION,
   NO_VALUE_COLUMN,
   TIMELINE_ORDER_PROPERTY,
 } from "./constants";
@@ -20,7 +22,13 @@ import { ColorPickerModal } from "./tags";
 import { getColumnColor } from "./status-colors";
 import { CardDetailModal } from "./card-detail-modal";
 
-type TimelinePreset = "day" | "week" | "month" | "semester" | "year" | "fit";
+type TimelineZoomId = "day" | "week" | "month" | "year";
+
+interface TimelineZoomLevel {
+  id: TimelineZoomId;
+  label: string;
+  durationMs: number;
+}
 
 interface TransitionHistoryRecord {
   from?: unknown;
@@ -55,7 +63,19 @@ interface TimelineTask {
 interface TimelinePool {
   id: string;
   title: string;
-  lanes: TimelineTask[];
+  lanes: TimelineLane[];
+}
+
+interface TimelineLane {
+  task: TimelineTask;
+  depth: number;
+  hasChildren: boolean;
+  segments: TimelineSegment[];
+}
+
+interface TimelineTreeNode {
+  task: TimelineTask;
+  children: TimelineTreeNode[];
 }
 
 interface TimelineRange {
@@ -66,30 +86,70 @@ interface TimelineRange {
 interface TimelineTick {
   at: Date;
   label: string;
+  major: boolean;
 }
 
-const PRESETS: Array<{ id: TimelinePreset; label: string }> = [
-  { id: "day", label: "Day" },
-  { id: "week", label: "Week" },
-  { id: "month", label: "Month" },
-  { id: "semester", label: "Semester" },
-  { id: "year", label: "Year" },
-  { id: "fit", label: "Fit" },
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_MS = 7 * DAY_MS;
+const MONTH_MS = 31 * DAY_MS;
+const YEAR_MS = 365 * DAY_MS;
+
+const ZOOM_LEVELS: TimelineZoomLevel[] = [
+  { id: "day", label: "Day", durationMs: DAY_MS },
+  { id: "week", label: "Week", durationMs: WEEK_MS },
+  { id: "month", label: "Month", durationMs: MONTH_MS },
+  { id: "year", label: "Year", durationMs: YEAR_MS },
 ];
 
-function isTimelinePreset(value: unknown): value is TimelinePreset {
-  return PRESETS.some((preset) => preset.id === value);
-}
-
-const PRESET_DURATIONS: Record<Exclude<TimelinePreset, "fit">, number> = {
-  day: 24 * 60 * 60 * 1000,
-  week: 7 * 24 * 60 * 60 * 1000,
-  month: 30 * 24 * 60 * 60 * 1000,
-  semester: 182 * 24 * 60 * 60 * 1000,
-  year: 365 * 24 * 60 * 60 * 1000,
+const LEGACY_ZOOM_DURATIONS: Record<string, number> = {
+  "1d": DAY_MS,
+  "2d": 2 * DAY_MS,
+  "3d": 3 * DAY_MS,
+  "4d": 4 * DAY_MS,
+  "5d": 5 * DAY_MS,
+  "1w": WEEK_MS,
+  "2w": 2 * WEEK_MS,
+  "3w": 3 * WEEK_MS,
+  "1mo": MONTH_MS,
+  "2mo": 2 * MONTH_MS,
+  "3mo": 3 * MONTH_MS,
+  "4mo": 4 * MONTH_MS,
+  "5mo": 5 * MONTH_MS,
+  "6mo": 6 * MONTH_MS,
+  "1y": YEAR_MS,
+  "2y": 2 * YEAR_MS,
+  "3y": 3 * YEAR_MS,
+  "4y": 4 * YEAR_MS,
+  "5y": 5 * YEAR_MS,
+  "10y": 10 * YEAR_MS,
+  "20y": 20 * YEAR_MS,
+  "40y": 40 * YEAR_MS,
+  day: DAY_MS,
+  week: WEEK_MS,
+  month: MONTH_MS,
+  semester: 6 * MONTH_MS,
+  year: YEAR_MS,
+  fit: MONTH_MS,
 };
 
+function isTimelineZoomId(value: unknown): value is TimelineZoomId {
+  return ZOOM_LEVELS.some((zoomLevel) => zoomLevel.id === value);
+}
+
+function getZoomDuration(id: TimelineZoomId): number {
+  return (
+    ZOOM_LEVELS.find((zoomLevel) => zoomLevel.id === id)?.durationMs ?? MONTH_MS
+  );
+}
+
 const MIN_TIMELINE_WIDTH = 960;
+const DEFAULT_LABEL_WIDTH = 240;
+const MIN_LABEL_WIDTH = 180;
+const MAX_LABEL_WIDTH = 520;
+const TIMELINE_PAST_WINDOWS = 2;
+const TIMELINE_FUTURE_WINDOWS = 2;
+const TIMELINE_TOTAL_WINDOWS =
+  TIMELINE_PAST_WINDOWS + 1 + TIMELINE_FUTURE_WINDOWS;
 const LANE_HEIGHT = 44;
 const POOL_HEADER_HEIGHT = 34;
 const LANE_GAP = 8;
@@ -100,7 +160,10 @@ export class TimelineView extends BasesView {
   containerEl: HTMLElement;
   plugin: BaseBoardPlugin;
   public activeFilters: Set<string> = new Set();
-  private preset: TimelinePreset = "month";
+  private zoomId: TimelineZoomId = "month";
+  private zoomDurationMs = MONTH_MS;
+  private pendingCurrentWindowAlignment = false;
+  private suppressClickAfterPan = false;
   private visibleTasks: TimelineTask[] = [];
 
   constructor(
@@ -112,7 +175,8 @@ export class TimelineView extends BasesView {
     this.scrollEl = scrollEl;
     this.plugin = plugin;
     this.containerEl = scrollEl.createDiv({ cls: "base-board-timeline" });
-    this.preset = this.getSavedPreset();
+    this.zoomDurationMs = this.getSavedZoomDuration();
+    this.zoomId = this.getZoomIdForDuration(this.zoomDurationMs);
   }
 
   static getViewOptions(): never[] {
@@ -128,8 +192,12 @@ export class TimelineView extends BasesView {
   }
 
   public render(): void {
+    const previousScrollLeft = this.getCurrentTimelineScrollLeft();
+    const previousScrollTop = this.getCurrentTimelineScrollTop();
+
     this.containerEl.empty();
-    this.preset = this.getSavedPreset();
+    this.zoomDurationMs = this.getSavedZoomDuration();
+    this.zoomId = this.getZoomIdForDuration(this.zoomDurationMs);
 
     const groupByProp = this.getGroupByProperty();
     if (!groupByProp) {
@@ -156,7 +224,21 @@ export class TimelineView extends BasesView {
 
     const range = this.getTimelineRange(visibleTasks);
     const pools = this.getPools(visibleTasks);
-    this.renderTimeline(pools, range);
+    this.renderTimeline(pools, range, previousScrollLeft, previousScrollTop);
+  }
+
+  private getCurrentTimelineScrollLeft(): number {
+    const timelineEl = this.containerEl.querySelector<HTMLElement>(
+      ".base-board-timeline-viewport",
+    );
+    return timelineEl?.scrollLeft ?? 0;
+  }
+
+  private getCurrentTimelineScrollTop(): number {
+    const timelineEl = this.containerEl.querySelector<HTMLElement>(
+      ".base-board-timeline-viewport",
+    );
+    return timelineEl?.scrollTop ?? 0;
   }
 
   private renderPlaceholder(text: string): void {
@@ -176,39 +258,63 @@ export class TimelineView extends BasesView {
     });
 
     const zoomEl = toolbarEl.createDiv({ cls: "base-board-timeline-zoom" });
-    for (const preset of PRESETS) {
+    for (const zoomLevel of ZOOM_LEVELS) {
       const buttonEl = zoomEl.createEl("button", {
         cls: "base-board-timeline-zoom-btn",
-        text: preset.label,
+        text: zoomLevel.label,
       });
-      if (this.preset === preset.id) buttonEl.addClass("is-active");
+      if (Math.abs(this.zoomDurationMs - zoomLevel.durationMs) < 1000) {
+        buttonEl.addClass("is-active");
+      }
       buttonEl.addEventListener("click", () => {
-        this.setPreset(preset.id);
+        this.setZoomDuration(zoomLevel.durationMs);
       });
     }
 
     this.renderFilterBar(toolbarEl, tasks);
   }
 
-  private renderTimeline(pools: TimelinePool[], range: TimelineRange): void {
+  private renderTimeline(
+    pools: TimelinePool[],
+    range: TimelineRange,
+    previousScrollLeft: number,
+    previousScrollTop: number,
+  ): void {
     const timelineEl = this.containerEl.createDiv({
       cls: "base-board-timeline-viewport",
     });
     timelineEl.addEventListener(
       "wheel",
       (event: WheelEvent) => {
-        if (!event.ctrlKey && !event.metaKey) return;
         event.preventDefault();
-        this.zoomByWheel(event.deltaY);
+        this.zoomByWheel(event);
       },
       { passive: false },
     );
+    timelineEl.addEventListener("mousedown", (event: MouseEvent) => {
+      this.startTimelinePan(event, timelineEl);
+    });
+    timelineEl.addEventListener(
+      "click",
+      (event: MouseEvent) => {
+        if (!this.suppressClickAfterPan) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        this.suppressClickAfterPan = false;
+      },
+      true,
+    );
+
     const contentEl = timelineEl.createDiv({
       cls: "base-board-timeline-content",
     });
+    contentEl.style.setProperty(
+      "--timeline-label-width",
+      `${this.getLabelWidth()}px`,
+    );
     const totalLanes = pools.reduce((sum, pool) => sum + pool.lanes.length, 0);
-    const width = this.getTimelineWidth(range);
-    contentEl.style.width = `${width}px`;
+    const width = this.getTimelineWidth(range, timelineEl);
+    contentEl.style.width = `${this.getLabelWidth() + width}px`;
 
     this.renderRuler(contentEl, range, width);
 
@@ -219,14 +325,27 @@ export class TimelineView extends BasesView {
 
     for (const pool of pools) {
       const poolEl = bodyEl.createDiv({ cls: "base-board-timeline-pool" });
-      poolEl.createDiv({
-        cls: "base-board-timeline-pool-title",
-        text: pool.title,
-      });
-
-      for (const task of pool.lanes) {
-        this.renderLane(poolEl, task, range);
+      if (pool.id !== "tasks") {
+        poolEl.createDiv({
+          cls: "base-board-timeline-pool-title",
+          text: pool.title,
+        });
       }
+
+      for (const lane of pool.lanes) {
+        this.renderLane(poolEl, lane, range);
+      }
+    }
+
+    if (this.pendingCurrentWindowAlignment) {
+      this.pendingCurrentWindowAlignment = false;
+      this.alignViewportToCurrentWindow(timelineEl);
+    } else if (previousScrollLeft > 0 || previousScrollTop > 0) {
+      this.restoreTimelineScroll(
+        timelineEl,
+        previousScrollLeft,
+        previousScrollTop,
+      );
     }
   }
 
@@ -236,13 +355,26 @@ export class TimelineView extends BasesView {
     width: number,
   ): void {
     const rulerEl = contentEl.createDiv({ cls: "base-board-timeline-ruler" });
+    rulerEl.createDiv({
+      cls: "base-board-timeline-ruler-label",
+      text: "Tasks",
+    });
+    const trackEl = rulerEl.createDiv({
+      cls: "base-board-timeline-ruler-track",
+    });
+    trackEl.style.width = `${width}px`;
     const ticks = this.getTicks(range);
 
     for (const tick of ticks) {
       const left = this.getPercent(tick.at, range);
-      const tickEl = rulerEl.createDiv({ cls: "base-board-timeline-tick" });
+      const tickEl = trackEl.createDiv({ cls: "base-board-timeline-tick" });
+      tickEl.addClass(
+        tick.major
+          ? "base-board-timeline-tick--major"
+          : "base-board-timeline-tick--minor",
+      );
       tickEl.style.left = `${left}%`;
-      tickEl.createSpan({ text: tick.label });
+      if (tick.label) tickEl.createSpan({ text: tick.label });
     }
 
     const gridEl = contentEl.createDiv({ cls: "base-board-timeline-grid" });
@@ -250,19 +382,45 @@ export class TimelineView extends BasesView {
     for (const tick of ticks) {
       const left = this.getPercent(tick.at, range);
       const lineEl = gridEl.createDiv({ cls: "base-board-timeline-grid-line" });
+      lineEl.addClass(
+        tick.major
+          ? "base-board-timeline-grid-line--major"
+          : "base-board-timeline-grid-line--minor",
+      );
       lineEl.style.left = `${left}%`;
     }
   }
 
   private renderLane(
     poolEl: HTMLElement,
-    task: TimelineTask,
+    lane: TimelineLane,
     range: TimelineRange,
   ): void {
+    const { task } = lane;
     const laneEl = poolEl.createDiv({ cls: "base-board-timeline-lane" });
-    laneEl.setAttr("draggable", "true");
+    laneEl.style.setProperty("--timeline-depth", String(lane.depth));
+    laneEl.style.setProperty("--timeline-indent", `${lane.depth * 18}px`);
+    if (lane.depth > 0) laneEl.addClass("base-board-timeline-lane--nested");
+    if (lane.hasChildren) {
+      laneEl.addClass("base-board-timeline-lane--parent");
+    }
+    if (lane.depth === 0 && lane.hasChildren) {
+      laneEl.addClass("base-board-timeline-lane--root-parent");
+    }
+    laneEl.setAttr("draggable", "false");
     laneEl.dataset.filePath = task.file.path;
+    laneEl.addEventListener("mousedown", (event: MouseEvent) => {
+      laneEl.setAttr(
+        "draggable",
+        event.ctrlKey || event.metaKey ? "true" : "false",
+      );
+    });
     laneEl.addEventListener("dragstart", (event: DragEvent) => {
+      if (!event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        laneEl.setAttr("draggable", "false");
+        return;
+      }
       event.dataTransfer?.setData(
         "text/base-board-timeline-card",
         task.file.path,
@@ -272,6 +430,7 @@ export class TimelineView extends BasesView {
       laneEl.addClass("base-board-timeline-lane--dragging");
     });
     laneEl.addEventListener("dragend", () => {
+      laneEl.setAttr("draggable", "false");
       laneEl.removeClass("base-board-timeline-lane--dragging");
       this.containerEl
         .querySelectorAll(".base-board-timeline-lane--drag-over")
@@ -298,24 +457,30 @@ export class TimelineView extends BasesView {
     });
 
     const labelEl = laneEl.createDiv({ cls: "base-board-timeline-lane-label" });
+    const resizeHandleEl = labelEl.createDiv({
+      cls: "base-board-timeline-label-resize-handle",
+    });
+    resizeHandleEl.addEventListener("mousedown", (event: MouseEvent) => {
+      this.startLabelResize(event);
+    });
+
+    if (lane.hasChildren && lane.depth > 0) {
+      const markerEl = labelEl.createSpan({
+        cls: "base-board-timeline-tree-marker",
+      });
+      setIcon(markerEl, "lucide-corner-down-right");
+    }
     labelEl.createDiv({
       cls: "base-board-timeline-task-title",
       text: task.title,
     });
-
-    if (task.tags.length > 0) {
-      labelEl.createDiv({
-        cls: "base-board-timeline-task-tags",
-        text: task.tags.map((tag) => `#${tag}`).join(" "),
-      });
-    }
 
     labelEl.addEventListener("click", () => {
       void this.app.workspace.getLeaf(false).openFile(task.file);
     });
 
     const trackEl = laneEl.createDiv({ cls: "base-board-timeline-track" });
-    for (const segment of task.segments) {
+    for (const segment of lane.segments) {
       if (!this.segmentOverlapsRange(segment, range)) continue;
       const start = new Date(
         Math.max(segment.start.getTime(), range.start.getTime()),
@@ -340,7 +505,7 @@ export class TimelineView extends BasesView {
       );
       setTooltip(
         segmentEl,
-        `${task.title}\n${status}\n${segment.start.toLocaleString()} -> ${segment.end.toLocaleString()}`,
+        `${task.title}\n${status}\n${this.formatBusinessElapsed(segment.start, segment.end)}\n${segment.start.toLocaleString()} → ${segment.end.toLocaleString()}`,
       );
       segmentEl.addEventListener("click", () => {
         new CardDetailModal(this.app, task.file).open();
@@ -579,47 +744,112 @@ export class TimelineView extends BasesView {
       }
     }
 
-    const childrenByPoolId = new Map<string, TimelineTask[]>();
-    const parentByPoolId = new Map<string, TimelineTask>();
+    const nodesByPath = new Map<string, TimelineTreeNode>();
+    for (const task of tasks) {
+      nodesByPath.set(task.file.path, { task, children: [] });
+    }
+
     const childPaths = new Set<string>();
 
     for (const task of tasks) {
       if (!task.parentKey) continue;
       const parent = tasksByIdentity.get(task.parentKey);
-      const poolId = parent ? parent.file.path : `external:${task.parentKey}`;
-      if (parent) parentByPoolId.set(poolId, parent);
-      const children = childrenByPoolId.get(poolId) ?? [];
-      children.push(task);
-      childrenByPoolId.set(poolId, children);
+      if (!parent || parent.file.path === task.file.path) continue;
+
+      const parentNode = nodesByPath.get(parent.file.path);
+      const childNode = nodesByPath.get(task.file.path);
+      if (!parentNode || !childNode) continue;
+
+      parentNode.children.push(childNode);
       childPaths.add(task.file.path);
     }
 
-    const pools: TimelinePool[] = [];
-    const parentPoolPaths = new Set<string>();
-    for (const [poolId, children] of childrenByPoolId) {
-      const parent = parentByPoolId.get(poolId);
-      const lanes = parent ? [parent, ...children] : children;
-      if (parent) parentPoolPaths.add(parent.file.path);
-      pools.push({
-        id: poolId,
-        title: parent
-          ? parent.title
-          : `Parent: ${poolId.replace(/^external:/, "")}`,
-        lanes: this.uniqueTasks(lanes),
+    const roots: TimelineTreeNode[] = [];
+    for (const task of tasks) {
+      const node = nodesByPath.get(task.file.path);
+      if (node && !childPaths.has(task.file.path)) roots.push(node);
+    }
+
+    return [
+      {
+        id: "tasks",
+        title: "Tasks",
+        lanes: this.flattenTimelineTree(this.sortTimelineNodes(roots), 0),
+      },
+    ];
+  }
+
+  private sortTimelineNodes(nodes: TimelineTreeNode[]): TimelineTreeNode[] {
+    return nodes
+      .sort((first, second) =>
+        this.compareTimelineTasks(first.task, second.task),
+      )
+      .map((node) => ({
+        task: node.task,
+        children: this.sortTimelineNodes(node.children),
+      }));
+  }
+
+  private flattenTimelineTree(
+    nodes: TimelineTreeNode[],
+    depth: number,
+  ): TimelineLane[] {
+    const lanes: TimelineLane[] = [];
+    for (const node of nodes) {
+      lanes.push({
+        task: node.task,
+        depth,
+        hasChildren: node.children.length > 0,
+        segments:
+          node.children.length > 0
+            ? this.getAggregateSegments(node)
+            : node.task.segments,
       });
+      lanes.push(...this.flattenTimelineTree(node.children, depth + 1));
+    }
+    return lanes;
+  }
+
+  private getAggregateSegments(node: TimelineTreeNode): TimelineSegment[] {
+    const childSegments = this.getDescendantSegments(node);
+    if (childSegments.length === 0) return node.task.segments;
+
+    const startTime = Math.min(
+      ...childSegments.map((segment) => segment.start.getTime()),
+    );
+    const endTime = Math.max(
+      ...childSegments.map((segment) => segment.end.getTime()),
+    );
+    if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) {
+      return node.task.segments;
     }
 
-    const unpooled = tasks.filter(
-      (task) =>
-        !childPaths.has(task.file.path) && !parentPoolPaths.has(task.file.path),
-    );
-    if (unpooled.length > 0) {
-      pools.push({ id: "tasks", title: "Tasks", lanes: unpooled });
-    }
+    return [
+      {
+        status: node.task.currentStatus,
+        start: new Date(startTime),
+        end: new Date(endTime),
+      },
+    ];
+  }
 
-    return pools.sort((first, second) =>
-      first.title.localeCompare(second.title),
-    );
+  private getDescendantSegments(node: TimelineTreeNode): TimelineSegment[] {
+    const segments: TimelineSegment[] = [];
+    for (const child of node.children) {
+      segments.push(...child.task.segments);
+      segments.push(...this.getDescendantSegments(child));
+    }
+    return segments;
+  }
+
+  private compareTimelineTasks(
+    first: TimelineTask,
+    second: TimelineTask,
+  ): number {
+    if (first.timelineOrder !== second.timelineOrder) {
+      return first.timelineOrder - second.timelineOrder;
+    }
+    return first.title.localeCompare(second.title);
   }
 
   private getTaskIdentities(task: TimelineTask): string[] {
@@ -628,17 +858,6 @@ export class TimelineView extends BasesView {
       task.file.basename.toLowerCase(),
       task.title.toLowerCase(),
     ];
-  }
-
-  private uniqueTasks(tasks: TimelineTask[]): TimelineTask[] {
-    const seen = new Set<string>();
-    const unique: TimelineTask[] = [];
-    for (const task of tasks) {
-      if (seen.has(task.file.path)) continue;
-      seen.add(task.file.path);
-      unique.push(task);
-    }
-    return unique;
   }
 
   private async reorderTimelineLane(
@@ -676,107 +895,299 @@ export class TimelineView extends BasesView {
     );
   }
 
-  private zoomByWheel(deltaY: number): void {
-    const presetIds = PRESETS.map((preset) => preset.id);
-    const currentIndex = presetIds.indexOf(this.preset);
-    const nextIndex = Math.max(
-      0,
-      Math.min(presetIds.length - 1, currentIndex + (deltaY > 0 ? 1 : -1)),
-    );
-    const nextPreset = presetIds[nextIndex];
-    if (nextPreset && nextPreset !== this.preset) {
-      this.setPreset(nextPreset);
-    }
+  private zoomByWheel(event: WheelEvent): void {
+    const step = this.getZoomStep(this.zoomDurationMs);
+    const direction = event.deltaY > 0 ? 1 : -1;
+    this.setZoomDuration(this.zoomDurationMs + step * direction);
   }
 
-  private setPreset(preset: TimelinePreset): void {
-    this.preset = preset;
-    this.config?.set(CONFIG_KEY_TIMELINE_PRESET, preset);
+  private setZoomDuration(durationMs: number): void {
+    this.zoomDurationMs = this.clampZoomDuration(durationMs);
+    this.zoomId = this.getZoomIdForDuration(this.zoomDurationMs);
+    this.pendingCurrentWindowAlignment = true;
+    this.config?.set(CONFIG_KEY_TIMELINE_ZOOM_DURATION, this.zoomDurationMs);
+    this.config?.set(CONFIG_KEY_TIMELINE_PRESET, this.zoomId);
     this.render();
   }
 
-  private getSavedPreset(): TimelinePreset {
-    const saved = this.config?.get(CONFIG_KEY_TIMELINE_PRESET);
-    return isTimelinePreset(saved) ? saved : "month";
+  private getSavedZoomDuration(): number {
+    const savedDuration = this.config?.get(CONFIG_KEY_TIMELINE_ZOOM_DURATION);
+    if (typeof savedDuration === "number" && Number.isFinite(savedDuration)) {
+      return this.clampZoomDuration(savedDuration);
+    }
+
+    const savedPreset = this.config?.get(CONFIG_KEY_TIMELINE_PRESET);
+    if (isTimelineZoomId(savedPreset)) {
+      return getZoomDuration(savedPreset);
+    }
+    if (typeof savedPreset === "string" && LEGACY_ZOOM_DURATIONS[savedPreset]) {
+      return this.clampZoomDuration(LEGACY_ZOOM_DURATIONS[savedPreset]);
+    }
+    return MONTH_MS;
+  }
+
+  private getZoomIdForDuration(durationMs: number): TimelineZoomId {
+    const exact = ZOOM_LEVELS.find(
+      (zoomLevel) => Math.abs(zoomLevel.durationMs - durationMs) < 1000,
+    );
+    return exact?.id ?? "month";
+  }
+
+  private clampZoomDuration(durationMs: number): number {
+    return Math.max(DAY_MS, Math.min(40 * YEAR_MS, durationMs));
+  }
+
+  private getZoomStep(durationMs: number): number {
+    if (durationMs < WEEK_MS) return DAY_MS;
+    if (durationMs < MONTH_MS) return WEEK_MS;
+    if (durationMs <= YEAR_MS) return MONTH_MS;
+    return YEAR_MS;
+  }
+
+  private getLabelWidth(): number {
+    const saved = this.config?.get(CONFIG_KEY_TIMELINE_LABEL_WIDTH);
+    return typeof saved === "number"
+      ? this.clampLabelWidth(saved)
+      : DEFAULT_LABEL_WIDTH;
+  }
+
+  private setLabelWidth(width: number): void {
+    const clampedWidth = this.clampLabelWidth(width);
+    this.config?.set(CONFIG_KEY_TIMELINE_LABEL_WIDTH, clampedWidth);
+    this.containerEl
+      .querySelectorAll<HTMLElement>(".base-board-timeline-content")
+      .forEach((contentEl) => {
+        contentEl.style.setProperty(
+          "--timeline-label-width",
+          `${clampedWidth}px`,
+        );
+      });
+  }
+
+  private clampLabelWidth(width: number): number {
+    return Math.max(MIN_LABEL_WIDTH, Math.min(MAX_LABEL_WIDTH, width));
+  }
+
+  private startLabelResize(event: MouseEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const startX = event.clientX;
+    const startWidth = this.getLabelWidth();
+
+    const handlePointerMove = (moveEvent: MouseEvent) => {
+      this.setLabelWidth(startWidth + moveEvent.clientX - startX);
+    };
+    const handlePointerUp = () => {
+      activeDocument.removeEventListener("mousemove", handlePointerMove);
+      activeDocument.removeEventListener("mouseup", handlePointerUp);
+    };
+
+    activeDocument.addEventListener("mousemove", handlePointerMove);
+    activeDocument.addEventListener("mouseup", handlePointerUp);
+  }
+
+  private startTimelinePan(event: MouseEvent, timelineEl: HTMLElement): void {
+    if (event.button !== 0 || event.ctrlKey || event.metaKey) return;
+    if (this.shouldIgnorePanTarget(event.target)) return;
+
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startScrollLeft = timelineEl.scrollLeft;
+    const startScrollTop = timelineEl.scrollTop;
+    let moved = false;
+
+    const handlePointerMove = (moveEvent: MouseEvent) => {
+      const deltaX = moveEvent.clientX - startX;
+      const deltaY = moveEvent.clientY - startY;
+      if (!moved && Math.abs(deltaX) + Math.abs(deltaY) < 4) return;
+
+      moved = true;
+      timelineEl.addClass("base-board-timeline-viewport--panning");
+      timelineEl.scrollLeft = startScrollLeft - deltaX;
+      timelineEl.scrollTop = startScrollTop - deltaY;
+      moveEvent.preventDefault();
+    };
+
+    const handlePointerUp = () => {
+      activeDocument.removeEventListener("mousemove", handlePointerMove);
+      activeDocument.removeEventListener("mouseup", handlePointerUp);
+      timelineEl.removeClass("base-board-timeline-viewport--panning");
+      if (moved) {
+        this.suppressClickAfterPan = true;
+        window.setTimeout(() => {
+          this.suppressClickAfterPan = false;
+        }, 0);
+      }
+    };
+
+    activeDocument.addEventListener("mousemove", handlePointerMove);
+    activeDocument.addEventListener("mouseup", handlePointerUp);
+  }
+
+  private shouldIgnorePanTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    return Boolean(
+      target.closest(
+        "button, input, textarea, select, .base-board-filter-pill, .base-board-filter-clear, .base-board-timeline-label-resize-handle",
+      ),
+    );
+  }
+
+  private restoreTimelineScroll(
+    timelineEl: HTMLElement,
+    scrollLeft: number,
+    scrollTop: number,
+  ): void {
+    window.requestAnimationFrame(() => {
+      timelineEl.scrollLeft = scrollLeft;
+      timelineEl.scrollTop = scrollTop;
+    });
+  }
+
+  private alignViewportToCurrentWindow(timelineEl: HTMLElement): void {
+    window.requestAnimationFrame(() => {
+      const chartWidth = Math.max(
+        0,
+        timelineEl.scrollWidth - this.getLabelWidth(),
+      );
+      const windowWidth = chartWidth / TIMELINE_TOTAL_WINDOWS;
+      timelineEl.scrollLeft = Math.max(0, windowWidth * TIMELINE_PAST_WINDOWS);
+    });
   }
 
   private getTimelineRange(tasks: TimelineTask[]): TimelineRange {
+    return this.getTimelineRangeForDuration(tasks, this.zoomDurationMs);
+  }
+
+  private getTimelineRangeForDuration(
+    tasks: TimelineTask[],
+    durationMs: number,
+  ): TimelineRange {
     const now = new Date();
-    if (this.preset !== "fit") {
-      const duration = PRESET_DURATIONS[this.preset];
-      return { start: new Date(now.getTime() - duration), end: now };
+    const endTime = this.roundTimelineEnd(now, durationMs);
+    return {
+      start: new Date(endTime - durationMs * (TIMELINE_PAST_WINDOWS + 1)),
+      end: new Date(endTime + durationMs * TIMELINE_FUTURE_WINDOWS),
+    };
+  }
+
+  private roundTimelineEnd(date: Date, durationMs: number): number {
+    const rounded = new Date(date);
+    if (durationMs <= 5 * DAY_MS) {
+      rounded.setMinutes(0, 0, 0);
+      if (rounded.getTime() < date.getTime()) {
+        rounded.setHours(rounded.getHours() + 1);
+      }
+      return rounded.getTime();
     }
 
+    if (durationMs <= 3 * 31 * DAY_MS) {
+      rounded.setHours(0, 0, 0, 0);
+      if (rounded.getTime() < date.getTime()) {
+        rounded.setDate(rounded.getDate() + 1);
+      }
+      return rounded.getTime();
+    }
+
+    rounded.setDate(1);
+    rounded.setHours(0, 0, 0, 0);
+    if (rounded.getTime() < date.getTime()) {
+      rounded.setMonth(rounded.getMonth() + 1);
+    }
+    return rounded.getTime();
+  }
+
+  private getSegmentTimes(tasks: TimelineTask[]): number[] {
     const times: number[] = [];
     for (const task of tasks) {
       for (const segment of task.segments) {
         times.push(segment.start.getTime(), segment.end.getTime());
       }
     }
-    const minTime = Math.min(...times);
-    const maxTime = Math.max(...times, now.getTime());
-    const padding = Math.max((maxTime - minTime) * 0.05, 60 * 60 * 1000);
-    return {
-      start: new Date(minTime - padding),
-      end: new Date(maxTime + padding),
-    };
+    return times.length > 0 ? times : [Date.now()];
   }
 
-  private getTimelineWidth(range: TimelineRange): number {
-    const hours = Math.max(
-      (range.end.getTime() - range.start.getTime()) / (60 * 60 * 1000),
-      1,
+  private getTimelineWidth(
+    range: TimelineRange,
+    timelineEl: HTMLElement,
+  ): number {
+    const chartWidth = Math.max(
+      MIN_TIMELINE_WIDTH,
+      timelineEl.clientWidth - this.getLabelWidth(),
     );
-    if (this.preset === "day") return Math.max(MIN_TIMELINE_WIDTH, hours * 72);
-    if (this.preset === "week") return Math.max(MIN_TIMELINE_WIDTH, hours * 14);
-    if (this.preset === "month") return Math.max(MIN_TIMELINE_WIDTH, hours * 4);
-    if (this.preset === "semester")
-      return Math.max(MIN_TIMELINE_WIDTH, hours * 1.2);
-    if (this.preset === "year")
-      return Math.max(MIN_TIMELINE_WIDTH, hours * 0.8);
-    return Math.max(MIN_TIMELINE_WIDTH, hours * 3);
+    return chartWidth * TIMELINE_TOTAL_WINDOWS;
   }
 
   private getTicks(range: TimelineRange): TimelineTick[] {
-    if (this.preset === "day") return this.getHourlyTicks(range);
-    if (this.preset === "week" || this.preset === "month") {
-      return this.getDailyTicks(range);
+    if (this.zoomDurationMs <= 2 * DAY_MS) {
+      return this.combineTicks(
+        this.getDailyTicks(range, true),
+        this.getHourIntervalTicks(range, 6),
+      );
     }
-    if (this.preset === "semester") return this.getDayIntervalTicks(range, 14);
-    if (this.preset === "year") return this.getMonthlyTicks(range);
-
-    const duration = range.end.getTime() - range.start.getTime();
-    if (duration <= PRESET_DURATIONS.week) return this.getDailyTicks(range);
-    if (duration <= PRESET_DURATIONS.semester) {
-      return this.getDayIntervalTicks(range, 14);
+    if (this.zoomDurationMs <= 3 * WEEK_MS) {
+      return this.combineTicks(
+        this.getWeeklyTicks(range, true),
+        this.getDailyTicks(range, false),
+      );
     }
-    return this.getMonthlyTicks(range);
+    if (this.zoomDurationMs <= 2 * YEAR_MS) {
+      return this.combineTicks(
+        this.getMonthlyTicks(range, true),
+        this.getWeeklyTicks(range, false, this.zoomDurationMs <= 6 * MONTH_MS),
+      );
+    }
+    return this.combineTicks(
+      this.getYearlyTicks(range, true),
+      this.getMonthlyTicks(range, false),
+    );
   }
 
-  private getHourlyTicks(range: TimelineRange): TimelineTick[] {
+  private combineTicks(
+    majorTicks: TimelineTick[],
+    minorTicks: TimelineTick[],
+  ): TimelineTick[] {
+    const majorTimes = new Set(
+      majorTicks.map((tick) => this.toLocalDateOnly(tick.at).getTime()),
+    );
+    return [
+      ...majorTicks,
+      ...minorTicks.filter(
+        (tick) => !majorTimes.has(this.toLocalDateOnly(tick.at).getTime()),
+      ),
+    ].sort((first, second) => first.at.getTime() - second.at.getTime());
+  }
+
+  private getHourIntervalTicks(
+    range: TimelineRange,
+    hours: number,
+  ): TimelineTick[] {
     const ticks: TimelineTick[] = [];
     const cursor = new Date(range.start);
     cursor.setMinutes(0, 0, 0);
     if (cursor.getTime() < range.start.getTime())
-      cursor.setHours(cursor.getHours() + 1);
+      cursor.setHours(cursor.getHours() + hours);
 
     while (cursor.getTime() <= range.end.getTime()) {
       ticks.push({
         at: new Date(cursor),
-        label: cursor.toLocaleTimeString([], { hour: "numeric" }),
+        label: "",
+        major: false,
       });
-      cursor.setHours(cursor.getHours() + 1);
+      cursor.setHours(cursor.getHours() + hours);
     }
     return ticks;
   }
 
-  private getDailyTicks(range: TimelineRange): TimelineTick[] {
-    return this.getDayIntervalTicks(range, 1);
+  private getDailyTicks(range: TimelineRange, major: boolean): TimelineTick[] {
+    return this.getDayIntervalTicks(range, 1, major);
   }
 
   private getDayIntervalTicks(
     range: TimelineRange,
     days: number,
+    major: boolean,
   ): TimelineTick[] {
     const ticks: TimelineTick[] = [];
     const cursor = new Date(range.start);
@@ -791,13 +1202,49 @@ export class TimelineView extends BasesView {
           month: "short",
           day: "numeric",
         }),
+        major,
       });
       cursor.setDate(cursor.getDate() + days);
     }
     return ticks;
   }
 
-  private getMonthlyTicks(range: TimelineRange): TimelineTick[] {
+  private getWeeklyTicks(
+    range: TimelineRange,
+    major: boolean,
+    showLabel = major,
+  ): TimelineTick[] {
+    const ticks: TimelineTick[] = [];
+    const cursor = this.getWeekStart(range.start);
+    if (cursor.getTime() < range.start.getTime()) {
+      cursor.setDate(cursor.getDate() + 7);
+    }
+
+    while (cursor.getTime() <= range.end.getTime()) {
+      ticks.push({
+        at: new Date(cursor),
+        label: showLabel
+          ? cursor.toLocaleDateString([], { month: "short", day: "numeric" })
+          : "",
+        major,
+      });
+      cursor.setDate(cursor.getDate() + 7);
+    }
+    return ticks;
+  }
+
+  private getWeekStart(date: Date): Date {
+    const weekStartDay = this.plugin.data_.timeline.weekStartDay;
+    const cursor = this.toLocalDateOnly(date);
+    const delta = (cursor.getDay() - weekStartDay + 7) % 7;
+    cursor.setDate(cursor.getDate() - delta);
+    return cursor;
+  }
+
+  private getMonthlyTicks(
+    range: TimelineRange,
+    major: boolean,
+  ): TimelineTick[] {
     const ticks: TimelineTick[] = [];
     const cursor = new Date(range.start);
     cursor.setDate(1);
@@ -812,8 +1259,29 @@ export class TimelineView extends BasesView {
           month: "short",
           year: "numeric",
         }),
+        major,
       });
       cursor.setMonth(cursor.getMonth() + 1);
+    }
+    return ticks;
+  }
+
+  private getYearlyTicks(range: TimelineRange, major: boolean): TimelineTick[] {
+    const ticks: TimelineTick[] = [];
+    const cursor = new Date(range.start);
+    cursor.setMonth(0, 1);
+    cursor.setHours(0, 0, 0, 0);
+    if (cursor.getTime() < range.start.getTime()) {
+      cursor.setFullYear(cursor.getFullYear() + 1);
+    }
+
+    while (cursor.getTime() <= range.end.getTime()) {
+      ticks.push({
+        at: new Date(cursor),
+        label: cursor.toLocaleDateString([], { year: "numeric" }),
+        major,
+      });
+      cursor.setFullYear(cursor.getFullYear() + 1);
     }
     return ticks;
   }
@@ -822,6 +1290,62 @@ export class TimelineView extends BasesView {
     const duration = range.end.getTime() - range.start.getTime();
     if (duration <= 0) return 0;
     return ((date.getTime() - range.start.getTime()) / duration) * 100;
+  }
+
+  private formatBusinessElapsed(start: Date, end: Date): string {
+    const durationMs = Math.max(0, end.getTime() - start.getTime());
+    if (durationMs < 24 * 60 * 60 * 1000) {
+      return this.formatShortElapsed(durationMs);
+    }
+
+    const businessDays = this.countBusinessDaysInclusive(start, end);
+    const weeks = Math.floor(businessDays / 5);
+    const days = businessDays % 5;
+    const parts: string[] = [];
+
+    if (weeks > 0) {
+      parts.push(`${weeks} ${weeks === 1 ? "week" : "weeks"}`);
+    }
+    if (days > 0 || parts.length === 0) {
+      parts.push(`${days} ${days === 1 ? "day" : "days"}`);
+    }
+
+    return `(${parts.join(" ")})`;
+  }
+
+  private formatShortElapsed(durationMs: number): string {
+    const totalMinutes = Math.max(1, Math.round(durationMs / (60 * 1000)));
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    const parts: string[] = [];
+
+    if (hours > 0) {
+      parts.push(`${hours} ${hours === 1 ? "hour" : "hours"}`);
+    }
+    if (minutes > 0 || parts.length === 0) {
+      parts.push(`${minutes} ${minutes === 1 ? "minute" : "minutes"}`);
+    }
+
+    return `(${parts.join(" ")})`;
+  }
+
+  private countBusinessDaysInclusive(start: Date, end: Date): number {
+    const firstDay = this.toLocalDateOnly(start);
+    const lastDay = this.toLocalDateOnly(end);
+    if (lastDay.getTime() < firstDay.getTime()) return 0;
+
+    let businessDays = 0;
+    const cursor = new Date(firstDay);
+    while (cursor.getTime() <= lastDay.getTime()) {
+      const day = cursor.getDay();
+      if (day !== 0 && day !== 6) businessDays++;
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return businessDays;
+  }
+
+  private toLocalDateOnly(date: Date): Date {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate());
   }
 
   private segmentOverlapsRange(
