@@ -19,6 +19,12 @@ export const TIMELINE_ORDER_PROPERTY = "timeline_order";
 /** Key used by BasesViewConfig.set/get to persist the selected Timeline zoom preset. */
 export const CONFIG_KEY_TIMELINE_PRESET = "timelinePreset";
 
+/** Key used by BasesViewConfig.set/get to persist the continuous Timeline zoom duration. */
+export const CONFIG_KEY_TIMELINE_ZOOM_DURATION = "timelineZoomDuration";
+
+/** Key used by BasesViewConfig.set/get to persist Timeline label column width. */
+export const CONFIG_KEY_TIMELINE_LABEL_WIDTH = "timelineLabelWidth";
+
 /**
  * Regex matching characters that are invalid in file/folder names.
  * Used when sanitizing user input before creating vault items.

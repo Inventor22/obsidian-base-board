@@ -857,12 +857,22 @@
   min-height: 0;
   overflow: auto;
   position: relative;
+  cursor: grab;
+  scrollbar-width: none;
+}
+
+.base-board-timeline-viewport::-webkit-scrollbar {
+  display: none;
+}
+
+.base-board-timeline-viewport--panning {
+  cursor: grabbing;
+  user-select: none;
 }
 
 .base-board-timeline-content {
   position: relative;
   min-width: 100%;
-  padding-left: 240px;
   padding-bottom: 20px;
 }
 
@@ -875,16 +885,26 @@
   border-bottom: 1px solid var(--background-modifier-border);
 }
 
-.base-board-timeline-ruler::before {
-  content: "";
+.base-board-timeline-ruler-label {
   position: sticky;
   left: 0;
-  display: block;
-  width: 240px;
+  z-index: 6;
+  box-sizing: border-box;
+  width: var(--timeline-label-width, 240px);
   height: 34px;
-  margin-left: -240px;
+  padding: 8px 12px;
   background-color: var(--background-secondary);
   border-right: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+}
+
+.base-board-timeline-ruler-track {
+  position: absolute;
+  top: 0;
+  left: var(--timeline-label-width, 240px);
+  height: 34px;
 }
 
 .base-board-timeline-tick {
@@ -892,6 +912,23 @@
   top: 0;
   bottom: 0;
   border-left: 1px solid var(--background-modifier-border);
+}
+
+.base-board-timeline-tick--major {
+  border-left-width: 2px;
+  border-left-color: color-mix(
+    in srgb,
+    var(--background-modifier-border) 90%,
+    var(--text-muted)
+  );
+}
+
+.base-board-timeline-tick--minor {
+  border-left-color: color-mix(
+    in srgb,
+    var(--background-modifier-border) 70%,
+    transparent
+  );
 }
 
 .base-board-timeline-tick span {
@@ -907,7 +944,7 @@
   position: absolute;
   top: 34px;
   bottom: 20px;
-  left: 240px;
+  left: var(--timeline-label-width, 240px);
   pointer-events: none;
 }
 
@@ -918,6 +955,23 @@
   border-left: 1px solid color-mix(
     in srgb,
     var(--background-modifier-border) 70%,
+    transparent
+  );
+}
+
+.base-board-timeline-grid-line--major {
+  border-left-width: 2px;
+  border-left-color: color-mix(
+    in srgb,
+    var(--background-modifier-border) 90%,
+    var(--text-muted)
+  );
+}
+
+.base-board-timeline-grid-line--minor {
+  border-left-color: color-mix(
+    in srgb,
+    var(--background-modifier-border) 55%,
     transparent
   );
 }
@@ -936,8 +990,7 @@
   left: 0;
   z-index: 4;
   box-sizing: border-box;
-  width: 240px;
-  margin-left: -240px;
+  width: var(--timeline-label-width, 240px);
   padding: 7px 12px;
   min-height: 34px;
   border-right: 1px solid var(--background-modifier-border);
@@ -972,10 +1025,9 @@
   left: 0;
   z-index: 3;
   box-sizing: border-box;
-  width: 240px;
+  width: var(--timeline-label-width, 240px);
   min-height: 44px;
-  margin-left: -240px;
-  padding: 6px 12px;
+  padding: 6px 12px 6px calc(12px + var(--timeline-indent, 0px));
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -983,6 +1035,71 @@
   cursor: pointer;
   border-right: 1px solid var(--background-modifier-border);
   background-color: var(--background-primary);
+}
+
+.base-board-timeline-label-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  z-index: 5;
+}
+
+.base-board-timeline-label-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 3px;
+  bottom: 0;
+  border-right: 1px solid transparent;
+}
+
+.base-board-timeline-label-resize-handle:hover::after {
+  border-right-color: var(--interactive-accent);
+}
+
+.base-board-timeline-lane--nested .base-board-timeline-lane-label {
+  background-color: color-mix(
+    in srgb,
+    var(--background-primary) 92%,
+    var(--background-secondary)
+  );
+}
+
+.base-board-timeline-lane--nested .base-board-timeline-lane-label::before {
+  content: "";
+  position: absolute;
+  left: calc(12px + var(--timeline-indent, 0px) - 12px);
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.base-board-timeline-lane--parent .base-board-timeline-task-title {
+  font-weight: var(--font-semibold);
+}
+
+.base-board-timeline-tree-marker {
+  position: absolute;
+  left: calc(12px + var(--timeline-indent, 0px) - 2px);
+  top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+
+.base-board-timeline-lane--parent .base-board-timeline-lane-label {
+  padding-left: calc(30px + var(--timeline-indent, 0px));
+}
+
+.base-board-timeline-lane--root-parent .base-board-timeline-lane-label {
+  padding-left: 12px;
 }
 
 .base-board-timeline-lane-label:hover {
@@ -997,17 +1114,9 @@
   font-weight: var(--font-medium);
 }
 
-.base-board-timeline-task-tags {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-}
-
 .base-board-timeline-track {
   position: absolute;
-  left: 0;
+  left: var(--timeline-label-width, 240px);
   right: 0;
   top: 0;
   min-height: 44px;

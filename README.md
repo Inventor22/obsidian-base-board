@@ -73,9 +73,9 @@ parent_task: Parent Task
 parentTask: parent-task-id
 ```
 
-If a task has children, the parent and its children are grouped into their own pool. Parent completion remains manual; the timeline only visualizes the recorded task movement history.
+If a task has children, the Timeline renders it as a parent lane and recursively indents descendants beneath it. Parent completion remains manual; the timeline only visualizes the recorded task movement history.
 
-Use a parent property for feature/subtask relationships instead of a tag. Tags are best for filtering and cross-cutting labels; `parent` is better for hierarchy because it points to one owning feature task.
+Use a parent property for feature/subtask relationships instead of a tag. Tags are best for filtering and cross-cutting labels; `parent` is better for hierarchy because it points to one owning feature task. Child relationships are inferred from `parent`, so separate child tags are not needed.
 
 ## Installation
 
