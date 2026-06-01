@@ -1,5 +1,13 @@
-import { Plugin, Notice, QueryController, TFile } from "obsidian";
+import {
+  Plugin,
+  Notice,
+  PluginSettingTab,
+  QueryController,
+  Setting,
+  TFile,
+} from "obsidian";
 import { KanbanView } from "./kanban-view";
+import { TimelineView } from "./timeline-view";
 import { sanitizeFilename } from "./constants";
 import { CreateBoardModal, BoardConfig } from "./modals";
 
@@ -8,12 +16,30 @@ export interface ColumnConfig {
   columns: string[];
 }
 
+export interface TransitionHistorySettings {
+  enabled: boolean;
+  propertyName: string;
+}
+
+export interface TimelineSettings {
+  weekStartDay: number;
+}
+
 export interface PluginData {
   columnConfigs: Record<string, ColumnConfig>;
+  transitionHistory: TransitionHistorySettings;
+  timeline: TimelineSettings;
 }
 
 const DEFAULT_DATA: PluginData = {
   columnConfigs: {},
+  transitionHistory: {
+    enabled: true,
+    propertyName: "status_history",
+  },
+  timeline: {
+    weekStartDay: 1,
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -25,6 +51,7 @@ export default class BaseBoardPlugin extends Plugin {
 
   async onload() {
     await this.loadPluginData();
+    this.addSettingTab(new BaseBoardSettingTab(this));
 
     this.registerBasesView("kanban", {
       name: "Kanban",
@@ -32,6 +59,14 @@ export default class BaseBoardPlugin extends Plugin {
       factory: (controller: QueryController, containerEl: HTMLElement) =>
         new KanbanView(controller, containerEl, this),
       options: () => KanbanView.getViewOptions(),
+    });
+
+    this.registerBasesView("timeline", {
+      name: "Timeline",
+      icon: "lucide-chart-gantt",
+      factory: (controller: QueryController, containerEl: HTMLElement) =>
+        new TimelineView(controller, containerEl, this),
+      options: () => TimelineView.getViewOptions(),
     });
 
     // -- Command: Create new board --------------------------------------------
@@ -174,9 +209,85 @@ export default class BaseBoardPlugin extends Plugin {
     const saved = (await this.loadData()) as PluginData | null | undefined;
     this.data_ = Object.assign({}, DEFAULT_DATA, saved ?? {});
     if (!this.data_.columnConfigs) this.data_.columnConfigs = {};
+    this.data_.transitionHistory = Object.assign(
+      {},
+      DEFAULT_DATA.transitionHistory,
+      saved?.transitionHistory ?? {},
+    );
+    this.data_.timeline = Object.assign(
+      {},
+      DEFAULT_DATA.timeline,
+      saved?.timeline ?? {},
+    );
   }
 
   async savePluginData(): Promise<void> {
     await this.saveData(this.data_);
+  }
+}
+
+class BaseBoardSettingTab extends PluginSettingTab {
+  plugin: BaseBoardPlugin;
+
+  constructor(plugin: BaseBoardPlugin) {
+    super(plugin.app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    new Setting(containerEl).setName("Transition history").setHeading();
+
+    new Setting(containerEl)
+      .setName("Log card transitions")
+      .setDesc(
+        "Append a timestamped history entry when a card moves between board columns.",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.data_.transitionHistory.enabled)
+          .onChange(async (value) => {
+            this.plugin.data_.transitionHistory.enabled = value;
+            await this.plugin.savePluginData();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Transition history property")
+      .setDesc("Frontmatter property used for the appended transition history.")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_DATA.transitionHistory.propertyName)
+          .setValue(this.plugin.data_.transitionHistory.propertyName)
+          .onChange(async (value) => {
+            this.plugin.data_.transitionHistory.propertyName = value.trim();
+            await this.plugin.savePluginData();
+          }),
+      );
+
+    new Setting(containerEl).setName("Timeline").setHeading();
+
+    new Setting(containerEl)
+      .setName("Week starts on")
+      .setDesc("Day used for weekly timeline boundaries.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            "0": "Sunday",
+            "1": "Monday",
+            "2": "Tuesday",
+            "3": "Wednesday",
+            "4": "Thursday",
+            "5": "Friday",
+            "6": "Saturday",
+          })
+          .setValue(String(this.plugin.data_.timeline.weekStartDay))
+          .onChange(async (value) => {
+            this.plugin.data_.timeline.weekStartDay = Number(value);
+            await this.plugin.savePluginData();
+          }),
+      );
   }
 }
