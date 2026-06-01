@@ -10,26 +10,12 @@ import {
   Notice,
   Menu,
   Value,
+  Keymap,
 } from "obsidian";
 import { KanbanView } from "./kanban-view";
 import { ORDER_PROPERTY, sanitizeFilename } from "./constants";
 import { relativeLuminance } from "./color-utils";
 import { CardDetailModal } from "./card-detail-modal";
-
-const SUFFIX_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
-
-function generateCardId(title: string): string {
-  const slug = title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 40);
-  const suffix = Array.from(
-    { length: 4 },
-    () => SUFFIX_CHARS[Math.floor(Math.random() * SUFFIX_CHARS.length)],
-  ).join("");
-  return `${slug}-${suffix}`;
-}
 
 // Format a Value for chip display:
 //   - DateValue    → relative ("3 days ago")
@@ -115,10 +101,11 @@ export class CardManager {
     cardEl.addEventListener("click", (e: MouseEvent) => {
       if (dragging) return;
 
-      const isMultiKey = e.ctrlKey || e.metaKey;
+      const isAlt = e.altKey;
       const isShift = e.shiftKey;
+      const isMod = e.ctrlKey || e.metaKey;
 
-      if (isMultiKey || isShift) {
+      if ((isAlt || isShift) && !isMod) {
         e.preventDefault();
         this.handleCardSelect(filePath, columnName, isShift);
         return;
@@ -133,7 +120,35 @@ export class CardManager {
       const file = this.view.app.vault.getAbstractFileByPath(filePath);
       if (!(file instanceof TFile)) return;
 
-      new CardDetailModal(this.view.app, file, this.view).open();
+      // Handle standard Obsidian modifiers using Keymap.isModEvent(e)
+      const mod = Keymap.isModEvent(e);
+      if (mod) {
+        e.preventDefault();
+        void this.view.app.workspace.getLeaf(mod).openFile(file);
+        return;
+      }
+
+      const openBehavior = this.view.getCardOpenBehavior();
+      if (openBehavior === "split") {
+        if (
+          this.view.detailLeaf &&
+          this.view.isLeafAttached(this.view.detailLeaf)
+        ) {
+          void this.view.detailLeaf.openFile(file);
+        } else {
+          this.view.detailLeaf = this.view.app.workspace.getLeaf(
+            "split",
+            "vertical",
+          );
+          void this.view.detailLeaf.openFile(file);
+        }
+      } else if (openBehavior === "tab") {
+        void this.view.app.workspace.getLeaf("tab").openFile(file);
+      } else if (openBehavior === "active") {
+        void this.view.app.workspace.getLeaf(false).openFile(file);
+      } else {
+        new CardDetailModal(this.view.app, file, this.view).open();
+      }
     });
 
     // Middle-click → always open in new tab
@@ -353,7 +368,27 @@ export class CardManager {
         .setTitle("Open")
         .setIcon("lucide-file-text")
         .onClick(() => {
-          new CardDetailModal(this.view.app, file, this.view).open();
+          const openBehavior = this.view.getCardOpenBehavior();
+          if (openBehavior === "split") {
+            if (
+              this.view.detailLeaf &&
+              this.view.isLeafAttached(this.view.detailLeaf)
+            ) {
+              void this.view.detailLeaf.openFile(file);
+            } else {
+              this.view.detailLeaf = this.view.app.workspace.getLeaf(
+                "split",
+                "vertical",
+              );
+              void this.view.detailLeaf.openFile(file);
+            }
+          } else if (openBehavior === "tab") {
+            void this.view.app.workspace.getLeaf("tab").openFile(file);
+          } else if (openBehavior === "active") {
+            void this.view.app.workspace.getLeaf(false).openFile(file);
+          } else {
+            new CardDetailModal(this.view.app, file, this.view).open();
+          }
         });
     });
 
@@ -502,65 +537,16 @@ export class CardManager {
       return;
     }
 
-    const folder = this.getTargetFolder();
-    const safeName = sanitizeFilename(title);
-    let filePath = `${folder}/${safeName}.md`;
+    const overrides = (fm: Record<string, unknown>) => {
+      fm[groupByProp] = columnName;
+      fm[ORDER_PROPERTY] = orderIndex;
+    };
 
-    // Avoid overwriting existing files
-    let counter = 1;
-    while (this.view.app.vault.getAbstractFileByPath(filePath)) {
-      filePath = `${folder}/${safeName} ${counter}.md`;
-      counter++;
+    try {
+      await this.view.createFileForView(title, overrides);
+    } catch (err) {
+      new Notice(`Failed to create card: ${String(err)}`);
     }
-
-    const id = generateCardId(title);
-    const frontmatter = [
-      "---",
-      `${groupByProp}: ${columnName}`,
-      `${ORDER_PROPERTY}: ${orderIndex}`,
-      `id: ${id}`,
-      "---",
-      "",
-      `# ${title}`,
-      "",
-    ].join("\n");
-
-    await this.view.app.vault.create(filePath, frontmatter);
-    new Notice(`Created "${safeName}"`);
-  }
-
-  /**
-   * Determine the folder for new cards by looking at existing entries.
-   * Falls back to the vault root.
-   *
-   * Uses the official BasesEntry.file property (TFile) which is
-   * guaranteed by the Obsidian API.
-   */
-  private getTargetFolder(): string {
-    // All entries in this board share the same .base query, so the first
-    // entry's parent folder is a good default for new cards.
-    for (const group of this.view.currentGroups) {
-      for (const entry of group.entries) {
-        const path = entry.file?.path;
-        if (path) {
-          const lastSlash = path.lastIndexOf("/");
-          if (lastSlash > 0) return path.substring(0, lastSlash);
-        }
-      }
-    }
-
-    // Fallback: try to infer from the first entry in the raw data list
-    const viewData = (
-      this.view as unknown as { data?: { data?: BasesEntry[] } }
-    ).data;
-    const entries: BasesEntry[] = viewData?.data ?? [];
-    if (entries.length > 0) {
-      const path = entries[0].file?.path ?? "";
-      const lastSlash = path.lastIndexOf("/");
-      if (lastSlash > 0) return path.substring(0, lastSlash);
-    }
-
-    return "";
   }
 
   // ---------------------------------------------------------------------------

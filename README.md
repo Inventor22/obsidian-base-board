@@ -23,11 +23,24 @@
 - **Hover Preview**: Native note previews on hover (uses the **Page preview** core plugin).
 - **One-Click Creation**: Add new notes directly to a specific column without leaving the board view.
 - **Transition History**: Optionally append timestamped frontmatter entries when cards move between columns.
+- **Timeline View**: Visualize task lifecycle history as zoomable swimlanes grouped by parent task.
 - **Data First**: All changes are written directly to your Markdown files.
 
 ## Usage
 
 Open the **Command palette** (`Ctrl/Cmd + P`) and run **"Base Board: Create new board"**. Enter a name, choose a folder, and the plugin will scaffold everything for you — a `.base` file, a tasks folder, and sample task notes. The board opens automatically.
+
+### Card Navigation & Selection
+
+By default, card interaction respects native Obsidian conventions:
+
+* **Click:** Open the card's note in the active tab / pane.
+* **Ctrl/Cmd + Click:** Open the note in a new tab.
+* **Ctrl/Cmd + Alt + Click** (or **Cmd + Option + Click** on macOS): Open the note to the side in a split pane.
+* **Alt / Option + Click:** Toggle selection of a card (for bulk actions or dragging).
+* **Shift + Click:** Select a range of cards.
+
+You can customize the default click behavior (e.g. to always open in a floating modal, split pane, or new tab) via the board toolbar under the view options menu.
 
 ### Transition History
 
@@ -46,11 +59,41 @@ status_history:
 
 Moves into or out of the no-value column are recorded as `null`. Reordering cards inside the same column does not add a history entry.
 
+### Column Colors
+
+Base Board assigns visually distinct default colors to common Kanban columns such as `To Do`, `In Progress`, `In Review`, `Flighting`, and `Completed`. Right-click a Kanban column header and choose **Change column color** to customize it. Timeline phase segments use the same column colors.
+
+### Timeline View
+
+Base Board also provides a `Timeline` Bases view for visualizing lifecycle history. Each task appears as a horizontal swimlane, and each lane is colored by the task phase recorded in `status_history`. The view includes preset range buttons for day, week, month, semester, year, and fit-to-data, plus the same tag filter pill pattern used by the Kanban view. Hold `Ctrl` or `Cmd` while scrolling over the timeline to zoom between presets.
+
+The timeline uses the same group-by property as the board, so a board grouped by `status` will visualize status transitions. Tasks without transition history still appear as a single segment from the note creation time to now using the current group-by value.
+
+Drag timeline lanes vertically to save a custom timeline order. This writes `timeline_order` to the affected task notes and does not change their Kanban column order.
+
+Parent task pools are inferred from one of these frontmatter properties on child tasks:
+
+```yaml
+parent: [[Parent Task]]
+```
+
+```yaml
+parent_task: Parent Task
+```
+
+```yaml
+parentTask: parent-task-id
+```
+
+If a task has children, the Timeline renders it as a parent lane and recursively indents descendants beneath it. Parent completion remains manual; the timeline only visualizes the recorded task movement history.
+
+Use a parent property for feature/subtask relationships instead of a tag. Tags are best for filtering and cross-cutting labels; `parent` is better for hierarchy because it points to one owning feature task. Child relationships are inferred from `parent`, so separate child tags are not needed.
+
 ## Installation
 
 ### From Obsidian Community Plugins
 
-Search for **Base Board** in the Obsidian Community Plugins browser and click **Install**.
+Search for **Base Board** in the Obsidian Community Plugins browser and click **Install**, or view the plugin directly on the [Obsidian Community Plugins directory](https://community.obsidian.md/plugins/base-board).
 
 ### Using BRAT
 

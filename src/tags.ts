@@ -212,12 +212,22 @@ export class ColorPickerModal extends Modal {
       });
     });
 
-    new Setting(contentEl).addButton((btn) => {
-      btn
-        .setButtonText("Done")
-        .setCta()
-        .onClick(() => this.close());
-    });
+    new Setting(contentEl)
+      .addButton((btn) => {
+        btn
+          .setButtonText("Reset to default")
+          .setWarning()
+          .onClick(() => {
+            this.onChange("");
+            this.close();
+          });
+      })
+      .addButton((btn) => {
+        btn
+          .setButtonText("Done")
+          .setCta()
+          .onClick(() => this.close());
+      });
   }
 
   onClose(): void {

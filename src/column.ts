@@ -9,6 +9,8 @@ import {
 import { KanbanView } from "./kanban-view";
 import { InputModal } from "./modals";
 import { NO_VALUE_COLUMN } from "./constants";
+import { ColorPickerModal } from "./tags";
+import { getColumnColor, setColumnColor } from "./status-colors";
 
 export class ColumnManager {
   private view: KanbanView;
@@ -50,9 +52,15 @@ export class ColumnManager {
     columnEl.dataset.columnName = columnName;
     columnEl.dataset.columnIndex = String(columnIndex);
 
+    const columnColor = getColumnColor(this.view.config, columnName);
+    columnEl.style.setProperty("--column-color", columnColor);
+    const accentEl = columnEl.createDiv({ cls: "base-board-column-accent" });
+    accentEl.style.backgroundColor = columnColor;
+
     // ---- Header ----
     const headerEl = columnEl.createDiv({ cls: "base-board-column-header" });
     headerEl.setAttr("draggable", "true");
+    headerEl.style.setProperty("--base-board-column-color", columnColor);
 
     const dragHandle = headerEl.createDiv({
       cls: "base-board-column-drag-handle",
@@ -95,11 +103,11 @@ export class ColumnManager {
     }
 
     // ---- Right-click context menu on header ----
-    if (!isNoValue) {
-      headerEl.addEventListener("contextmenu", (e: MouseEvent) => {
-        e.preventDefault();
-        const menu = new Menu();
+    headerEl.addEventListener("contextmenu", (e: MouseEvent) => {
+      e.preventDefault();
+      const menu = new Menu();
 
+      if (!isNoValue) {
         menu.addItem((item) => {
           item
             .setTitle("Rename column")
@@ -114,25 +122,44 @@ export class ColumnManager {
               );
             });
         });
-
         menu.addSeparator();
-        menu.addItem((item) => {
-          item
-            .setTitle(
-              entries.length > 0
-                ? `Delete column (${entries.length} card${entries.length > 1 ? "s" : ""} will remain)`
-                : "Delete column",
-            )
-            .setIcon("lucide-trash-2")
-            .setWarning(true)
-            .onClick(() => {
-              this.handleDeleteColumn(columnName);
-            });
-        });
+      }
 
-        menu.showAtMouseEvent(e);
+      const currentColor = getColumnColor(this.view.config, columnName);
+      menu.addItem((item) => {
+        item
+          .setTitle("Change color")
+          .setIcon("lucide-palette")
+          .onClick(() => {
+            new ColorPickerModal(
+              this.view.app,
+              columnName,
+              currentColor,
+              (color) => {
+                setColumnColor(this.view.config, columnName, color);
+                this.view.scheduleRender();
+              },
+            ).open();
+          });
       });
-    }
+      menu.addSeparator();
+
+      menu.addItem((item) => {
+        item
+          .setTitle(
+            entries.length > 0
+              ? `Delete column (${entries.length} card${entries.length > 1 ? "s" : ""} will remain)`
+              : "Delete column",
+          )
+          .setIcon("lucide-trash-2")
+          .setWarning(true)
+          .onClick(() => {
+            this.handleDeleteColumn(columnName);
+          });
+      });
+
+      menu.showAtMouseEvent(e);
+    });
 
     // ---- Cards container ----
     const cardsEl = columnEl.createDiv({ cls: "base-board-cards" });

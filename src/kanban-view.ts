@@ -2,12 +2,14 @@ import {
   BasesView,
   BasesEntry,
   BasesEntryGroup,
+  BasesAllOptions,
   HoverParent,
   HoverPopover,
   QueryController,
   NullValue,
   setIcon,
   TFile,
+  WorkspaceLeaf,
 } from "obsidian";
 import type BaseBoardPlugin from "./main";
 import { DragDropManager } from "./drag-drop";
@@ -18,6 +20,8 @@ import {
   NO_VALUE_COLUMN,
   ORDER_PROPERTY,
   CONFIG_KEY_COLUMNS,
+  CONFIG_KEY_OPEN_BEHAVIOR,
+  CONFIG_KEY_COLUMN_COLORS,
 } from "./constants";
 
 interface TransitionHistoryEntry {
@@ -57,6 +61,7 @@ export class KanbanView extends BasesView implements HoverParent {
   public tags: Tags;
   /** Currently selected card file paths (for batch operations) */
   public selectedCards: Set<string> = new Set();
+  public detailLeaf: WorkspaceLeaf | null = null;
 
   constructor(
     controller: QueryController,
@@ -126,8 +131,27 @@ export class KanbanView extends BasesView implements HoverParent {
     }
   }
 
-  static getViewOptions(): never[] {
-    return [];
+  static getViewOptions(): BasesAllOptions[] {
+    return [
+      {
+        type: "group" as const,
+        displayName: "Display",
+        items: [
+          {
+            key: CONFIG_KEY_OPEN_BEHAVIOR,
+            type: "dropdown" as const,
+            displayName: "Open card in",
+            default: "active",
+            options: {
+              active: "Active pane / tab",
+              modal: "Floating modal",
+              split: "Split to the right",
+              tab: "New tab",
+            },
+          },
+        ],
+      },
+    ];
   }
 
   // ---------------------------------------------------------------------------
@@ -201,6 +225,43 @@ export class KanbanView extends BasesView implements HoverParent {
     return null;
   }
 
+  public getCardOpenBehavior(): "active" | "modal" | "split" | "tab" {
+    const val = this.config?.get(CONFIG_KEY_OPEN_BEHAVIOR);
+    if (val === "modal" || val === "split" || val === "tab") return val;
+    return "active";
+  }
+
+  public isLeafAttached(leaf: WorkspaceLeaf): boolean {
+    let found = false;
+    this.app.workspace.iterateAllLeaves((l) => {
+      if (l === leaf) found = true;
+    });
+    return found;
+  }
+
+  public getColumnColors(): Record<string, string> {
+    const raw = this.config?.get(CONFIG_KEY_COLUMN_COLORS);
+    return raw && typeof raw === "object"
+      ? (raw as Record<string, string>)
+      : {};
+  }
+
+  public getColumnColor(columnName: string): string | null {
+    const customColors = this.getColumnColors();
+    return customColors[columnName] ?? null;
+  }
+
+  public setColumnColor(columnName: string, color: string): void {
+    const colors = this.getColumnColors();
+    if (color) {
+      colors[columnName] = color;
+    } else {
+      delete colors[columnName];
+    }
+    this.config?.set(CONFIG_KEY_COLUMN_COLORS, colors);
+    this.scheduleRender();
+  }
+
   private getColumnName(key: unknown): string {
     if (key === undefined || key === null || key instanceof NullValue) {
       return NO_VALUE_COLUMN;
@@ -256,11 +317,15 @@ export class KanbanView extends BasesView implements HoverParent {
     // 2. Fallback: legacy plugin data.json
     const fromPlugin = this.plugin.getColumnConfig(this.getBaseId());
 
-    const stored = fromConfig?.length
+    const rawStored = fromConfig?.length
       ? fromConfig
       : fromPlugin?.columns?.length
         ? fromPlugin.columns
         : null;
+
+    const stored = rawStored
+      ? rawStored.map((col) => (col === "" ? NO_VALUE_COLUMN : col))
+      : null;
 
     const dataColumns = this.currentGroups.map((g) =>
       this.getColumnName(g.key),
@@ -407,7 +472,8 @@ export class KanbanView extends BasesView implements HoverParent {
    */
   public saveColumns(columns: string[]): void {
     // Primary: persist in .base file via the official config API
-    this.config?.set(CONFIG_KEY_COLUMNS, columns);
+    const toSave = columns.map((col) => (col === NO_VALUE_COLUMN ? "" : col));
+    this.config?.set(CONFIG_KEY_COLUMNS, toSave);
 
     // Legacy fallback: also write to plugin data.json
     void this.plugin.saveColumnConfig(this.getBaseId(), { columns });
