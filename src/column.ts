@@ -60,10 +60,7 @@ export class ColumnManager {
     // ---- Header ----
     const headerEl = columnEl.createDiv({ cls: "base-board-column-header" });
     headerEl.setAttr("draggable", "true");
-    headerEl.style.setProperty(
-      "--base-board-column-color",
-      columnColor,
-    );
+    headerEl.style.setProperty("--base-board-column-color", columnColor);
 
     const dragHandle = headerEl.createDiv({
       cls: "base-board-column-drag-handle",

@@ -93,20 +93,34 @@ interface TimelineTick {
   labelTier?: TimelineTickLabelTier;
 }
 
-interface TimelineLabelPlacement {
-  start: number;
-  end: number;
-  priority: number;
-  element: HTMLElement;
+interface TimelineRulerModel {
+  gridLines: TimelineGridLine[];
+  labelBands: TimelineLabelBand[];
+}
+
+interface TimelineGridLine {
+  at: Date;
+  tier: TimelineGridLineTier;
+}
+
+interface TimelineLabelBand {
+  start: Date;
+  end: Date;
+  label: string;
+  row: TimelineLabelBandRow;
+  minWidthPx: number;
 }
 
 type TimelineTickLabelStyle = "date" | "day-number" | "month" | "month-year";
 type TimelineTickLabelTier = "major" | "interval" | "subdivision";
+type TimelineGridLineTier = "major" | "minor" | "subdivision";
+type TimelineLabelBandRow = "major" | "minor";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 31 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
+const TIMELINE_BUILD_VERSION = "2026.06.01.1";
 
 const ZOOM_LEVELS: TimelineZoomLevel[] = [
   { id: "day", label: "Day", durationMs: DAY_MS },
@@ -309,6 +323,10 @@ export class TimelineView extends BasesView {
         this.setZoomDuration(zoomLevel.durationMs);
       });
     }
+    zoomEl.createSpan({
+      cls: "base-board-timeline-build-version",
+      text: `v${TIMELINE_BUILD_VERSION}`,
+    });
 
     this.renderFilterBar(toolbarEl, tasks);
   }
@@ -402,131 +420,293 @@ export class TimelineView extends BasesView {
       cls: "base-board-timeline-ruler-track",
     });
     trackEl.style.width = `${width}px`;
-    const ticks = this.getRenderableTicks(this.getTicks(range), range, width);
-    const placedLabels: TimelineLabelPlacement[] = [];
+    const ruler = this.getRulerModel(range);
 
-    for (const tick of ticks) {
-      const left = this.getPercent(tick.at, range);
-      const tickEl = trackEl.createDiv({ cls: "base-board-timeline-tick" });
-      tickEl.addClass(
-        tick.major
-          ? "base-board-timeline-tick--major"
-          : "base-board-timeline-tick--minor",
+    for (const gridLine of ruler.gridLines) {
+      this.renderRulerGridLine(trackEl, gridLine, range);
+    }
+
+    const majorLabelRowEl = trackEl.createDiv({
+      cls: "base-board-timeline-label-row base-board-timeline-label-row--major",
+    });
+    const minorLabelRowEl = trackEl.createDiv({
+      cls: "base-board-timeline-label-row base-board-timeline-label-row--minor",
+    });
+    for (const labelBand of ruler.labelBands) {
+      this.renderRulerLabelBand(
+        labelBand.row === "major" ? majorLabelRowEl : minorLabelRowEl,
+        labelBand,
+        range,
+        width,
       );
-      if (tick.subdivision) {
-        tickEl.addClass("base-board-timeline-tick--subdivision");
-      }
-      tickEl.style.left = `${left}%`;
-      if (tick.label) {
-        this.renderTickLabel(trackEl, tick, range, width, placedLabels);
-      }
     }
 
     const gridEl = contentEl.createDiv({ cls: "base-board-timeline-grid" });
     gridEl.style.width = `${width}px`;
-    for (const tick of ticks) {
-      const left = this.getPercent(tick.at, range);
-      const lineEl = gridEl.createDiv({ cls: "base-board-timeline-grid-line" });
-      lineEl.addClass(
-        tick.major
-          ? "base-board-timeline-grid-line--major"
-          : "base-board-timeline-grid-line--minor",
-      );
-      if (tick.subdivision) {
-        lineEl.addClass("base-board-timeline-grid-line--subdivision");
-      }
-      lineEl.style.left = `${left}%`;
+    for (const gridLine of ruler.gridLines) {
+      this.renderBodyGridLine(gridEl, gridLine, range);
     }
   }
 
-  private getRenderableTicks(
-    ticks: TimelineTick[],
-    range: TimelineRange,
-    width: number,
-  ): TimelineTick[] {
-    const minimumSubdivisionGapPx = 18;
-    const anchorTicks = ticks.filter((tick) => !tick.subdivision || tick.label);
-
-    return ticks.filter((tick) => {
-      if (!tick.subdivision || tick.label) return true;
-
-      const tickX = (this.getPercent(tick.at, range) / 100) * width;
-      return !anchorTicks.some((anchorTick) => {
-        if (anchorTick.at.getTime() === tick.at.getTime()) return false;
-        const anchorX = (this.getPercent(anchorTick.at, range) / 100) * width;
-        return Math.abs(anchorX - tickX) < minimumSubdivisionGapPx;
-      });
-    });
+  private getRulerModel(range: TimelineRange): TimelineRulerModel {
+    return {
+      gridLines: this.getRulerGridLines(range),
+      labelBands: this.getRulerLabelBands(range),
+    };
   }
 
-  private renderTickLabel(
+  private getRulerGridLines(range: TimelineRange): TimelineGridLine[] {
+    return this.getTicks(range).map((tick) => ({
+      at: tick.at,
+      tier: tick.major ? "major" : tick.subdivision ? "subdivision" : "minor",
+    }));
+  }
+
+  private renderRulerGridLine(
     trackEl: HTMLElement,
-    tick: TimelineTick,
+    gridLine: TimelineGridLine,
     range: TimelineRange,
-    width: number,
-    placedLabels: TimelineLabelPlacement[],
   ): void {
-    const labelDate = tick.subdivision ? (tick.labelAt ?? tick.at) : tick.at;
-    const labelLeft = this.getPercent(labelDate, range);
-    const labelWidth = this.getEstimatedTickLabelWidth(tick, range, width);
-    const labelX = (labelLeft / 100) * width;
-    const labelStart = tick.subdivision ? labelX - labelWidth / 2 : labelX;
-    const labelEnd = labelStart + labelWidth;
-    const labelPriority = this.getTickLabelPriority(tick);
-
-    const collisions = placedLabels.filter(
-      (placement) => placement.start < labelEnd && placement.end > labelStart,
-    );
-    if (collisions.some((placement) => placement.priority >= labelPriority)) {
-      return;
-    }
-
-    for (const collision of collisions) {
-      collision.element.remove();
-      placedLabels.splice(placedLabels.indexOf(collision), 1);
-    }
-
-    const labelEl = trackEl.createSpan({
-      cls: "base-board-timeline-tick-label",
-      text: tick.label,
-    });
-    labelEl.addClass(
-      `base-board-timeline-tick-label--${this.getTickLabelTier(tick)}`,
-    );
-    labelEl.style.left = `${labelLeft}%`;
-    if (tick.subdivision && tick.labelSpanMs) {
-      const labelWidthPercent =
-        (tick.labelSpanMs / (range.end.getTime() - range.start.getTime())) *
-        100;
-      labelEl.style.maxWidth = `calc(${labelWidthPercent}% - 8px)`;
-    }
-
-    placedLabels.push({
-      start: labelStart - 6,
-      end: labelEnd + 6,
-      priority: labelPriority,
-      element: labelEl,
-    });
+    const lineEl = trackEl.createDiv({ cls: "base-board-timeline-tick" });
+    lineEl.addClass(`base-board-timeline-tick--${gridLine.tier}`);
+    lineEl.style.left = `${this.getPercent(gridLine.at, range)}%`;
   }
 
-  private getEstimatedTickLabelWidth(
-    tick: TimelineTick,
+  private renderBodyGridLine(
+    gridEl: HTMLElement,
+    gridLine: TimelineGridLine,
+    range: TimelineRange,
+  ): void {
+    const lineEl = gridEl.createDiv({ cls: "base-board-timeline-grid-line" });
+    lineEl.addClass(`base-board-timeline-grid-line--${gridLine.tier}`);
+    lineEl.style.left = `${this.getPercent(gridLine.at, range)}%`;
+  }
+
+  private renderRulerLabelBand(
+    rowEl: HTMLElement,
+    labelBand: TimelineLabelBand,
     range: TimelineRange,
     width: number,
-  ): number {
-    const textWidth = Math.min(120, tick.label.length * 7 + 16);
-    if (!tick.subdivision || !tick.labelSpanMs) return textWidth;
+  ): void {
+    const visibleStart = Math.max(
+      labelBand.start.getTime(),
+      range.start.getTime(),
+    );
+    const visibleEnd = Math.min(labelBand.end.getTime(), range.end.getTime());
+    if (visibleEnd <= visibleStart) return;
 
-    const spanWidth =
-      (tick.labelSpanMs / (range.end.getTime() - range.start.getTime())) *
-      width;
-    return Math.max(12, Math.min(textWidth, spanWidth - 8));
+    const startPercent = this.getPercent(new Date(visibleStart), range);
+    const endPercent = this.getPercent(new Date(visibleEnd), range);
+    const bandWidthPx = ((endPercent - startPercent) / 100) * width;
+    if (bandWidthPx < labelBand.minWidthPx) return;
+
+    const labelEl = rowEl.createSpan({
+      cls: "base-board-timeline-label-band",
+      text: labelBand.label,
+    });
+    labelEl.style.left = `${startPercent}%`;
+    labelEl.style.width = `${endPercent - startPercent}%`;
   }
 
-  private getTickLabelPriority(tick: TimelineTick): number {
-    if (tick.major) return 3;
-    if (tick.labelTier === "interval") return 2;
-    return 1;
+  private getRulerLabelBands(range: TimelineRange): TimelineLabelBand[] {
+    if (this.zoomDurationMs <= 2 * DAY_MS) {
+      return [
+        ...this.getDayLabelBands(range, 1, "major", "date", 56),
+        ...this.getHourLabelBands(range, 6, "minor", 28),
+      ];
+    }
+    if (this.zoomDurationMs <= MONTH_MS) {
+      return [
+        ...this.getWeekLabelBands(range, "major", 58),
+        ...this.getDayLabelBands(range, 1, "minor", "day-number", 18),
+      ];
+    }
+    if (this.zoomDurationMs <= 6 * MONTH_MS) {
+      return [
+        ...this.getMonthLabelBands(range, 1, "major", "month-year", 68),
+        ...this.getWeekLabelBands(range, "minor", 54),
+      ];
+    }
+    if (this.zoomDurationMs <= 2 * YEAR_MS) {
+      return [
+        ...this.getYearLabelBands(range, 1, "major", 42),
+        ...this.getMonthLabelBands(range, 1, "minor", "month", 32),
+      ];
+    }
+    if (this.zoomDurationMs <= 5 * YEAR_MS) {
+      return [
+        ...this.getYearLabelBands(range, 1, "major", 42),
+        ...this.getMonthLabelBands(range, 3, "minor", "month", 32),
+      ];
+    }
+    return [
+      ...this.getYearLabelBands(
+        range,
+        this.getYearLabelInterval(),
+        "major",
+        42,
+      ),
+      ...this.getYearLabelBands(
+        range,
+        this.getYearMinorInterval(),
+        "minor",
+        36,
+      ),
+    ];
+  }
+
+  private getHourLabelBands(
+    range: TimelineRange,
+    hours: number,
+    row: TimelineLabelBandRow,
+    minWidthPx: number,
+  ): TimelineLabelBand[] {
+    const bands: TimelineLabelBand[] = [];
+    const cursor = new Date(range.start);
+    cursor.setMinutes(0, 0, 0);
+
+    while (this.addHours(cursor, hours).getTime() <= range.start.getTime()) {
+      cursor.setHours(cursor.getHours() + hours);
+    }
+
+    while (cursor.getTime() < range.end.getTime()) {
+      const end = this.addHours(cursor, hours);
+      bands.push({
+        start: new Date(cursor),
+        end,
+        label: cursor.toLocaleTimeString([], { hour: "numeric" }),
+        row,
+        minWidthPx,
+      });
+      cursor.setHours(cursor.getHours() + hours);
+    }
+    return bands;
+  }
+
+  private getDayLabelBands(
+    range: TimelineRange,
+    days: number,
+    row: TimelineLabelBandRow,
+    labelStyle: TimelineTickLabelStyle,
+    minWidthPx: number,
+  ): TimelineLabelBand[] {
+    const bands: TimelineLabelBand[] = [];
+    const cursor = this.toLocalDateOnly(range.start);
+
+    while (this.addDays(cursor, days).getTime() <= range.start.getTime()) {
+      cursor.setDate(cursor.getDate() + days);
+    }
+
+    while (cursor.getTime() < range.end.getTime()) {
+      const end = this.addDays(cursor, days);
+      bands.push({
+        start: new Date(cursor),
+        end,
+        label:
+          labelStyle === "day-number"
+            ? String(cursor.getDate())
+            : cursor.toLocaleDateString([], { month: "short", day: "numeric" }),
+        row,
+        minWidthPx,
+      });
+      cursor.setDate(cursor.getDate() + days);
+    }
+    return bands;
+  }
+
+  private getWeekLabelBands(
+    range: TimelineRange,
+    row: TimelineLabelBandRow,
+    minWidthPx: number,
+  ): TimelineLabelBand[] {
+    const bands: TimelineLabelBand[] = [];
+    const cursor = this.getWeekStart(range.start);
+
+    while (this.addDays(cursor, 7).getTime() <= range.start.getTime()) {
+      cursor.setDate(cursor.getDate() + 7);
+    }
+
+    while (cursor.getTime() < range.end.getTime()) {
+      const end = this.addDays(cursor, 7);
+      bands.push({
+        start: new Date(cursor),
+        end,
+        label: cursor.toLocaleDateString([], {
+          month: "short",
+          day: "numeric",
+        }),
+        row,
+        minWidthPx,
+      });
+      cursor.setDate(cursor.getDate() + 7);
+    }
+    return bands;
+  }
+
+  private getMonthLabelBands(
+    range: TimelineRange,
+    months: number,
+    row: TimelineLabelBandRow,
+    labelStyle: TimelineTickLabelStyle,
+    minWidthPx: number,
+  ): TimelineLabelBand[] {
+    const bands: TimelineLabelBand[] = [];
+    const cursor = new Date(range.start);
+    cursor.setMonth(cursor.getMonth() - (cursor.getMonth() % months), 1);
+    cursor.setHours(0, 0, 0, 0);
+
+    while (this.addMonths(cursor, months).getTime() <= range.start.getTime()) {
+      cursor.setMonth(cursor.getMonth() + months);
+    }
+
+    while (cursor.getTime() < range.end.getTime()) {
+      const end = this.addMonths(cursor, months);
+      bands.push({
+        start: new Date(cursor),
+        end,
+        label: cursor.toLocaleDateString(
+          [],
+          labelStyle === "month"
+            ? { month: "short" }
+            : { month: "short", year: "numeric" },
+        ),
+        row,
+        minWidthPx,
+      });
+      cursor.setMonth(cursor.getMonth() + months);
+    }
+    return bands;
+  }
+
+  private getYearLabelBands(
+    range: TimelineRange,
+    years: number,
+    row: TimelineLabelBandRow,
+    minWidthPx: number,
+  ): TimelineLabelBand[] {
+    const bands: TimelineLabelBand[] = [];
+    const cursor = new Date(range.start.getFullYear(), 0, 1);
+    const yearOffset = ((cursor.getFullYear() % years) + years) % years;
+    if (yearOffset !== 0) {
+      cursor.setFullYear(cursor.getFullYear() - yearOffset);
+    }
+
+    while (this.addYears(cursor, years).getTime() <= range.start.getTime()) {
+      cursor.setFullYear(cursor.getFullYear() + years);
+    }
+
+    while (cursor.getTime() < range.end.getTime()) {
+      const end = this.addYears(cursor, years);
+      bands.push({
+        start: new Date(cursor),
+        end,
+        label: cursor.toLocaleDateString([], { year: "numeric" }),
+        row,
+        minWidthPx,
+      });
+      cursor.setFullYear(cursor.getFullYear() + years);
+    }
+    return bands;
   }
 
   private renderLane(
@@ -1292,7 +1472,7 @@ export class TimelineView extends BasesView {
     }
     if (this.zoomDurationMs <= 6 * MONTH_MS) {
       return this.combineTicks(
-        this.getMonthlyTicks(range, true),
+        this.getMonthlyTicks(range, true, "month-year", false),
         this.getWeeklyTicks(range, false, true),
         this.getDayIntervalTicks(range, 2, false, "day-number", true, false),
       );
@@ -1324,13 +1504,25 @@ export class TimelineView extends BasesView {
   }
 
   private combineTicks(...tickGroups: TimelineTick[][]): TimelineTick[] {
-    const seenTimes = new Set<number>();
+    const ticksByTime = new Map<number, TimelineTick>();
     const ticks: TimelineTick[] = [];
     for (const tickGroup of tickGroups) {
       for (const tick of tickGroup) {
         const time = tick.at.getTime();
-        if (seenTimes.has(time)) continue;
-        seenTimes.add(time);
+        const existingTick = ticksByTime.get(time);
+        if (existingTick) {
+          existingTick.major = existingTick.major || tick.major;
+          existingTick.subdivision =
+            existingTick.subdivision && tick.subdivision;
+          if (!existingTick.label && tick.label) {
+            existingTick.label = tick.label;
+            existingTick.labelAt = tick.labelAt;
+            existingTick.labelSpanMs = tick.labelSpanMs;
+            existingTick.labelTier = tick.labelTier;
+          }
+          continue;
+        }
+        ticksByTime.set(time, tick);
         ticks.push(tick);
       }
     }
@@ -1563,6 +1755,24 @@ export class TimelineView extends BasesView {
   private addDays(date: Date, days: number): Date {
     const nextDate = new Date(date);
     nextDate.setDate(nextDate.getDate() + days);
+    return nextDate;
+  }
+
+  private addHours(date: Date, hours: number): Date {
+    const nextDate = new Date(date);
+    nextDate.setHours(nextDate.getHours() + hours);
+    return nextDate;
+  }
+
+  private addMonths(date: Date, months: number): Date {
+    const nextDate = new Date(date);
+    nextDate.setMonth(nextDate.getMonth() + months);
+    return nextDate;
+  }
+
+  private addYears(date: Date, years: number): Date {
+    const nextDate = new Date(date);
+    nextDate.setFullYear(nextDate.getFullYear() + years);
     return nextDate;
   }
 

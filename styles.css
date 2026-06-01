@@ -875,6 +875,14 @@
   );
 }
 
+.base-board-timeline-build-version {
+  margin-left: 4px;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  line-height: 1;
+  white-space: nowrap;
+}
+
 .base-board-timeline-filter-bar {
   border-bottom: 1px solid var(--background-modifier-border);
 }
@@ -907,7 +915,7 @@
   position: sticky;
   top: 0;
   z-index: 5;
-  height: 34px;
+  height: 48px;
   background-color: var(--background-secondary);
   border-bottom: 1px solid var(--background-modifier-border);
 }
@@ -918,7 +926,7 @@
   z-index: 6;
   box-sizing: border-box;
   width: var(--timeline-label-width, 240px);
-  height: 34px;
+  height: 48px;
   padding: 0 12px;
   display: flex;
   align-items: center;
@@ -933,7 +941,7 @@
   position: absolute;
   top: 0;
   left: var(--timeline-label-width, 240px);
-  height: 34px;
+  height: 48px;
 }
 
 .base-board-timeline-tick {
@@ -968,42 +976,45 @@
   );
 }
 
-.base-board-timeline-tick-label {
+.base-board-timeline-label-row {
   position: absolute;
-  max-width: 120px;
-  padding-left: 6px;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+}
+
+.base-board-timeline-label-row--major {
+  top: 5px;
+  height: 18px;
+}
+
+.base-board-timeline-label-row--minor {
+  top: 25px;
+  height: 18px;
+}
+
+.base-board-timeline-label-band {
+  position: absolute;
+  box-sizing: border-box;
+  height: 18px;
+  padding: 0 6px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-  line-height: 1;
-  pointer-events: none;
+  line-height: 18px;
   text-align: center;
   min-width: 0;
 }
 
-.base-board-timeline-tick-label--major {
-  top: 8px;
+.base-board-timeline-label-row--major .base-board-timeline-label-band {
   font-weight: var(--font-semibold);
-  color: var(--text-muted);
-}
-
-.base-board-timeline-tick-label--interval {
-  top: 8px;
-  color: var(--text-muted);
-}
-
-.base-board-timeline-tick-label--subdivision {
-  top: 8px;
-  transform: translateX(-50%);
-  padding-left: 0;
-  color: var(--text-muted);
 }
 
 .base-board-timeline-grid {
   position: absolute;
-  top: 34px;
+  top: 48px;
   bottom: 20px;
   left: var(--timeline-label-width, 240px);
   pointer-events: none;
