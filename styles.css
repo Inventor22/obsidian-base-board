@@ -892,7 +892,9 @@
   box-sizing: border-box;
   width: var(--timeline-label-width, 240px);
   height: 34px;
-  padding: 8px 12px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
   background-color: var(--background-secondary);
   border-right: 1px solid var(--background-modifier-border);
   color: var(--text-muted);
@@ -931,13 +933,45 @@
   );
 }
 
-.base-board-timeline-tick span {
+.base-board-timeline-tick--subdivision {
+  border-left-color: color-mix(
+    in srgb,
+    var(--background-modifier-border) 45%,
+    transparent
+  );
+}
+
+.base-board-timeline-tick-label {
   position: absolute;
-  top: 8px;
-  left: 6px;
+  max-width: 120px;
+  padding-left: 6px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
+  line-height: 1;
+  pointer-events: none;
+  text-align: center;
+  min-width: 0;
+}
+
+.base-board-timeline-tick-label--major {
+  top: 8px;
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+}
+
+.base-board-timeline-tick-label--interval {
+  top: 8px;
+  color: var(--text-muted);
+}
+
+.base-board-timeline-tick-label--subdivision {
+  top: 8px;
+  transform: translateX(-50%);
+  padding-left: 0;
+  color: var(--text-muted);
 }
 
 .base-board-timeline-grid {
@@ -952,11 +986,8 @@
   position: absolute;
   top: 0;
   bottom: 0;
-  border-left: 1px solid color-mix(
-    in srgb,
-    var(--background-modifier-border) 70%,
-    transparent
-  );
+  border-left: 1px solid
+    color-mix(in srgb, var(--background-modifier-border) 70%, transparent);
 }
 
 .base-board-timeline-grid-line--major {
@@ -972,6 +1003,14 @@
   border-left-color: color-mix(
     in srgb,
     var(--background-modifier-border) 55%,
+    transparent
+  );
+}
+
+.base-board-timeline-grid-line--subdivision {
+  border-left-color: color-mix(
+    in srgb,
+    var(--background-modifier-border) 35%,
     transparent
   );
 }

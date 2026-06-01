@@ -87,7 +87,21 @@ interface TimelineTick {
   at: Date;
   label: string;
   major: boolean;
+  subdivision?: boolean;
+  labelAt?: Date;
+  labelSpanMs?: number;
+  labelTier?: TimelineTickLabelTier;
 }
+
+interface TimelineLabelPlacement {
+  start: number;
+  end: number;
+  priority: number;
+  element: HTMLElement;
+}
+
+type TimelineTickLabelStyle = "date" | "day-number" | "month" | "month-year";
+type TimelineTickLabelTier = "major" | "interval" | "subdivision";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -131,6 +145,31 @@ const LEGACY_ZOOM_DURATIONS: Record<string, number> = {
   year: YEAR_MS,
   fit: MONTH_MS,
 };
+
+const WHEEL_ZOOM_DURATIONS = [
+  DAY_MS,
+  2 * DAY_MS,
+  3 * DAY_MS,
+  4 * DAY_MS,
+  5 * DAY_MS,
+  WEEK_MS,
+  2 * WEEK_MS,
+  3 * WEEK_MS,
+  MONTH_MS,
+  2 * MONTH_MS,
+  3 * MONTH_MS,
+  4 * MONTH_MS,
+  5 * MONTH_MS,
+  6 * MONTH_MS,
+  YEAR_MS,
+  2 * YEAR_MS,
+  3 * YEAR_MS,
+  4 * YEAR_MS,
+  5 * YEAR_MS,
+  10 * YEAR_MS,
+  20 * YEAR_MS,
+  40 * YEAR_MS,
+];
 
 function isTimelineZoomId(value: unknown): value is TimelineZoomId {
   return ZOOM_LEVELS.some((zoomLevel) => zoomLevel.id === value);
@@ -363,7 +402,8 @@ export class TimelineView extends BasesView {
       cls: "base-board-timeline-ruler-track",
     });
     trackEl.style.width = `${width}px`;
-    const ticks = this.getTicks(range);
+    const ticks = this.getRenderableTicks(this.getTicks(range), range, width);
+    const placedLabels: TimelineLabelPlacement[] = [];
 
     for (const tick of ticks) {
       const left = this.getPercent(tick.at, range);
@@ -373,8 +413,13 @@ export class TimelineView extends BasesView {
           ? "base-board-timeline-tick--major"
           : "base-board-timeline-tick--minor",
       );
+      if (tick.subdivision) {
+        tickEl.addClass("base-board-timeline-tick--subdivision");
+      }
       tickEl.style.left = `${left}%`;
-      if (tick.label) tickEl.createSpan({ text: tick.label });
+      if (tick.label) {
+        this.renderTickLabel(trackEl, tick, range, width, placedLabels);
+      }
     }
 
     const gridEl = contentEl.createDiv({ cls: "base-board-timeline-grid" });
@@ -387,8 +432,101 @@ export class TimelineView extends BasesView {
           ? "base-board-timeline-grid-line--major"
           : "base-board-timeline-grid-line--minor",
       );
+      if (tick.subdivision) {
+        lineEl.addClass("base-board-timeline-grid-line--subdivision");
+      }
       lineEl.style.left = `${left}%`;
     }
+  }
+
+  private getRenderableTicks(
+    ticks: TimelineTick[],
+    range: TimelineRange,
+    width: number,
+  ): TimelineTick[] {
+    const minimumSubdivisionGapPx = 18;
+    const anchorTicks = ticks.filter((tick) => !tick.subdivision || tick.label);
+
+    return ticks.filter((tick) => {
+      if (!tick.subdivision || tick.label) return true;
+
+      const tickX = (this.getPercent(tick.at, range) / 100) * width;
+      return !anchorTicks.some((anchorTick) => {
+        if (anchorTick.at.getTime() === tick.at.getTime()) return false;
+        const anchorX = (this.getPercent(anchorTick.at, range) / 100) * width;
+        return Math.abs(anchorX - tickX) < minimumSubdivisionGapPx;
+      });
+    });
+  }
+
+  private renderTickLabel(
+    trackEl: HTMLElement,
+    tick: TimelineTick,
+    range: TimelineRange,
+    width: number,
+    placedLabels: TimelineLabelPlacement[],
+  ): void {
+    const labelDate = tick.subdivision ? (tick.labelAt ?? tick.at) : tick.at;
+    const labelLeft = this.getPercent(labelDate, range);
+    const labelWidth = this.getEstimatedTickLabelWidth(tick, range, width);
+    const labelX = (labelLeft / 100) * width;
+    const labelStart = tick.subdivision ? labelX - labelWidth / 2 : labelX;
+    const labelEnd = labelStart + labelWidth;
+    const labelPriority = this.getTickLabelPriority(tick);
+
+    const collisions = placedLabels.filter(
+      (placement) => placement.start < labelEnd && placement.end > labelStart,
+    );
+    if (collisions.some((placement) => placement.priority >= labelPriority)) {
+      return;
+    }
+
+    for (const collision of collisions) {
+      collision.element.remove();
+      placedLabels.splice(placedLabels.indexOf(collision), 1);
+    }
+
+    const labelEl = trackEl.createSpan({
+      cls: "base-board-timeline-tick-label",
+      text: tick.label,
+    });
+    labelEl.addClass(
+      `base-board-timeline-tick-label--${this.getTickLabelTier(tick)}`,
+    );
+    labelEl.style.left = `${labelLeft}%`;
+    if (tick.subdivision && tick.labelSpanMs) {
+      const labelWidthPercent =
+        (tick.labelSpanMs / (range.end.getTime() - range.start.getTime())) *
+        100;
+      labelEl.style.maxWidth = `calc(${labelWidthPercent}% - 8px)`;
+    }
+
+    placedLabels.push({
+      start: labelStart - 6,
+      end: labelEnd + 6,
+      priority: labelPriority,
+      element: labelEl,
+    });
+  }
+
+  private getEstimatedTickLabelWidth(
+    tick: TimelineTick,
+    range: TimelineRange,
+    width: number,
+  ): number {
+    const textWidth = Math.min(120, tick.label.length * 7 + 16);
+    if (!tick.subdivision || !tick.labelSpanMs) return textWidth;
+
+    const spanWidth =
+      (tick.labelSpanMs / (range.end.getTime() - range.start.getTime())) *
+      width;
+    return Math.max(12, Math.min(textWidth, spanWidth - 8));
+  }
+
+  private getTickLabelPriority(tick: TimelineTick): number {
+    if (tick.major) return 3;
+    if (tick.labelTier === "interval") return 2;
+    return 1;
   }
 
   private renderLane(
@@ -896,9 +1034,10 @@ export class TimelineView extends BasesView {
   }
 
   private zoomByWheel(event: WheelEvent): void {
-    const step = this.getZoomStep(this.zoomDurationMs);
     const direction = event.deltaY > 0 ? 1 : -1;
-    this.setZoomDuration(this.zoomDurationMs + step * direction);
+    this.setZoomDuration(
+      this.getNextWheelZoomDuration(this.zoomDurationMs, direction),
+    );
   }
 
   private setZoomDuration(durationMs: number): void {
@@ -937,11 +1076,30 @@ export class TimelineView extends BasesView {
     return Math.max(DAY_MS, Math.min(40 * YEAR_MS, durationMs));
   }
 
-  private getZoomStep(durationMs: number): number {
-    if (durationMs < WEEK_MS) return DAY_MS;
-    if (durationMs < MONTH_MS) return WEEK_MS;
-    if (durationMs <= YEAR_MS) return MONTH_MS;
-    return YEAR_MS;
+  private getNextWheelZoomDuration(
+    durationMs: number,
+    direction: number,
+  ): number {
+    const currentIndex = this.getNearestWheelZoomIndex(durationMs);
+    const nextIndex = Math.max(
+      0,
+      Math.min(WHEEL_ZOOM_DURATIONS.length - 1, currentIndex + direction),
+    );
+    return WHEEL_ZOOM_DURATIONS[nextIndex];
+  }
+
+  private getNearestWheelZoomIndex(durationMs: number): number {
+    const clampedDuration = this.clampZoomDuration(durationMs);
+    let nearestIndex = 0;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < WHEEL_ZOOM_DURATIONS.length; index++) {
+      const distance = Math.abs(WHEEL_ZOOM_DURATIONS[index] - clampedDuration);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestIndex = index;
+      }
+    }
+    return nearestIndex;
   }
 
   private getLabelWidth(): number {
@@ -1126,37 +1284,59 @@ export class TimelineView extends BasesView {
         this.getHourIntervalTicks(range, 6),
       );
     }
-    if (this.zoomDurationMs <= 3 * WEEK_MS) {
+    if (this.zoomDurationMs <= MONTH_MS) {
       return this.combineTicks(
         this.getWeeklyTicks(range, true),
-        this.getDailyTicks(range, false),
+        this.getDailyTicks(range, false, "day-number", true),
+      );
+    }
+    if (this.zoomDurationMs <= 6 * MONTH_MS) {
+      return this.combineTicks(
+        this.getMonthlyTicks(range, true),
+        this.getWeeklyTicks(range, false, true),
+        this.getDayIntervalTicks(range, 2, false, "day-number", true, false),
       );
     }
     if (this.zoomDurationMs <= 2 * YEAR_MS) {
       return this.combineTicks(
-        this.getMonthlyTicks(range, true),
-        this.getWeeklyTicks(range, false, this.zoomDurationMs <= 6 * MONTH_MS),
+        this.getYearlyTicks(range, true),
+        this.getMonthlyTicks(range, false, "month", true),
+        this.getWeeklyTicks(range, false, false),
+      );
+    }
+    if (this.zoomDurationMs <= 5 * YEAR_MS) {
+      return this.combineTicks(
+        this.getYearlyTicks(range, true),
+        this.getMonthIntervalTicks(range, 3, false, "month", true),
+        this.getMonthlyTicks(range, false, "month", false),
       );
     }
     return this.combineTicks(
-      this.getYearlyTicks(range, true),
-      this.getMonthlyTicks(range, false),
+      this.getYearlyTicks(range, true, this.getYearLabelInterval()),
+      this.getYearlyTicks(range, false, this.getYearMinorInterval(), true),
     );
   }
 
-  private combineTicks(
-    majorTicks: TimelineTick[],
-    minorTicks: TimelineTick[],
-  ): TimelineTick[] {
-    const majorTimes = new Set(
-      majorTicks.map((tick) => this.toLocalDateOnly(tick.at).getTime()),
+  private getTickLabelTier(tick: TimelineTick): TimelineTickLabelTier {
+    if (tick.labelTier) return tick.labelTier;
+    if (tick.subdivision) return "subdivision";
+    return tick.major ? "major" : "interval";
+  }
+
+  private combineTicks(...tickGroups: TimelineTick[][]): TimelineTick[] {
+    const seenTimes = new Set<number>();
+    const ticks: TimelineTick[] = [];
+    for (const tickGroup of tickGroups) {
+      for (const tick of tickGroup) {
+        const time = tick.at.getTime();
+        if (seenTimes.has(time)) continue;
+        seenTimes.add(time);
+        ticks.push(tick);
+      }
+    }
+    return ticks.sort(
+      (first, second) => first.at.getTime() - second.at.getTime(),
     );
-    return [
-      ...majorTicks,
-      ...minorTicks.filter(
-        (tick) => !majorTimes.has(this.toLocalDateOnly(tick.at).getTime()),
-      ),
-    ].sort((first, second) => first.at.getTime() - second.at.getTime());
   }
 
   private getHourIntervalTicks(
@@ -1172,22 +1352,41 @@ export class TimelineView extends BasesView {
     while (cursor.getTime() <= range.end.getTime()) {
       ticks.push({
         at: new Date(cursor),
-        label: "",
+        label: cursor.toLocaleTimeString([], {
+          hour: "numeric",
+        }),
         major: false,
+        labelTier: "interval",
       });
       cursor.setHours(cursor.getHours() + hours);
     }
     return ticks;
   }
 
-  private getDailyTicks(range: TimelineRange, major: boolean): TimelineTick[] {
-    return this.getDayIntervalTicks(range, 1, major);
+  private getDailyTicks(
+    range: TimelineRange,
+    major: boolean,
+    labelStyle: TimelineTickLabelStyle = "date",
+    subdivision = false,
+    showLabel = true,
+  ): TimelineTick[] {
+    return this.getDayIntervalTicks(
+      range,
+      1,
+      major,
+      labelStyle,
+      subdivision,
+      showLabel,
+    );
   }
 
   private getDayIntervalTicks(
     range: TimelineRange,
     days: number,
     major: boolean,
+    labelStyle: TimelineTickLabelStyle = "date",
+    subdivision = false,
+    showLabel = true,
   ): TimelineTick[] {
     const ticks: TimelineTick[] = [];
     const cursor = new Date(range.start);
@@ -1198,11 +1397,23 @@ export class TimelineView extends BasesView {
     while (cursor.getTime() <= range.end.getTime()) {
       ticks.push({
         at: new Date(cursor),
-        label: cursor.toLocaleDateString([], {
-          month: "short",
-          day: "numeric",
-        }),
+        label: showLabel
+          ? labelStyle === "day-number"
+            ? String(cursor.getDate())
+            : cursor.toLocaleDateString([], {
+                month: "short",
+                day: "numeric",
+              })
+          : "",
         major,
+        subdivision,
+        labelAt: this.getVisibleIntervalMidpoint(
+          cursor,
+          this.addDays(cursor, days),
+          range,
+        ),
+        labelSpanMs: days * DAY_MS,
+        labelTier: subdivision ? "subdivision" : major ? "major" : "interval",
       });
       cursor.setDate(cursor.getDate() + days);
     }
@@ -1227,6 +1438,13 @@ export class TimelineView extends BasesView {
           ? cursor.toLocaleDateString([], { month: "short", day: "numeric" })
           : "",
         major,
+        labelAt: this.getVisibleIntervalMidpoint(
+          cursor,
+          this.addDays(cursor, 7),
+          range,
+        ),
+        labelSpanMs: WEEK_MS,
+        labelTier: major ? "major" : "interval",
       });
       cursor.setDate(cursor.getDate() + 7);
     }
@@ -1244,46 +1462,108 @@ export class TimelineView extends BasesView {
   private getMonthlyTicks(
     range: TimelineRange,
     major: boolean,
+    labelStyle: TimelineTickLabelStyle = "month-year",
+    showLabel = true,
+  ): TimelineTick[] {
+    return this.getMonthIntervalTicks(range, 1, major, labelStyle, showLabel);
+  }
+
+  private getMonthIntervalTicks(
+    range: TimelineRange,
+    months: number,
+    major: boolean,
+    labelStyle: TimelineTickLabelStyle = "month-year",
+    showLabel = true,
   ): TimelineTick[] {
     const ticks: TimelineTick[] = [];
     const cursor = new Date(range.start);
-    cursor.setDate(1);
+    cursor.setMonth(cursor.getMonth() - (cursor.getMonth() % months), 1);
     cursor.setHours(0, 0, 0, 0);
-    if (cursor.getTime() < range.start.getTime())
-      cursor.setMonth(cursor.getMonth() + 1);
+    if (cursor.getTime() < range.start.getTime()) {
+      cursor.setMonth(cursor.getMonth() + months);
+    }
 
     while (cursor.getTime() <= range.end.getTime()) {
+      const nextMonth = new Date(cursor);
+      nextMonth.setMonth(nextMonth.getMonth() + months);
       ticks.push({
         at: new Date(cursor),
-        label: cursor.toLocaleDateString([], {
-          month: "short",
-          year: "numeric",
-        }),
+        label: showLabel
+          ? cursor.toLocaleDateString(
+              [],
+              labelStyle === "month"
+                ? { month: "short" }
+                : { month: "short", year: "numeric" },
+            )
+          : "",
         major,
+        labelAt: this.getVisibleIntervalMidpoint(cursor, nextMonth, range),
+        labelSpanMs: nextMonth.getTime() - cursor.getTime(),
+        labelTier: major ? "major" : "interval",
       });
-      cursor.setMonth(cursor.getMonth() + 1);
+      cursor.setMonth(cursor.getMonth() + months);
     }
     return ticks;
   }
 
-  private getYearlyTicks(range: TimelineRange, major: boolean): TimelineTick[] {
+  private getYearlyTicks(
+    range: TimelineRange,
+    major: boolean,
+    years = 1,
+    showLabel = major,
+  ): TimelineTick[] {
     const ticks: TimelineTick[] = [];
-    const cursor = new Date(range.start);
-    cursor.setMonth(0, 1);
-    cursor.setHours(0, 0, 0, 0);
+    const cursor = new Date(range.start.getFullYear(), 0, 1);
+    const yearOffset = ((cursor.getFullYear() % years) + years) % years;
+    if (yearOffset !== 0) {
+      cursor.setFullYear(cursor.getFullYear() - yearOffset);
+    }
     if (cursor.getTime() < range.start.getTime()) {
-      cursor.setFullYear(cursor.getFullYear() + 1);
+      cursor.setFullYear(cursor.getFullYear() + years);
     }
 
     while (cursor.getTime() <= range.end.getTime()) {
+      const nextYear = new Date(cursor);
+      nextYear.setFullYear(nextYear.getFullYear() + years);
       ticks.push({
         at: new Date(cursor),
-        label: cursor.toLocaleDateString([], { year: "numeric" }),
+        label: showLabel
+          ? cursor.toLocaleDateString([], { year: "numeric" })
+          : "",
         major,
+        labelAt: this.getVisibleIntervalMidpoint(cursor, nextYear, range),
+        labelSpanMs: nextYear.getTime() - cursor.getTime(),
+        labelTier: major ? "major" : "interval",
       });
-      cursor.setFullYear(cursor.getFullYear() + 1);
+      cursor.setFullYear(cursor.getFullYear() + years);
     }
     return ticks;
+  }
+
+  private getYearLabelInterval(): number {
+    if (this.zoomDurationMs <= 20 * YEAR_MS) return 5;
+    return 10;
+  }
+
+  private getYearMinorInterval(): number {
+    if (this.zoomDurationMs <= 20 * YEAR_MS) return 1;
+    return 5;
+  }
+
+  private getVisibleIntervalMidpoint(
+    start: Date,
+    end: Date,
+    range: TimelineRange,
+  ): Date {
+    const visibleStart = Math.max(start.getTime(), range.start.getTime());
+    const visibleEnd = Math.min(end.getTime(), range.end.getTime());
+    return new Date(visibleStart + Math.max(0, visibleEnd - visibleStart) / 2);
+  }
+
+  private addDays(date: Date, days: number): Date {
+    const nextDate = new Date(date);
+    nextDate.setDate(nextDate.getDate() + days);
+    return nextDate;
   }
 
   private getPercent(date: Date, range: TimelineRange): number {
