@@ -56,7 +56,7 @@ interface TimelineZoomLevel {
 interface TimelineZoomStop {
   id: TimelineZoomStopId;
   durationMs: number;
-  tiers: TimelineRulerTier[];
+  ruler: TimelineRulerPolicy;
 }
 
 interface TransitionHistoryRecord {
@@ -127,6 +127,7 @@ interface TimelineLabelBand {
   end: Date;
   labelCandidates: string[];
   row: TimelineLabelBandRow;
+  labelFormat: TimelineLabelFormat;
 }
 
 interface TimelineLabelPlacement {
@@ -137,128 +138,201 @@ interface TimelineLabelPlacement {
   label: string;
 }
 
-interface TimelineRulerTier {
-  unit: TimelineCalendarUnit;
-  lineTier: TimelineGridLineTier;
-  labelRow?: TimelineLabelBandRow;
-  minLineGapPx: number;
-  drawLines?: boolean;
+interface TimelineRulerPolicy {
+  gridUnit: TimelineCalendarUnit;
+  gridEvery: number;
+  gridLineTier: TimelineGridLineTier;
+  majorGridUnit?: TimelineCalendarUnit;
+  majorGridEvery?: number;
+  majorLabelUnit: TimelineCalendarUnit;
+  majorLabelEvery?: number;
+  majorLabelFormat?: TimelineLabelFormat;
+  minorLabelUnit?: TimelineCalendarUnit;
+  minorLabelEvery?: number;
+  minorLabelFormat?: TimelineLabelFormat;
 }
 
 type TimelineCalendarUnit = "hour" | "day" | "week" | "month" | "year";
 type TimelineGridLineTier = "major" | "minor" | "subdivision";
 type TimelineLabelBandRow = "major" | "minor";
+type TimelineLabelFormat =
+  | "auto"
+  | "day-number"
+  | "month-day"
+  | "month-year"
+  | "weekday-day";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 31 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
-const TIMELINE_BUILD_VERSION = "2026.06.01.7";
+const TIMELINE_BUILD_VERSION = "2026.06.02.2";
 
 const TIMELINE_ZOOM_STOPS: TimelineZoomStop[] = [
   {
     id: "1d",
     durationMs: DAY_MS,
-    tiers: [
-      { unit: "day", lineTier: "major", labelRow: "major", minLineGapPx: 48 },
-      { unit: "hour", lineTier: "minor", labelRow: "minor", minLineGapPx: 14 },
-    ],
+    ruler: {
+      gridUnit: "hour",
+      gridEvery: 1,
+      gridLineTier: "minor",
+      majorLabelUnit: "day",
+      minorLabelUnit: "hour",
+    },
   },
   {
     id: "2d",
     durationMs: 2 * DAY_MS,
-    tiers: [
-      { unit: "day", lineTier: "major", labelRow: "major", minLineGapPx: 48 },
-      { unit: "hour", lineTier: "minor", labelRow: "minor", minLineGapPx: 18 },
-    ],
+    ruler: {
+      gridUnit: "hour",
+      gridEvery: 1,
+      gridLineTier: "minor",
+      majorLabelUnit: "day",
+      minorLabelUnit: "hour",
+    },
   },
   {
     id: "3d",
     durationMs: 3 * DAY_MS,
-    tiers: [
-      { unit: "day", lineTier: "major", labelRow: "major", minLineGapPx: 48 },
-      { unit: "hour", lineTier: "minor", minLineGapPx: 24 },
-    ],
+    ruler: {
+      gridUnit: "hour",
+      gridEvery: 6,
+      gridLineTier: "minor",
+      majorLabelUnit: "day",
+    },
   },
   {
     id: "4d",
     durationMs: 4 * DAY_MS,
-    tiers: [
-      { unit: "day", lineTier: "major", labelRow: "major", minLineGapPx: 48 },
-      { unit: "hour", lineTier: "minor", minLineGapPx: 24 },
-    ],
+    ruler: {
+      gridUnit: "hour",
+      gridEvery: 6,
+      gridLineTier: "minor",
+      majorGridUnit: "week",
+      majorLabelUnit: "week",
+      majorLabelFormat: "month-year",
+      minorLabelUnit: "day",
+      minorLabelFormat: "weekday-day",
+    },
   },
   {
     id: "5d",
     durationMs: 5 * DAY_MS,
-    tiers: [
-      { unit: "day", lineTier: "major", labelRow: "major", minLineGapPx: 48 },
-      { unit: "hour", lineTier: "minor", minLineGapPx: 28 },
-    ],
+    ruler: {
+      gridUnit: "hour",
+      gridEvery: 12,
+      gridLineTier: "minor",
+      majorGridUnit: "week",
+      majorLabelUnit: "week",
+      majorLabelFormat: "month-year",
+      minorLabelUnit: "day",
+      minorLabelFormat: "weekday-day",
+    },
   },
   {
     id: "1w",
     durationMs: WEEK_MS,
-    tiers: [
-      { unit: "week", lineTier: "major", labelRow: "major", minLineGapPx: 58 },
-      { unit: "day", lineTier: "minor", labelRow: "minor", minLineGapPx: 18 },
-    ],
+    ruler: {
+      gridUnit: "day",
+      gridEvery: 1,
+      gridLineTier: "minor",
+      majorGridUnit: "week",
+      majorLabelUnit: "week",
+      majorLabelFormat: "month-year",
+      minorLabelUnit: "day",
+      minorLabelFormat: "weekday-day",
+    },
   },
   {
     id: "2w",
     durationMs: 2 * WEEK_MS,
-    tiers: [
-      { unit: "week", lineTier: "major", labelRow: "major", minLineGapPx: 58 },
-      { unit: "day", lineTier: "minor", labelRow: "minor", minLineGapPx: 18 },
-    ],
+    ruler: {
+      gridUnit: "day",
+      gridEvery: 1,
+      gridLineTier: "minor",
+      majorGridUnit: "week",
+      majorLabelUnit: "week",
+      majorLabelFormat: "month-year",
+      minorLabelUnit: "day",
+      minorLabelFormat: "weekday-day",
+    },
   },
   {
     id: "3w",
     durationMs: 3 * WEEK_MS,
-    tiers: [
-      { unit: "week", lineTier: "major", labelRow: "major", minLineGapPx: 58 },
-      { unit: "day", lineTier: "minor", labelRow: "minor", minLineGapPx: 18 },
-    ],
+    ruler: {
+      gridUnit: "day",
+      gridEvery: 1,
+      gridLineTier: "minor",
+      majorGridUnit: "week",
+      majorLabelUnit: "week",
+      majorLabelFormat: "month-year",
+      minorLabelUnit: "day",
+      minorLabelFormat: "weekday-day",
+    },
   },
   ...(["1mo", "2mo", "3mo", "4mo", "5mo", "6mo"] as const).map(
     (id, index): TimelineZoomStop => ({
       id,
       durationMs: (index + 1) * MONTH_MS,
-      tiers: [
-        { unit: "week", lineTier: "minor", labelRow: "major", minLineGapPx: 30 },
-      ],
+      ruler: {
+        gridUnit: index < 2 ? "day" : "week",
+        gridEvery: 1,
+        gridLineTier: "minor",
+        majorGridUnit: index < 2 ? "week" : "month",
+        majorLabelUnit: index < 2 ? "week" : "month",
+        majorLabelFormat: "month-year",
+        minorLabelUnit: index < 2 ? "day" : undefined,
+        minorLabelEvery: 1,
+        minorLabelFormat: "day-number",
+      },
     }),
   ),
   ...(["1y", "2y", "3y", "4y", "5y"] as const).map(
     (id, index): TimelineZoomStop => ({
       id,
       durationMs: (index + 1) * YEAR_MS,
-      tiers: [
-        { unit: "year", lineTier: "major", labelRow: "major", minLineGapPx: 60 },
-        { unit: "month", lineTier: "minor", labelRow: "minor", minLineGapPx: 26 },
-      ],
+      ruler: {
+        gridUnit: "month",
+        gridEvery: 1,
+        gridLineTier: "minor",
+        majorGridUnit: "year",
+        majorLabelUnit: "year",
+        minorLabelUnit: index < 2 ? "month" : undefined,
+      },
     }),
   ),
   {
     id: "10y",
     durationMs: 10 * YEAR_MS,
-    tiers: [
-      { unit: "year", lineTier: "major", labelRow: "major", minLineGapPx: 36 },
-    ],
+    ruler: {
+      gridUnit: "year",
+      gridEvery: 1,
+      gridLineTier: "minor",
+      majorLabelUnit: "year",
+    },
   },
   {
     id: "20y",
     durationMs: 20 * YEAR_MS,
-    tiers: [
-      { unit: "year", lineTier: "major", labelRow: "major", minLineGapPx: 36 },
-    ],
+    ruler: {
+      gridUnit: "year",
+      gridEvery: 2,
+      gridLineTier: "minor",
+      majorLabelUnit: "year",
+      majorLabelEvery: 2,
+    },
   },
   {
     id: "40y",
     durationMs: 40 * YEAR_MS,
-    tiers: [
-      { unit: "year", lineTier: "major", labelRow: "major", minLineGapPx: 36 },
-    ],
+    ruler: {
+      gridUnit: "year",
+      gridEvery: 5,
+      gridLineTier: "minor",
+      majorLabelUnit: "year",
+      majorLabelEvery: 5,
+    },
   },
 ];
 
@@ -453,6 +527,14 @@ export class TimelineView extends BasesView {
       cls: "base-board-timeline-build-version",
       text: `v${TIMELINE_BUILD_VERSION}`,
     });
+    const tickDebugEl = zoomEl.createSpan({
+      cls: "base-board-timeline-build-version base-board-timeline-zoom-tick-debug",
+      text: this.getWheelZoomTickDebugText(this.zoomDurationMs),
+    });
+    setTooltip(
+      tickDebugEl,
+      "Wheel zoom tick bounds and current level for debugging ruler spacing.",
+    );
 
     this.renderFilterBar(toolbarEl, tasks);
   }
@@ -549,6 +631,7 @@ export class TimelineView extends BasesView {
     const ruler = this.getRulerModel(range, width);
 
     for (const gridLine of ruler.gridLines) {
+      if (gridLine.tier !== "major") continue;
       this.renderRulerGridLine(trackEl, gridLine, range);
     }
 
@@ -578,75 +661,44 @@ export class TimelineView extends BasesView {
     }
   }
 
-  private getRulerModel(range: TimelineRange, width: number): TimelineRulerModel {
-    const tiers = this.getRulerStrategy();
+  private getRulerModel(
+    range: TimelineRange,
+    width: number,
+  ): TimelineRulerModel {
+    const ruler = this.getRulerPolicy();
     return {
-      gridLines: this.getRulerGridLines(range, width, tiers),
-      labelBands: this.getRulerLabelBands(range, width, tiers),
+      gridLines: this.getRulerGridLines(range, ruler),
+      labelBands: this.getRulerLabelBands(range, ruler),
     };
   }
 
   private getRulerGridLines(
     range: TimelineRange,
-    width: number,
-    tiers: TimelineRulerTier[],
+    ruler: TimelineRulerPolicy,
   ): TimelineGridLine[] {
     const linesByTime = new Map<number, TimelineGridLine>();
 
-    for (const tier of tiers) {
-      if (tier.drawLines === false) continue;
-      if (!this.shouldRenderRulerTier(range, width, tier)) continue;
+    for (const at of this.getCalendarBoundaries(
+      range,
+      ruler.gridUnit,
+      ruler.gridEvery,
+    )) {
+      linesByTime.set(at.getTime(), { at, tier: ruler.gridLineTier });
+    }
 
-      for (const at of this.getCalendarBoundaries(range, tier.unit)) {
-        const time = at.getTime();
-        const existingLine = linesByTime.get(time);
-        if (
-          !existingLine ||
-          this.getGridLinePriority(tier.lineTier) >
-            this.getGridLinePriority(existingLine.tier)
-        ) {
-          linesByTime.set(time, { at, tier: tier.lineTier });
-        }
+    if (ruler.majorGridUnit) {
+      for (const at of this.getCalendarBoundaries(
+        range,
+        ruler.majorGridUnit,
+        ruler.majorGridEvery ?? 1,
+      )) {
+        linesByTime.set(at.getTime(), { at, tier: "major" });
       }
     }
 
     return Array.from(linesByTime.values()).sort(
       (first, second) => first.at.getTime() - second.at.getTime(),
     );
-  }
-
-  private shouldRenderRulerTier(
-    range: TimelineRange,
-    width: number,
-    tier: TimelineRulerTier,
-  ): boolean {
-    if (tier.lineTier === "major") return true;
-    const boundaries = this.getCalendarBoundaries(range, tier.unit);
-    if (boundaries.length < 2) return true;
-    return (
-      this.getMinimumBoundaryGapPx(boundaries, range, width) >=
-      tier.minLineGapPx
-    );
-  }
-
-  private getMinimumBoundaryGapPx(
-    boundaries: Date[],
-    range: TimelineRange,
-    width: number,
-  ): number {
-    let minimumGapPx = Number.POSITIVE_INFINITY;
-    for (let index = 1; index < boundaries.length; index++) {
-      const previousX = (this.getPercent(boundaries[index - 1], range) / 100) * width;
-      const currentX = (this.getPercent(boundaries[index], range) / 100) * width;
-      minimumGapPx = Math.min(minimumGapPx, currentX - previousX);
-    }
-    return minimumGapPx;
-  }
-
-  private getGridLinePriority(tier: TimelineGridLineTier): number {
-    if (tier === "major") return 3;
-    if (tier === "minor") return 2;
-    return 1;
   }
 
   private renderRulerGridLine(
@@ -676,9 +728,11 @@ export class TimelineView extends BasesView {
     width: number,
   ): void {
     const placements: TimelineLabelPlacement[] = [];
-    const sortedBands = [...labelBands].sort(
-      (first, second) => first.start.getTime() - second.start.getTime(),
-    );
+    const sortedBands = this.getConsistentRulerLabelBands(
+      labelBands,
+      range,
+      width,
+    ).sort((first, second) => first.start.getTime() - second.start.getTime());
 
     for (const labelBand of sortedBands) {
       const placement = this.getRulerLabelPlacement(
@@ -697,6 +751,58 @@ export class TimelineView extends BasesView {
       labelEl.style.width = `${placement.widthPercent}%`;
       placements.push(placement);
     }
+  }
+
+  private getConsistentRulerLabelBands(
+    labelBands: TimelineLabelBand[],
+    range: TimelineRange,
+    width: number,
+  ): TimelineLabelBand[] {
+    if (
+      labelBands.length === 0 ||
+      !labelBands.every((labelBand) => labelBand.labelFormat === "weekday-day")
+    ) {
+      return [...labelBands];
+    }
+
+    const longLabelBands = labelBands.map((labelBand) => ({
+      ...labelBand,
+      labelCandidates: labelBand.labelCandidates.slice(0, 1),
+    }));
+    if (this.canPlaceAllRulerLabelBands(longLabelBands, range, width)) {
+      return longLabelBands;
+    }
+
+    return labelBands.map((labelBand) => ({
+      ...labelBand,
+      labelCandidates: [
+        labelBand.labelCandidates[1] ?? labelBand.labelCandidates[0],
+      ],
+    }));
+  }
+
+  private canPlaceAllRulerLabelBands(
+    labelBands: TimelineLabelBand[],
+    range: TimelineRange,
+    width: number,
+  ): boolean {
+    const placements: TimelineLabelPlacement[] = [];
+    const sortedBands = [...labelBands].sort(
+      (first, second) => first.start.getTime() - second.start.getTime(),
+    );
+
+    for (const labelBand of sortedBands) {
+      const placement = this.getRulerLabelPlacement(
+        labelBand,
+        range,
+        width,
+        placements,
+      );
+      if (!placement) return false;
+      placements.push(placement);
+    }
+
+    return true;
   }
 
   private getRulerLabelPlacement(
@@ -718,12 +824,11 @@ export class TimelineView extends BasesView {
     const startPx = (startPercent / 100) * width;
     const endPx = (endPercent / 100) * width;
     const centerPx = startPx + (endPx - startPx) / 2;
-    const labelGapPx = 8;
-
     for (const label of labelBand.labelCandidates) {
       const requiredWidthPx = this.getEstimatedRulerLabelWidth(label);
       if (bandWidthPx < requiredWidthPx) continue;
 
+      const labelGapPx = this.getRulerLabelGapPx(label);
       const labelStartPx = centerPx - requiredWidthPx / 2 - labelGapPx;
       const labelEndPx = centerPx + requiredWidthPx / 2 + labelGapPx;
       const collides = existingPlacements.some(
@@ -746,45 +851,72 @@ export class TimelineView extends BasesView {
   }
 
   private getEstimatedRulerLabelWidth(label: string): number {
+    if (/^\d{1,2}$/.test(label)) return label.length * 7 + 4;
     return Math.min(160, label.length * 7.5 + 18);
+  }
+
+  private getRulerLabelGapPx(label: string): number {
+    if (/^\d{1,2}$/.test(label)) return 1;
+    return 8;
   }
 
   private getRulerLabelBands(
     range: TimelineRange,
-    width: number,
-    tiers: TimelineRulerTier[],
+    ruler: TimelineRulerPolicy,
   ): TimelineLabelBand[] {
-    const bands: TimelineLabelBand[] = [];
-    for (const tier of tiers) {
-      if (!tier.labelRow || !this.shouldRenderRulerTier(range, width, tier)) {
-        continue;
-      }
-      bands.push(...this.getCalendarLabelBands(range, tier.unit, tier.labelRow));
+    const bands = this.getCalendarLabelBands(
+      range,
+      ruler.majorLabelUnit,
+      "major",
+      ruler.majorLabelEvery ?? 1,
+      ruler.majorLabelFormat,
+    );
+    if (ruler.minorLabelUnit) {
+      bands.push(
+        ...this.getCalendarLabelBands(
+          range,
+          ruler.minorLabelUnit,
+          "minor",
+          ruler.minorLabelEvery ?? 1,
+          ruler.minorLabelFormat,
+        ),
+      );
     }
     return bands;
   }
 
-  private getRulerStrategy(): TimelineRulerTier[] {
-    return this.getActiveZoomStop().tiers;
+  private getRulerPolicy(): TimelineRulerPolicy {
+    return this.getActiveZoomStop().ruler;
   }
 
   private getCalendarLabelBands(
     range: TimelineRange,
     unit: TimelineCalendarUnit,
     row: TimelineLabelBandRow,
+    every = 1,
+    labelFormat: TimelineLabelFormat = "auto",
   ): TimelineLabelBand[] {
     const bands: TimelineLabelBand[] = [];
     const cursor = this.getCalendarBoundaryOnOrBefore(range.start, unit);
 
     while (cursor.getTime() < range.end.getTime()) {
       const end = this.addCalendarUnit(cursor, unit);
-      bands.push({
-        start: new Date(cursor),
-        end,
-        labelCandidates: this.getCalendarLabelCandidates(cursor, unit),
-        row,
-      });
-      this.advanceCalendarCursor(cursor, unit);
+      if (this.shouldUseCalendarBoundary(cursor, unit, every)) {
+        const labelEnd = this.addCalendarUnits(cursor, unit, every);
+        bands.push({
+          start: new Date(cursor),
+          end: labelEnd,
+          labelCandidates: this.getCalendarLabelCandidates(
+            cursor,
+            unit,
+            labelFormat,
+            labelEnd,
+          ),
+          row,
+          labelFormat,
+        });
+      }
+      cursor.setTime(end.getTime());
     }
 
     return bands;
@@ -793,12 +925,16 @@ export class TimelineView extends BasesView {
   private getCalendarBoundaries(
     range: TimelineRange,
     unit: TimelineCalendarUnit,
+    every = 1,
   ): Date[] {
     const boundaries: Date[] = [];
     const cursor = this.getCalendarBoundaryOnOrBefore(range.start, unit);
 
     while (cursor.getTime() <= range.end.getTime()) {
-      if (cursor.getTime() >= range.start.getTime()) {
+      if (
+        cursor.getTime() >= range.start.getTime() &&
+        this.shouldUseCalendarBoundary(cursor, unit, every)
+      ) {
         boundaries.push(new Date(cursor));
       }
       this.advanceCalendarCursor(cursor, unit);
@@ -851,10 +987,59 @@ export class TimelineView extends BasesView {
     return nextDate;
   }
 
+  private addCalendarUnits(
+    date: Date,
+    unit: TimelineCalendarUnit,
+    count: number,
+  ): Date {
+    const nextDate = new Date(date);
+    for (let index = 0; index < count; index++) {
+      this.advanceCalendarCursor(nextDate, unit);
+    }
+    return nextDate;
+  }
+
+  private shouldUseCalendarBoundary(
+    date: Date,
+    unit: TimelineCalendarUnit,
+    every: number,
+  ): boolean {
+    if (every <= 1) return true;
+
+    if (unit === "hour") return date.getHours() % every === 0;
+    if (unit === "day")
+      return Math.floor(date.getTime() / DAY_MS) % every === 0;
+    if (unit === "week") {
+      return (
+        Math.floor(this.toLocalDateOnly(date).getTime() / WEEK_MS) % every === 0
+      );
+    }
+    if (unit === "month") {
+      return (date.getFullYear() * 12 + date.getMonth()) % every === 0;
+    }
+    return date.getFullYear() % every === 0;
+  }
+
   private getCalendarLabelCandidates(
     date: Date,
     unit: TimelineCalendarUnit,
+    format: TimelineLabelFormat = "auto",
+    end?: Date,
   ): string[] {
+    if (format === "day-number") return [String(date.getDate())];
+    if (format === "month-day") {
+      return [date.toLocaleDateString([], { month: "short", day: "numeric" })];
+    }
+    if (format === "month-year") {
+      return [this.getMonthYearLabel(date, end)];
+    }
+    if (format === "weekday-day") {
+      return [
+        `${date.toLocaleDateString([], { weekday: "long" })} ${date.getDate()}`,
+        `${date.toLocaleDateString([], { weekday: "short" })} ${date.getDate()}`,
+      ];
+    }
+
     if (unit === "hour") {
       const hour = date.getHours();
       const hour12 = hour % 12 || 12;
@@ -870,20 +1055,7 @@ export class TimelineView extends BasesView {
       ]);
     }
     if (unit === "week") {
-      const previousWeek = this.addDays(date, -7);
-      if (previousWeek.getMonth() !== date.getMonth()) {
-        return this.uniqueLabels([
-          date.toLocaleDateString([], { month: "long", year: "numeric" }),
-          date.toLocaleDateString([], { month: "long" }),
-          date.toLocaleDateString([], { month: "short" }),
-          date.toLocaleDateString([], { month: "short", day: "numeric" }),
-          String(date.getDate()),
-        ]);
-      }
-      return this.uniqueLabels([
-        date.toLocaleDateString([], { month: "short", day: "numeric" }),
-        String(date.getDate()),
-      ]);
+      return [];
     }
     if (unit === "month") {
       return this.uniqueLabels([
@@ -893,6 +1065,26 @@ export class TimelineView extends BasesView {
       ]);
     }
     return [date.toLocaleDateString([], { year: "numeric" })];
+  }
+
+  private getMonthYearLabel(start: Date, end?: Date): string {
+    if (!end) {
+      return start.toLocaleDateString([], { month: "long", year: "numeric" });
+    }
+
+    const inclusiveEnd = this.addDays(end, -1);
+    if (
+      start.getFullYear() === inclusiveEnd.getFullYear() &&
+      start.getMonth() === inclusiveEnd.getMonth()
+    ) {
+      return start.toLocaleDateString([], { month: "long", year: "numeric" });
+    }
+
+    if (start.getFullYear() === inclusiveEnd.getFullYear()) {
+      return `${start.toLocaleDateString([], { month: "long" })}/${inclusiveEnd.toLocaleDateString([], { month: "long" })} ${start.getFullYear()}`;
+    }
+
+    return `${start.toLocaleDateString([], { month: "long", year: "numeric" })}/${inclusiveEnd.toLocaleDateString([], { month: "long", year: "numeric" })}`;
   }
 
   private uniqueLabels(labels: string[]): string[] {
@@ -1445,7 +1637,9 @@ export class TimelineView extends BasesView {
   }
 
   private getActiveZoomStop(): TimelineZoomStop {
-    return TIMELINE_ZOOM_STOPS[this.getNearestWheelZoomIndex(this.zoomDurationMs)];
+    return TIMELINE_ZOOM_STOPS[
+      this.getNearestWheelZoomIndex(this.zoomDurationMs)
+    ];
   }
 
   private clampZoomDuration(durationMs: number): number {
@@ -1476,6 +1670,17 @@ export class TimelineView extends BasesView {
       }
     }
     return nearestIndex;
+  }
+
+  private getWheelZoomTickDebugText(durationMs: number): string {
+    const currentIndex = this.getNearestWheelZoomIndex(durationMs);
+    const minimumIndex = 0;
+    const maximumIndex = TIMELINE_ZOOM_STOPS.length - 1;
+    return (
+      `ticks min ${minimumIndex}=${TIMELINE_ZOOM_STOPS[minimumIndex].id} ` +
+      `current ${currentIndex}=${TIMELINE_ZOOM_STOPS[currentIndex].id} ` +
+      `max ${maximumIndex}=${TIMELINE_ZOOM_STOPS[maximumIndex].id}`
+    );
   }
 
   private getLabelWidth(): number {
