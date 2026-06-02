@@ -173,7 +173,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 31 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
-const TIMELINE_BUILD_VERSION = "2026.06.02.17";
+const TIMELINE_BUILD_VERSION = "2026.06.02.18";
 const COMPLETED_SEGMENT_TAIL_MIN_MS = 12 * 60 * 60 * 1000;
 const COMPLETED_SEGMENT_TAIL_MAX_MS = 3 * DAY_MS;
 const COMPLETED_SEGMENT_TAIL_RATIO = 0.1;
@@ -407,9 +407,9 @@ function getZoomStopById(id: TimelineZoomStopId): TimelineZoomStop {
 const DEFAULT_LABEL_WIDTH = 240;
 const MIN_LABEL_WIDTH = 180;
 const MAX_LABEL_WIDTH = 520;
-const LANE_HEIGHT = 44;
+const LANE_HEIGHT = 36;
 const POOL_HEADER_HEIGHT = 34;
-const LANE_GAP = 8;
+const LANE_GAP = 0;
 
 export class TimelineView extends BasesView {
   type = "timeline";
