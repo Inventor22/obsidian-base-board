@@ -963,7 +963,7 @@
 .base-board-timeline-tick--minor {
   border-left-color: color-mix(
     in srgb,
-    var(--background-modifier-border) 70%,
+    var(--background-modifier-border) 55%,
     transparent
   );
 }
@@ -995,6 +995,7 @@
 
 .base-board-timeline-label-band {
   position: absolute;
+  display: block;
   box-sizing: border-box;
   height: 18px;
   padding: 0 6px;
@@ -1040,7 +1041,7 @@
 .base-board-timeline-grid-line--minor {
   border-left-color: color-mix(
     in srgb,
-    var(--background-modifier-border) 55%,
+    var(--background-modifier-border) 40%,
     transparent
   );
 }
