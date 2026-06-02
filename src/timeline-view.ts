@@ -173,7 +173,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 31 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
-const TIMELINE_BUILD_VERSION = "2026.06.02.18";
+const TIMELINE_BUILD_VERSION = "2026.06.02.19";
 const COMPLETED_SEGMENT_TAIL_MIN_MS = 12 * 60 * 60 * 1000;
 const COMPLETED_SEGMENT_TAIL_MAX_MS = 3 * DAY_MS;
 const COMPLETED_SEGMENT_TAIL_RATIO = 0.1;
@@ -407,8 +407,8 @@ function getZoomStopById(id: TimelineZoomStopId): TimelineZoomStop {
 const DEFAULT_LABEL_WIDTH = 240;
 const MIN_LABEL_WIDTH = 180;
 const MAX_LABEL_WIDTH = 520;
-const LANE_HEIGHT = 36;
-const POOL_HEADER_HEIGHT = 34;
+const LANE_HEIGHT = 28;
+const POOL_HEADER_HEIGHT = 28;
 const LANE_GAP = 0;
 
 export class TimelineView extends BasesView {
@@ -586,6 +586,7 @@ export class TimelineView extends BasesView {
       `${this.getLabelWidth()}px`,
     );
     const totalLanes = pools.reduce((sum, pool) => sum + pool.lanes.length, 0);
+    const totalPoolHeaders = pools.filter((pool) => pool.id !== "tasks").length;
     const width = this.getTimelineWidth(range, timelineEl);
     contentEl.style.width = `${this.getLabelWidth() + width}px`;
 
@@ -593,7 +594,8 @@ export class TimelineView extends BasesView {
 
     const bodyEl = contentEl.createDiv({ cls: "base-board-timeline-body" });
     bodyEl.style.minHeight = `${
-      totalLanes * (LANE_HEIGHT + LANE_GAP) + pools.length * POOL_HEADER_HEIGHT
+      totalLanes * (LANE_HEIGHT + LANE_GAP) +
+      totalPoolHeaders * POOL_HEADER_HEIGHT
     }px`;
 
     for (const pool of pools) {
@@ -1500,13 +1502,32 @@ export class TimelineView extends BasesView {
       if (node && !childPaths.has(task.file.path)) roots.push(node);
     }
 
-    return [
-      {
+    const sortedRoots = this.sortTimelineNodes(roots);
+    const pools: TimelinePool[] = [];
+    const standaloneRoots: TimelineTreeNode[] = [];
+
+    for (const root of sortedRoots) {
+      if (root.children.length === 0) {
+        standaloneRoots.push(root);
+        continue;
+      }
+
+      pools.push({
+        id: root.task.file.path,
+        title: root.task.title,
+        lanes: this.flattenTimelineTree(root.children, 1),
+      });
+    }
+
+    if (standaloneRoots.length > 0) {
+      pools.push({
         id: "tasks",
         title: "Tasks",
-        lanes: this.flattenTimelineTree(this.sortTimelineNodes(roots), 0),
-      },
-    ];
+        lanes: this.flattenTimelineTree(standaloneRoots, 0),
+      });
+    }
+
+    return pools;
   }
 
   private sortTimelineNodes(nodes: TimelineTreeNode[]): TimelineTreeNode[] {
