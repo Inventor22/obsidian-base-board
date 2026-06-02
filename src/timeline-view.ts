@@ -59,6 +59,13 @@ interface TimelineZoomStop {
   ruler: TimelineRulerPolicy;
 }
 
+interface TimelineZoomAnchor {
+  timeMs: number;
+  chartViewportX: number;
+  chartViewportWidth: number;
+  scrollTop: number;
+}
+
 interface TransitionHistoryRecord {
   from?: unknown;
   to?: unknown;
@@ -166,7 +173,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 31 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
-const TIMELINE_BUILD_VERSION = "2026.06.02.2";
+const TIMELINE_BUILD_VERSION = "2026.06.02.15";
 
 const TIMELINE_ZOOM_STOPS: TimelineZoomStop[] = [
   {
@@ -394,14 +401,9 @@ function getZoomStopById(id: TimelineZoomStopId): TimelineZoomStop {
   );
 }
 
-const MIN_TIMELINE_WIDTH = 960;
 const DEFAULT_LABEL_WIDTH = 240;
 const MIN_LABEL_WIDTH = 180;
 const MAX_LABEL_WIDTH = 520;
-const TIMELINE_PAST_WINDOWS = 2;
-const TIMELINE_FUTURE_WINDOWS = 2;
-const TIMELINE_TOTAL_WINDOWS =
-  TIMELINE_PAST_WINDOWS + 1 + TIMELINE_FUTURE_WINDOWS;
 const LANE_HEIGHT = 44;
 const POOL_HEADER_HEIGHT = 34;
 const LANE_GAP = 8;
@@ -414,7 +416,10 @@ export class TimelineView extends BasesView {
   public activeFilters: Set<string> = new Set();
   private zoomId: TimelineZoomId = "month";
   private zoomDurationMs = MONTH_MS;
-  private pendingCurrentWindowAlignment = false;
+  private pendingZoomAnchor: TimelineZoomAnchor | null = null;
+  private renderedTimelineRange: TimelineRange | null = null;
+  private viewportStartMs: number | null = null;
+  private pendingTimelineScrollTop: number | null = null;
   private suppressClickAfterPan = false;
   private visibleTasks: TimelineTask[] = [];
 
@@ -444,11 +449,12 @@ export class TimelineView extends BasesView {
   }
 
   public render(): void {
-    const previousScrollLeft = this.getCurrentTimelineScrollLeft();
     const previousScrollTop = this.getCurrentTimelineScrollTop();
 
     this.containerEl.empty();
-    this.zoomDurationMs = this.getSavedZoomDuration();
+    if (!this.hasPendingZoomRender()) {
+      this.zoomDurationMs = this.getSavedZoomDuration();
+    }
     this.zoomId = this.getZoomIdForDuration(this.zoomDurationMs);
 
     const groupByProp = this.getGroupByProperty();
@@ -475,15 +481,13 @@ export class TimelineView extends BasesView {
     }
 
     const range = this.getTimelineRange(visibleTasks);
+    this.renderedTimelineRange = range;
     const pools = this.getPools(visibleTasks);
-    this.renderTimeline(pools, range, previousScrollLeft, previousScrollTop);
+    this.renderTimeline(pools, range, previousScrollTop);
   }
 
-  private getCurrentTimelineScrollLeft(): number {
-    const timelineEl = this.containerEl.querySelector<HTMLElement>(
-      ".base-board-timeline-viewport",
-    );
-    return timelineEl?.scrollLeft ?? 0;
+  private hasPendingZoomRender(): boolean {
+    return Boolean(this.pendingZoomAnchor);
   }
 
   private getCurrentTimelineScrollTop(): number {
@@ -542,9 +546,10 @@ export class TimelineView extends BasesView {
   private renderTimeline(
     pools: TimelinePool[],
     range: TimelineRange,
-    previousScrollLeft: number,
     previousScrollTop: number,
   ): void {
+    this.pendingZoomAnchor = null;
+
     const timelineEl = this.containerEl.createDiv({
       cls: "base-board-timeline-viewport",
     });
@@ -552,7 +557,7 @@ export class TimelineView extends BasesView {
       "wheel",
       (event: WheelEvent) => {
         event.preventDefault();
-        this.zoomByWheel(event);
+        this.zoomByWheel(event, timelineEl);
       },
       { passive: false },
     );
@@ -602,15 +607,10 @@ export class TimelineView extends BasesView {
       }
     }
 
-    if (this.pendingCurrentWindowAlignment) {
-      this.pendingCurrentWindowAlignment = false;
-      this.alignViewportToCurrentWindow(timelineEl);
-    } else if (previousScrollLeft > 0 || previousScrollTop > 0) {
-      this.restoreTimelineScroll(
-        timelineEl,
-        previousScrollLeft,
-        previousScrollTop,
-      );
+    const scrollTop = this.pendingTimelineScrollTop ?? previousScrollTop;
+    this.pendingTimelineScrollTop = null;
+    if (scrollTop > 0) {
+      this.restoreTimelineScroll(timelineEl, scrollTop);
     }
   }
 
@@ -1595,20 +1595,79 @@ export class TimelineView extends BasesView {
     );
   }
 
-  private zoomByWheel(event: WheelEvent): void {
+  private zoomByWheel(event: WheelEvent, timelineEl: HTMLElement): void {
     const direction = event.deltaY > 0 ? 1 : -1;
-    this.setZoomDuration(
-      this.getNextWheelZoomDuration(this.zoomDurationMs, direction),
+    const nextDuration = this.getNextWheelZoomDuration(
+      this.zoomDurationMs,
+      direction,
     );
+    if (Math.abs(nextDuration - this.zoomDurationMs) < 1000) return;
+
+    const anchor = this.getWheelZoomAnchor(event, timelineEl);
+    if (anchor) {
+      this.viewportStartMs =
+        anchor.timeMs -
+        (anchor.chartViewportX / anchor.chartViewportWidth) * nextDuration;
+      this.pendingTimelineScrollTop = anchor.scrollTop;
+    }
+
+    this.setZoomDuration(nextDuration, {
+      alignToCurrentWindow: false,
+      anchor,
+    });
   }
 
-  private setZoomDuration(durationMs: number): void {
+  private setZoomDuration(
+    durationMs: number,
+    options: {
+      alignToCurrentWindow?: boolean;
+      anchor?: TimelineZoomAnchor | null;
+    } = {},
+  ): void {
     this.zoomDurationMs = this.clampZoomDuration(durationMs);
     this.zoomId = this.getZoomIdForDuration(this.zoomDurationMs);
-    this.pendingCurrentWindowAlignment = true;
+    this.pendingZoomAnchor = options.anchor ?? null;
+    if (!this.pendingZoomAnchor && (options.alignToCurrentWindow ?? true)) {
+      this.viewportStartMs = this.getDefaultViewportStartMs(
+        this.zoomDurationMs,
+      );
+    }
     this.config?.set(CONFIG_KEY_TIMELINE_ZOOM_DURATION, this.zoomDurationMs);
     this.config?.set(CONFIG_KEY_TIMELINE_PRESET, this.zoomId);
     this.render();
+  }
+
+  private getWheelZoomAnchor(
+    event: WheelEvent,
+    timelineEl: HTMLElement,
+  ): TimelineZoomAnchor | null {
+    if (this.visibleTasks.length === 0) return null;
+
+    const range =
+      this.renderedTimelineRange ?? this.getTimelineRange(this.visibleTasks);
+    const width = this.getTimelineWidth(range, timelineEl);
+    const duration = range.end.getTime() - range.start.getTime();
+    if (width <= 0 || duration <= 0) return null;
+
+    const viewportRect = timelineEl.getBoundingClientRect();
+    const labelWidth = this.getLabelWidth();
+    const rawViewportX = event.clientX - viewportRect.left;
+    const chartViewportWidth = this.getTimelineWidth(range, timelineEl);
+    if (chartViewportWidth <= 0) return null;
+
+    const chartViewportX = Math.min(
+      Math.max(rawViewportX - labelWidth, 0),
+      chartViewportWidth,
+    );
+    const chartX = Math.max(0, Math.min(width, chartViewportX));
+    const cursorTimeMs = range.start.getTime() + (chartX / width) * duration;
+
+    return {
+      timeMs: cursorTimeMs,
+      chartViewportX,
+      chartViewportWidth,
+      scrollTop: timelineEl.scrollTop,
+    };
   }
 
   private getSavedZoomDuration(): number {
@@ -1732,7 +1791,13 @@ export class TimelineView extends BasesView {
 
     const startX = event.clientX;
     const startY = event.clientY;
-    const startScrollLeft = timelineEl.scrollLeft;
+    this.ensureViewportStartMs(this.zoomDurationMs);
+    const startViewportStartMs = this.viewportStartMs ?? 0;
+    const chartWidth = this.getTimelineWidth(
+      this.renderedTimelineRange ?? this.getTimelineRange(this.visibleTasks),
+      timelineEl,
+    );
+    const msPerPixel = chartWidth > 0 ? this.zoomDurationMs / chartWidth : 0;
     const startScrollTop = timelineEl.scrollTop;
     let moved = false;
 
@@ -1743,15 +1808,18 @@ export class TimelineView extends BasesView {
 
       moved = true;
       timelineEl.addClass("base-board-timeline-viewport--panning");
-      timelineEl.scrollLeft = startScrollLeft - deltaX;
-      timelineEl.scrollTop = startScrollTop - deltaY;
+      this.viewportStartMs = startViewportStartMs - deltaX * msPerPixel;
+      this.pendingTimelineScrollTop = Math.max(0, startScrollTop - deltaY);
+      this.render();
       moveEvent.preventDefault();
     };
 
     const handlePointerUp = () => {
       activeDocument.removeEventListener("mousemove", handlePointerMove);
       activeDocument.removeEventListener("mouseup", handlePointerUp);
-      timelineEl.removeClass("base-board-timeline-viewport--panning");
+      this.containerEl
+        .querySelector<HTMLElement>(".base-board-timeline-viewport")
+        ?.removeClass("base-board-timeline-viewport--panning");
       if (moved) {
         this.suppressClickAfterPan = true;
         window.setTimeout(() => {
@@ -1775,40 +1843,32 @@ export class TimelineView extends BasesView {
 
   private restoreTimelineScroll(
     timelineEl: HTMLElement,
-    scrollLeft: number,
     scrollTop: number,
   ): void {
     window.requestAnimationFrame(() => {
-      timelineEl.scrollLeft = scrollLeft;
       timelineEl.scrollTop = scrollTop;
     });
   }
 
-  private alignViewportToCurrentWindow(timelineEl: HTMLElement): void {
-    window.requestAnimationFrame(() => {
-      const chartWidth = Math.max(
-        0,
-        timelineEl.scrollWidth - this.getLabelWidth(),
-      );
-      const windowWidth = chartWidth / TIMELINE_TOTAL_WINDOWS;
-      timelineEl.scrollLeft = Math.max(0, windowWidth * TIMELINE_PAST_WINDOWS);
-    });
-  }
-
   private getTimelineRange(tasks: TimelineTask[]): TimelineRange {
-    return this.getTimelineRangeForDuration(tasks, this.zoomDurationMs);
+    this.ensureViewportStartMs(this.zoomDurationMs);
+    const startTime =
+      this.viewportStartMs ??
+      this.getDefaultViewportStartMs(this.zoomDurationMs);
+    return {
+      start: new Date(startTime),
+      end: new Date(startTime + this.zoomDurationMs),
+    };
   }
 
-  private getTimelineRangeForDuration(
-    tasks: TimelineTask[],
-    durationMs: number,
-  ): TimelineRange {
-    const now = new Date();
-    const endTime = this.roundTimelineEnd(now, durationMs);
-    return {
-      start: new Date(endTime - durationMs * (TIMELINE_PAST_WINDOWS + 1)),
-      end: new Date(endTime + durationMs * TIMELINE_FUTURE_WINDOWS),
-    };
+  private ensureViewportStartMs(durationMs: number): void {
+    if (this.viewportStartMs === null) {
+      this.viewportStartMs = this.getDefaultViewportStartMs(durationMs);
+    }
+  }
+
+  private getDefaultViewportStartMs(durationMs: number): number {
+    return this.roundTimelineEnd(new Date(), durationMs) - durationMs;
   }
 
   private roundTimelineEnd(date: Date, durationMs: number): number {
@@ -1851,11 +1911,7 @@ export class TimelineView extends BasesView {
     range: TimelineRange,
     timelineEl: HTMLElement,
   ): number {
-    const chartWidth = Math.max(
-      MIN_TIMELINE_WIDTH,
-      timelineEl.clientWidth - this.getLabelWidth(),
-    );
-    return chartWidth * TIMELINE_TOTAL_WINDOWS;
+    return Math.max(1, timelineEl.clientWidth - this.getLabelWidth());
   }
 
   private getWeekStart(date: Date): Date {
