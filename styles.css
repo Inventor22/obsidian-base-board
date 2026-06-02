@@ -732,6 +732,42 @@
   flex-direction: column;
 }
 
+.base-board-card-mini-timeline {
+  padding: 0 0 12px;
+}
+
+.base-board-card-mini-timeline-title {
+  margin-bottom: 6px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+}
+
+.base-board-card-mini-timeline-track {
+  position: relative;
+  height: 22px;
+  border-radius: var(--radius-s);
+  overflow: hidden;
+  background-color: var(--background-modifier-border);
+}
+
+.base-board-card-mini-timeline-segment {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  box-sizing: border-box;
+  min-width: 2px;
+  overflow: hidden;
+  padding: 4px 6px;
+  border-right: 1px solid rgba(255, 255, 255, 0.18);
+  background-color: var(--mini-timeline-status-color);
+  color: #ffffff;
+  font-size: var(--font-ui-smaller);
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .modal.base-board-card-modal .base-board-rogue-leaf-container {
   flex: 1;
   position: relative;

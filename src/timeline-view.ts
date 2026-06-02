@@ -173,7 +173,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 31 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
-const TIMELINE_BUILD_VERSION = "2026.06.02.15";
+const TIMELINE_BUILD_VERSION = "2026.06.02.17";
+const COMPLETED_SEGMENT_TAIL_MIN_MS = 12 * 60 * 60 * 1000;
+const COMPLETED_SEGMENT_TAIL_MAX_MS = 3 * DAY_MS;
+const COMPLETED_SEGMENT_TAIL_RATIO = 0.1;
 
 const TIMELINE_ZOOM_STOPS: TimelineZoomStop[] = [
   {
@@ -609,9 +612,7 @@ export class TimelineView extends BasesView {
 
     const scrollTop = this.pendingTimelineScrollTop ?? previousScrollTop;
     this.pendingTimelineScrollTop = null;
-    if (scrollTop > 0) {
-      this.restoreTimelineScroll(timelineEl, scrollTop);
-    }
+    this.restoreTimelineScroll(timelineEl, scrollTop);
   }
 
   private renderRuler(
@@ -1319,11 +1320,15 @@ export class TimelineView extends BasesView {
   ): TimelineSegment[] {
     const now = new Date();
     if (events.length === 0) {
+      const start = new Date(file.stat.ctime);
+      const end = this.isCompletedStatus(currentStatus)
+        ? this.getCompletedSegmentEnd(start, new Date(file.stat.mtime))
+        : now;
       return [
         {
           status: currentStatus,
-          start: new Date(file.stat.ctime),
-          end: now,
+          start,
+          end,
         },
       ];
     }
@@ -1347,16 +1352,41 @@ export class TimelineView extends BasesView {
     for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
       const event = events[eventIndex];
       const nextEvent = events[eventIndex + 1];
+      const status = nextEvent ? event.to : (currentStatus ?? event.to);
       segments.push({
-        status: nextEvent ? event.to : (currentStatus ?? event.to),
+        status,
         start: event.at,
-        end: nextEvent?.at ?? now,
+        end:
+          nextEvent?.at ??
+          (this.isCompletedStatus(status)
+            ? this.getCompletedSegmentEnd(createdAt, event.at)
+            : now),
       });
     }
 
     return segments.filter(
       (segment) => segment.end.getTime() > segment.start.getTime(),
     );
+  }
+
+  private isCompletedStatus(status: string | null): boolean {
+    const normalizedStatus = status?.trim().toLowerCase();
+    return normalizedStatus === "completed" || normalizedStatus === "done";
+  }
+
+  private getCompletedSegmentEnd(workflowStart: Date, completedAt: Date): Date {
+    const workflowDurationMs = Math.max(
+      0,
+      completedAt.getTime() - workflowStart.getTime(),
+    );
+    const tailMs = Math.max(
+      COMPLETED_SEGMENT_TAIL_MIN_MS,
+      Math.min(
+        COMPLETED_SEGMENT_TAIL_MAX_MS,
+        workflowDurationMs * COMPLETED_SEGMENT_TAIL_RATIO,
+      ),
+    );
+    return new Date(completedAt.getTime() + tailMs);
   }
 
   private getTaskTitle(entry: BasesEntry, file: TFile): string {
@@ -1845,9 +1875,7 @@ export class TimelineView extends BasesView {
     timelineEl: HTMLElement,
     scrollTop: number,
   ): void {
-    window.requestAnimationFrame(() => {
-      timelineEl.scrollTop = scrollTop;
-    });
+    timelineEl.scrollTop = scrollTop;
   }
 
   private getTimelineRange(tasks: TimelineTask[]): TimelineRange {
