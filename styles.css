@@ -332,6 +332,40 @@
   user-select: none;
 }
 
+.base-board-card--parent {
+  background-color: color-mix(
+    in srgb,
+    var(--background-primary) 92%,
+    var(--background-secondary)
+  );
+}
+
+.base-board-card--hierarchy-color {
+  background-color: color-mix(
+    in srgb,
+    var(--card-hierarchy-color) var(--card-hierarchy-tint-strength, 10%),
+    var(--background-primary)
+  );
+  border-left: 3px solid
+    color-mix(in srgb, var(--card-hierarchy-color) 68%, var(--background-primary));
+}
+
+.base-board-card--hierarchy-color .base-board-card-hierarchy-icon {
+  color: color-mix(
+    in srgb,
+    var(--card-hierarchy-color) 72%,
+    var(--text-muted)
+  );
+}
+
+.base-board-card--hierarchy-color .base-board-card-child-count {
+  background-color: color-mix(
+    in srgb,
+    var(--card-hierarchy-color) 12%,
+    var(--background-secondary)
+  );
+}
+
 /* Only animate cards on initial board mount */
 .base-board-board--animate .base-board-card {
   animation: base-board-card-enter 0.25s ease both;
@@ -375,12 +409,68 @@
 
 /* ---- Card title ---- */
 
+.base-board-card-hierarchy {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin-bottom: 3px;
+  padding-right: 24px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.25;
+}
+
+.base-board-card-hierarchy-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+
+.base-board-card-hierarchy-icon svg {
+  width: 12px;
+  height: 12px;
+}
+
+.base-board-card-hierarchy-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .base-board-card-title {
   font-size: var(--font-ui-small);
   font-weight: var(--font-medium);
   line-height: 1.35;
   margin-bottom: 4px;
   padding-right: 24px; /* leave room for the edit button */
+}
+
+.base-board-card-child-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  margin: 0 0 6px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius-s);
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.base-board-card-child-count svg {
+  width: 12px;
+  height: 12px;
+}
+
+.base-board-card-child-count:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
 }
 
 /* ---- Card edit button ---- */

@@ -18,6 +18,8 @@
 - **Inline Power**: Rename cards or column titles directly on the board.
 - **Native Editing Modal**: Open any card into a fully-functional Obsidian editor floating directly over your workspace.
 - **Rich Cards**: View key metadata fields as chips on each card for a quick overview.
+- **Task Hierarchy**: Cards with a `parent`, `parent_task`, or `parentTask` property show their parent breadcrumb, and parent cards show a child-count control for quickly focusing visible children.
+- **Project Colors**: Root tasks can set `project_color` to give their hierarchy an inherited card tint that gets lighter for descendants.
 - **Configurable Card Title**: Set `cardTitleProperty: note.title` in your `.base` file to use a frontmatter property (e.g. `title`) as the card heading instead of the filename.
 - **Tags**: Color-coded tag chips on cards with a clickable filter bar to narrow the board by tag.
 - **Hover Preview**: Native note previews on hover (uses the **Page preview** core plugin).
@@ -32,9 +34,9 @@ Open the **Command palette** (`Ctrl/Cmd + P`) and run **"Base Board: Create new 
 
 ### Card Navigation & Selection
 
-By default, card interaction respects native Obsidian conventions:
+By default, clicking a card opens it in Base Board's floating card modal. Modifier keys still respect native Obsidian conventions:
 
-* **Click:** Open the card's note in the active tab / pane.
+* **Click:** Open the card in a floating modal.
 * **Ctrl/Cmd + Click:** Open the note in a new tab.
 * **Ctrl/Cmd + Alt + Click** (or **Cmd + Option + Click** on macOS): Open the note to the side in a split pane.
 * **Alt / Option + Click:** Toggle selection of a card (for bulk actions or dragging).

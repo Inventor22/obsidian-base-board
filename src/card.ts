@@ -69,6 +69,39 @@ const FILE_PROPS_TO_SKIP = new Set([
   "tags",
 ]);
 
+const HIERARCHY_PROPS = new Set(["parent", "parent_task", "parentTask"]);
+const HIERARCHY_COLOR_PROPS = new Set([
+  "project_color",
+  "projectColor",
+  "hierarchy_color",
+  "hierarchyColor",
+]);
+const PROJECT_COLOR_PALETTE = [
+  "#3f7d9a",
+  "#7a6fba",
+  "#4f8f6b",
+  "#b0764f",
+  "#9a5f7d",
+  "#6f8c3f",
+  "#b08a3f",
+  "#4d8c8a",
+];
+
+interface CardHierarchyEntry {
+  entry: BasesEntry;
+  file: TFile;
+  title: string;
+  parentKey: string | null;
+  projectColor: string | null;
+}
+
+interface CardHierarchyInfo {
+  parentTitles: string[];
+  directChildPaths: string[];
+  projectColor: string | null;
+  depth: number;
+}
+
 export class CardManager {
   private view: KanbanView;
 
@@ -212,6 +245,25 @@ export class CardManager {
       cls: "base-board-tag-container",
     });
     const file = this.view.app.vault.getAbstractFileByPath(filePath);
+    const hierarchyInfo =
+      file instanceof TFile
+        ? this.getCardHierarchyInfo(file.path)
+        : null;
+    if (hierarchyInfo && hierarchyInfo.directChildPaths.length > 0) {
+      cardEl.addClass("base-board-card--parent");
+    }
+    if (hierarchyInfo?.projectColor) {
+      cardEl.addClass("base-board-card--hierarchy-color");
+      cardEl.style.setProperty(
+        "--card-hierarchy-color",
+        hierarchyInfo.projectColor,
+      );
+      cardEl.style.setProperty(
+        "--card-hierarchy-tint-strength",
+        this.getHierarchyTintStrength(hierarchyInfo.depth),
+      );
+    }
+
     if (file instanceof TFile) {
       const fileTags = this.view.tags.extractTagsFromFile(file);
       for (const tag of fileTags) {
@@ -231,24 +283,48 @@ export class CardManager {
       }
     }
 
+    if (hierarchyInfo && hierarchyInfo.parentTitles.length > 0) {
+      const breadcrumbEl = cardEl.createDiv({
+        cls: "base-board-card-hierarchy",
+      });
+      const iconEl = breadcrumbEl.createSpan({
+        cls: "base-board-card-hierarchy-icon",
+      });
+      setIcon(iconEl, "lucide-corner-down-right");
+      const breadcrumb = hierarchyInfo.parentTitles.join(" / ");
+      breadcrumbEl.createSpan({
+        cls: "base-board-card-hierarchy-text",
+        text: breadcrumb,
+      });
+      breadcrumbEl.setAttr("title", breadcrumb);
+    }
+
     const titleEl = cardEl.createDiv({ cls: "base-board-card-title" });
 
     // Respect cardTitleProperty if configured — use a frontmatter property
     // (e.g. "title") as the card heading instead of the filename.
-    let cardTitle = entry.file?.basename ?? "Untitled";
-    const titleProp = this.view.config.get("cardTitleProperty") as
-      | string
-      | undefined;
-    if (titleProp) {
-      const propId = titleProp.startsWith("note.")
-        ? titleProp
-        : `note.${titleProp}`;
-      const tv = entry.getValue(propId as BasesPropertyId);
-      if (tv && !(tv instanceof NullValue) && tv.isTruthy()) {
-        cardTitle = formatValueForChip(tv);
-      }
-    }
+    const cardTitle = this.getCardTitle(entry);
     titleEl.createSpan({ text: cardTitle });
+
+    if (hierarchyInfo && hierarchyInfo.directChildPaths.length > 0) {
+      const childCount = hierarchyInfo.directChildPaths.length;
+      const childButtonEl = cardEl.createEl("button", {
+        cls: "base-board-card-child-count",
+        attr: {
+          type: "button",
+          title: "Focus child cards",
+        },
+      });
+      setIcon(childButtonEl.createSpan(), "lucide-list-tree");
+      childButtonEl.createSpan({
+        text: `${childCount} ${childCount === 1 ? "child" : "children"}`,
+      });
+      childButtonEl.addEventListener("click", (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.focusChildCards(hierarchyInfo.directChildPaths);
+      });
+    }
 
     // ---- Edit button (visible on hover) ----
     const editBtn = cardEl.createDiv({ cls: "base-board-card-edit-btn" });
@@ -280,6 +356,8 @@ export class CardManager {
       const propName = propId.startsWith("note.") ? propId.slice(5) : propId;
       if (groupByProp && propName === groupByProp) continue;
       if (propName === ORDER_PROPERTY) continue;
+      if (HIERARCHY_PROPS.has(propName)) continue;
+      if (HIERARCHY_COLOR_PROPS.has(propName)) continue;
 
       const val = entry.getValue(propId);
       if (!val || val instanceof NullValue || !val.isTruthy()) continue;
@@ -342,6 +420,266 @@ export class CardManager {
     chip.createSpan({ text: label, cls: "base-board-chip-label" });
     chip.createSpan({ text: value, cls: "base-board-chip-value" });
     return chip;
+  }
+
+  private getCardTitle(entry: BasesEntry): string {
+    let cardTitle = entry.file?.basename ?? "Untitled";
+    const titleProp = this.view.config.get("cardTitleProperty") as
+      | string
+      | undefined;
+    if (!titleProp) return cardTitle;
+
+    const propId = titleProp.startsWith("note.")
+      ? titleProp
+      : `note.${titleProp}`;
+    const value = entry.getValue(propId as BasesPropertyId);
+    if (value && !(value instanceof NullValue) && value.isTruthy()) {
+      cardTitle = formatValueForChip(value);
+    }
+    return cardTitle;
+  }
+
+  private getCardHierarchyInfo(filePath: string): CardHierarchyInfo | null {
+    const entries = this.getHierarchyEntries();
+    const entriesByPath = new Map<string, CardHierarchyEntry>();
+    const entriesByIdentity = new Map<string, CardHierarchyEntry>();
+
+    for (const hierarchyEntry of entries) {
+      entriesByPath.set(hierarchyEntry.file.path, hierarchyEntry);
+      for (const identity of this.getCardIdentities(hierarchyEntry)) {
+        entriesByIdentity.set(identity, hierarchyEntry);
+      }
+    }
+
+    const current = entriesByPath.get(filePath);
+    if (!current) return null;
+
+    const directChildPaths = entries
+      .filter((candidate) => {
+        if (!candidate.parentKey) return false;
+        const parent = entriesByIdentity.get(candidate.parentKey);
+        return parent?.file.path === current.file.path;
+      })
+      .map((candidate) => candidate.file.path);
+
+    const parentTitles = this.getParentTitles(
+      current,
+      entriesByIdentity,
+    );
+    const hierarchyRoot = this.getHierarchyRoot(current, entriesByIdentity);
+    const participatesInHierarchy =
+      parentTitles.length > 0 || directChildPaths.length > 0;
+    const projectColor = participatesInHierarchy
+      ? (hierarchyRoot.root.projectColor ??
+        this.getGeneratedProjectColor(hierarchyRoot.root))
+      : current.projectColor;
+
+    return {
+      parentTitles,
+      directChildPaths,
+      projectColor,
+      depth: hierarchyRoot.depth,
+    };
+  }
+
+  private getHierarchyEntries(): CardHierarchyEntry[] {
+    const entries: CardHierarchyEntry[] = [];
+    for (const group of this.view.currentGroups) {
+      for (const entry of group.entries) {
+        const file = entry.file;
+        if (!(file instanceof TFile)) continue;
+        entries.push({
+          entry,
+          file,
+          title: this.getCardTitle(entry),
+          parentKey: this.getParentKey(file),
+          projectColor: this.getProjectColor(file),
+        });
+      }
+    }
+    return entries;
+  }
+
+  private getParentTitles(
+    entry: CardHierarchyEntry,
+    entriesByIdentity: Map<string, CardHierarchyEntry>,
+  ): string[] {
+    const titles: string[] = [];
+    const visitedPaths = new Set([entry.file.path]);
+    let parentKey = entry.parentKey;
+
+    while (parentKey) {
+      const parent = entriesByIdentity.get(parentKey);
+      if (!parent || visitedPaths.has(parent.file.path)) {
+        if (titles.length === 0) {
+          const parentTitle = this.getParentDisplayTitle(entry.file);
+          if (parentTitle) titles.push(parentTitle);
+        }
+        break;
+      }
+
+      titles.push(parent.title);
+      visitedPaths.add(parent.file.path);
+      parentKey = parent.parentKey;
+    }
+
+    return titles.reverse();
+  }
+
+  private getHierarchyRoot(
+    entry: CardHierarchyEntry,
+    entriesByIdentity: Map<string, CardHierarchyEntry>,
+  ): { root: CardHierarchyEntry; depth: number } {
+    const visitedPaths = new Set([entry.file.path]);
+    let root = entry;
+    let depth = 0;
+
+    while (root.parentKey) {
+      const parent = entriesByIdentity.get(root.parentKey);
+      if (!parent || visitedPaths.has(parent.file.path)) break;
+
+      root = parent;
+      depth++;
+      visitedPaths.add(parent.file.path);
+    }
+
+    return { root, depth };
+  }
+
+  private getHierarchyTintStrength(depth: number): string {
+    return `${Math.max(5, 18 - depth * 5)}%`;
+  }
+
+  private getProjectColor(file: TFile): string | null {
+    const frontmatter = this.getFrontmatter(file);
+    const value =
+      frontmatter?.project_color ??
+      frontmatter?.projectColor ??
+      frontmatter?.hierarchy_color ??
+      frontmatter?.hierarchyColor;
+    return this.normalizeHexColor(value);
+  }
+
+  private normalizeHexColor(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const color = value.trim();
+    if (!/^#(?:[A-Fa-f0-9]{3}|[A-Fa-f0-9]{6})$/.test(color)) return null;
+    return color.length === 4
+      ? color.replace(/^#(.)(.)(.)$/, "#$1$1$2$2$3$3")
+      : color;
+  }
+
+  private getGeneratedProjectColor(entry: CardHierarchyEntry): string {
+    const seed = this.getProjectColorSeed(entry);
+    let hash = 0;
+    for (const character of seed) {
+      hash = (hash * 31 + character.charCodeAt(0)) % 1000000007;
+    }
+    return PROJECT_COLOR_PALETTE[hash % PROJECT_COLOR_PALETTE.length];
+  }
+
+  private getProjectColorSeed(entry: CardHierarchyEntry): string {
+    const frontmatter = this.getFrontmatter(entry.file);
+    const id = frontmatter?.id;
+    return typeof id === "string" && id.trim()
+      ? id.trim()
+      : entry.title || entry.file.path;
+  }
+
+  private focusChildCards(childPaths: string[]): void {
+    const childPathSet = new Set(childPaths);
+    const selectedCards = this.view.selectedCards;
+    const shouldClearChildren =
+      childPaths.length > 0 &&
+      childPaths.every((childPath) => selectedCards.has(childPath));
+
+    if (shouldClearChildren) {
+      for (const childPath of childPaths) {
+        selectedCards.delete(childPath);
+      }
+    } else {
+      selectedCards.clear();
+      for (const childPath of childPaths) {
+        selectedCards.add(childPath);
+      }
+    }
+
+    const selectedChildEls: HTMLElement[] = [];
+    this.view.containerEl
+      .querySelectorAll<HTMLElement>(".base-board-card")
+      .forEach((cardEl) => {
+        const filePath = cardEl.dataset.filePath ?? "";
+        if (selectedCards.has(filePath)) {
+          cardEl.addClass("base-board-card--selected");
+          if (childPathSet.has(filePath)) selectedChildEls.push(cardEl);
+        } else {
+          cardEl.removeClass("base-board-card--selected");
+        }
+      });
+
+    if (shouldClearChildren) return;
+
+    const firstChildEl = selectedChildEls[0];
+    firstChildEl?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    firstChildEl?.focus({ preventScroll: true });
+  }
+
+  private getParentKey(file: TFile): string | null {
+    const value = this.getParentValue(file);
+    return this.normalizeReference(value);
+  }
+
+  private getParentValue(file: TFile): unknown {
+    const frontmatter = this.getFrontmatter(file);
+    return (
+      frontmatter?.parent ?? frontmatter?.parent_task ?? frontmatter?.parentTask
+    );
+  }
+
+  private getFrontmatter(file: TFile): Record<string, unknown> | undefined {
+    const frontmatter = this.view.app.metadataCache.getFileCache(
+      file,
+    )?.frontmatter;
+    return frontmatter && typeof frontmatter === "object"
+      ? frontmatter
+      : undefined;
+  }
+
+  private normalizeReference(value: unknown): string | null {
+    const firstValue = Array.isArray(value) ? (value as unknown[])[0] : value;
+    if (typeof firstValue !== "string") return null;
+    let normalized = firstValue.trim();
+    if (!normalized) return null;
+
+    const linkMatch = normalized.match(/^\[\[([^|\]]+)(?:\|[^\]]+)?\]\]$/);
+    if (linkMatch) normalized = linkMatch[1];
+    normalized = normalized.replace(/\.md$/i, "");
+    const slashIndex = normalized.lastIndexOf("/");
+    if (slashIndex >= 0) normalized = normalized.slice(slashIndex + 1);
+    return normalized.toLowerCase();
+  }
+
+  private getParentDisplayTitle(file: TFile): string | null {
+    const value = this.getParentValue(file);
+    const firstValue = Array.isArray(value) ? (value as unknown[])[0] : value;
+    if (typeof firstValue !== "string") return null;
+    let display = firstValue.trim();
+    if (!display) return null;
+
+    const linkMatch = display.match(/^\[\[([^|\]]+)(?:\|([^\]]+))?\]\]$/);
+    if (linkMatch) display = linkMatch[2] ?? linkMatch[1];
+    display = display.replace(/\.md$/i, "");
+    const slashIndex = display.lastIndexOf("/");
+    if (slashIndex >= 0) display = display.slice(slashIndex + 1);
+    return display;
+  }
+
+  private getCardIdentities(entry: CardHierarchyEntry): string[] {
+    return [
+      entry.file.path.replace(/\.md$/i, "").toLowerCase(),
+      entry.file.basename.toLowerCase(),
+      entry.title.toLowerCase(),
+    ];
   }
 
   private showCardActionMenu(
