@@ -8,6 +8,7 @@ import {
 } from "obsidian";
 import { KanbanView } from "./kanban-view";
 import { TimelineView } from "./timeline-view";
+import { RolloutView } from "./rollout-view";
 import { sanitizeFilename } from "./constants";
 import { CreateBoardModal, BoardConfig } from "./modals";
 
@@ -67,6 +68,13 @@ export default class BaseBoardPlugin extends Plugin {
       factory: (controller: QueryController, containerEl: HTMLElement) =>
         new TimelineView(controller, containerEl, this),
       options: () => TimelineView.getViewOptions(),
+    });
+
+    this.registerBasesView("rollout", {
+      name: "Rollout",
+      icon: "lucide-radio-tower",
+      factory: (controller: QueryController, containerEl: HTMLElement) =>
+        new RolloutView(controller, containerEl, this),
     });
 
     // -- Command: Create new board --------------------------------------------

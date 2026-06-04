@@ -69,7 +69,12 @@ const FILE_PROPS_TO_SKIP = new Set([
   "tags",
 ]);
 
-const HIERARCHY_PROPS = new Set(["parent", "parent_task", "parentTask"]);
+const HIERARCHY_PROPS = new Set([
+  "parent",
+  "parent_task",
+  "parentTask",
+  "feature",
+]);
 const HIERARCHY_COLOR_PROPS = new Set([
   "project_color",
   "projectColor",
@@ -961,7 +966,10 @@ export class CardManager {
   private getParentValue(file: TFile): unknown {
     const frontmatter = this.getFrontmatter(file);
     return (
-      frontmatter?.parent ?? frontmatter?.parent_task ?? frontmatter?.parentTask
+      frontmatter?.parent ??
+      frontmatter?.parent_task ??
+      frontmatter?.parentTask ??
+      frontmatter?.feature
     );
   }
 

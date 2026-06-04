@@ -562,7 +562,10 @@ export class CardDetailModal extends Modal {
         file,
         title: this.getTaskTitle(file, frontmatter),
         parentKey: this.normalizeReference(
-          frontmatter?.parent ?? frontmatter?.parent_task ?? frontmatter?.parentTask,
+          frontmatter?.parent ??
+            frontmatter?.parent_task ??
+            frontmatter?.parentTask ??
+            frontmatter?.feature,
         ),
         status:
           this.normalizeStatus(frontmatter?.[STATUS_PROPERTY]) ?? NO_VALUE_COLUMN,
@@ -794,6 +797,7 @@ export class CardDetailModal extends Modal {
 
   private normalizeStatus(value: unknown): string | null {
     if (value === undefined || value === null) return null;
+    if (Array.isArray(value)) return this.normalizeStatus(value[0]);
     if (typeof value === "string") return value;
     if (typeof value === "number" || typeof value === "boolean") {
       return String(value);

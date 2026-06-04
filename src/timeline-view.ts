@@ -73,6 +73,13 @@ interface TransitionHistoryRecord {
   property?: unknown;
 }
 
+interface RolloutHistoryRecord {
+  from?: unknown;
+  to?: unknown;
+  at?: unknown;
+  property?: unknown;
+}
+
 interface TimelineEvent {
   from: string | null;
   to: string | null;
@@ -92,8 +99,10 @@ interface TimelineTask {
   currentStatus: string | null;
   tags: string[];
   parentKey: string | null;
+  parentTitle: string | null;
   timelineOrder: number;
   segments: TimelineSegment[];
+  rolloutSegments: TimelineSegment[];
 }
 
 interface TimelinePool {
@@ -177,6 +186,8 @@ const TIMELINE_BUILD_VERSION = "2026.06.02.19";
 const COMPLETED_SEGMENT_TAIL_MIN_MS = 12 * 60 * 60 * 1000;
 const COMPLETED_SEGMENT_TAIL_MAX_MS = 3 * DAY_MS;
 const COMPLETED_SEGMENT_TAIL_RATIO = 0.1;
+const ROLLOUT_RING_PROPERTY = "rollout_ring";
+const ROLLOUT_HISTORY_PROPERTY = "rollout_history";
 
 const TIMELINE_ZOOM_STOPS: TimelineZoomStop[] = [
   {
@@ -1110,6 +1121,9 @@ export class TimelineView extends BasesView {
     if (lane.depth === 0 && lane.hasChildren) {
       laneEl.addClass("base-board-timeline-lane--root-parent");
     }
+    if (task.rolloutSegments.length > 0) {
+      laneEl.addClass("base-board-timeline-lane--has-rollout");
+    }
     laneEl.setAttr("draggable", "false");
     laneEl.dataset.filePath = task.file.path;
     laneEl.addEventListener("mousedown", (event: MouseEvent) => {
@@ -1214,6 +1228,38 @@ export class TimelineView extends BasesView {
         new CardDetailModal(this.app, task.file).open();
       });
     }
+
+    for (const segment of task.rolloutSegments) {
+      if (!this.segmentOverlapsRange(segment, range)) continue;
+      const start = new Date(
+        Math.max(segment.start.getTime(), range.start.getTime()),
+      );
+      const end = new Date(
+        Math.min(segment.end.getTime(), range.end.getTime()),
+      );
+      const left = this.getPercent(start, range);
+      const right = this.getPercent(end, range);
+      const width = Math.max(right - left, 0.4);
+      const ring = this.getDisplayStatus(segment.status);
+
+      const rolloutEl = trackEl.createDiv({
+        cls: "base-board-timeline-rollout-segment",
+        text: ring,
+      });
+      rolloutEl.style.left = `${left}%`;
+      rolloutEl.style.width = `${width}%`;
+      rolloutEl.style.setProperty(
+        "--timeline-rollout-color",
+        this.getRolloutRingColor(segment.status),
+      );
+      setTooltip(
+        rolloutEl,
+        `${task.title}\nRollout: ${ring}\n${this.formatBusinessElapsed(segment.start, segment.end)}\n${segment.start.toLocaleString()} → ${segment.end.toLocaleString()}`,
+      );
+      rolloutEl.addEventListener("click", () => {
+        new CardDetailModal(this.app, task.file).open();
+      });
+    }
   }
 
   private getTasks(groupByProp: string): TimelineTask[] {
@@ -1227,6 +1273,12 @@ export class TimelineView extends BasesView {
       const currentStatus = this.getCurrentStatus(file, groupByProp);
       const events = this.getHistoryEvents(file, groupByProp);
       const segments = this.getSegments(file, events, currentStatus);
+      const currentRolloutRing = this.getCurrentRolloutRing(file);
+      const rolloutEvents = this.getRolloutHistoryEvents(file);
+      const rolloutSegments =
+        currentRolloutRing || rolloutEvents.length > 0
+          ? this.getSegments(file, rolloutEvents, currentRolloutRing)
+          : [];
       tasks.push({
         entry,
         file,
@@ -1234,8 +1286,10 @@ export class TimelineView extends BasesView {
         currentStatus,
         tags: this.extractTagsFromFile(file),
         parentKey: this.getParentKey(file),
+        parentTitle: this.getParentDisplayTitle(file),
         timelineOrder: this.getTimelineOrder(file),
         segments,
+        rolloutSegments,
       });
     }
 
@@ -1306,6 +1360,41 @@ export class TimelineView extends BasesView {
       events.push({
         from: this.normalizeStatus(record.from),
         to: this.normalizeStatus(record.to),
+        at,
+      });
+    }
+
+    return events.sort(
+      (first, second) => first.at.getTime() - second.at.getTime(),
+    );
+  }
+
+  private getCurrentRolloutRing(file: TFile): string | null {
+    const frontmatter = this.getFrontmatter(file);
+    return this.normalizeRolloutRing(frontmatter?.[ROLLOUT_RING_PROPERTY]);
+  }
+
+  private getRolloutHistoryEvents(file: TFile): TimelineEvent[] {
+    const frontmatter = this.getFrontmatter(file);
+    const rawHistory = frontmatter?.[ROLLOUT_HISTORY_PROPERTY];
+    if (!Array.isArray(rawHistory)) return [];
+
+    const events: TimelineEvent[] = [];
+    for (const rawRecord of rawHistory as unknown[]) {
+      if (!rawRecord || typeof rawRecord !== "object") continue;
+      const record = rawRecord as RolloutHistoryRecord;
+      if (
+        typeof record.property === "string" &&
+        record.property !== ROLLOUT_RING_PROPERTY
+      ) {
+        continue;
+      }
+      if (typeof record.at !== "string") continue;
+      const at = new Date(record.at);
+      if (Number.isNaN(at.getTime())) continue;
+      events.push({
+        from: this.normalizeRolloutRing(record.from),
+        to: this.normalizeRolloutRing(record.to),
         at,
       });
     }
@@ -1433,8 +1522,29 @@ export class TimelineView extends BasesView {
     const value =
       frontmatter?.parent ??
       frontmatter?.parent_task ??
-      frontmatter?.parentTask;
+      frontmatter?.parentTask ??
+      frontmatter?.feature;
     return this.normalizeReference(value);
+  }
+
+  private getParentDisplayTitle(file: TFile): string | null {
+    const frontmatter = this.getFrontmatter(file);
+    const value =
+      frontmatter?.parent ??
+      frontmatter?.parent_task ??
+      frontmatter?.parentTask ??
+      frontmatter?.feature;
+    const firstValue = Array.isArray(value) ? (value as unknown[])[0] : value;
+    if (typeof firstValue !== "string") return null;
+    let display = firstValue.trim();
+    if (!display) return null;
+
+    const linkMatch = display.match(/^\[\[([^|\]]+)(?:\|([^\]]+))?\]\]$/);
+    if (linkMatch) display = linkMatch[2] ?? linkMatch[1];
+    display = display.replace(/\.md$/i, "");
+    const slashIndex = display.lastIndexOf("/");
+    if (slashIndex >= 0) display = display.slice(slashIndex + 1);
+    return display;
   }
 
   private getFrontmatter(file: TFile): Record<string, unknown> | undefined {
@@ -1482,11 +1592,28 @@ export class TimelineView extends BasesView {
     }
 
     const childPaths = new Set<string>();
+    const virtualParentNodes = new Map<
+      string,
+      { title: string; nodes: TimelineTreeNode[] }
+    >();
+    const virtualChildPaths = new Set<string>();
 
     for (const task of tasks) {
       if (!task.parentKey) continue;
       const parent = tasksByIdentity.get(task.parentKey);
-      if (!parent || parent.file.path === task.file.path) continue;
+      if (!parent) {
+        const childNode = nodesByPath.get(task.file.path);
+        if (!childNode) continue;
+        const virtualParent = virtualParentNodes.get(task.parentKey) ?? {
+          title: task.parentTitle ?? task.parentKey,
+          nodes: [],
+        };
+        virtualParent.nodes.push(childNode);
+        virtualParentNodes.set(task.parentKey, virtualParent);
+        virtualChildPaths.add(task.file.path);
+        continue;
+      }
+      if (parent.file.path === task.file.path) continue;
 
       const parentNode = nodesByPath.get(parent.file.path);
       const childNode = nodesByPath.get(task.file.path);
@@ -1499,12 +1626,29 @@ export class TimelineView extends BasesView {
     const roots: TimelineTreeNode[] = [];
     for (const task of tasks) {
       const node = nodesByPath.get(task.file.path);
-      if (node && !childPaths.has(task.file.path)) roots.push(node);
+      if (
+        node &&
+        !childPaths.has(task.file.path) &&
+        !virtualChildPaths.has(task.file.path)
+      ) {
+        roots.push(node);
+      }
     }
 
     const sortedRoots = this.sortTimelineNodes(roots);
     const pools: TimelinePool[] = [];
     const standaloneRoots: TimelineTreeNode[] = [];
+
+    for (const [parentKey, virtualParent] of virtualParentNodes) {
+      pools.push({
+        id: `feature:${parentKey}`,
+        title: virtualParent.title,
+        lanes: this.flattenTimelineTree(
+          this.sortTimelineNodes(virtualParent.nodes),
+          1,
+        ),
+      });
+    }
 
     for (const root of sortedRoots) {
       if (root.children.length === 0) {
@@ -2071,10 +2215,26 @@ export class TimelineView extends BasesView {
     if (value === undefined || value === null || value instanceof NullValue) {
       return null;
     }
+    if (Array.isArray(value)) return this.normalizeStatus(value[0]);
     if (typeof value === "string") return value;
     if (typeof value === "number" || typeof value === "boolean")
       return String(value);
     return null;
+  }
+
+  private normalizeRolloutRing(value: unknown): string | null {
+    const ring = this.normalizeStatus(value);
+    if (!ring) return null;
+    return ring.trim().toLowerCase() === "none" ? null : ring;
+  }
+
+  private getRolloutRingColor(ring: string | null): string {
+    const normalizedRing = ring?.trim().toLowerCase();
+    if (normalizedRing === "stage") return "#3f7d9a";
+    if (normalizedRing === "canary") return "#b08a3f";
+    if (normalizedRing === "pilot") return "#7a6fba";
+    if (normalizedRing === "broad") return "#4f8f6b";
+    return "var(--text-muted)";
   }
 
   private getDisplayStatus(status: string | null): string {

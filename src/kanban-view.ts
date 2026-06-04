@@ -442,6 +442,7 @@ export class KanbanView extends BasesView implements HoverParent {
     if (value === undefined || value === null || value instanceof NullValue) {
       return null;
     }
+    if (Array.isArray(value)) return this.normalizeStatus(value[0]);
     if (typeof value === "object") {
       if ("value" in value) {
         return this.normalizeStatus((value as Record<string, unknown>).value);
