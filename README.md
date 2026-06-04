@@ -18,7 +18,8 @@
 - **Inline Power**: Rename cards or column titles directly on the board.
 - **Native Editing Modal**: Open any card into a fully-functional Obsidian editor floating directly over your workspace.
 - **Rich Cards**: View key metadata fields as chips on each card for a quick overview.
-- **Task Hierarchy**: Cards with a `parent`, `parent_task`, or `parentTask` property show their parent breadcrumb, and parent cards show a child-count control for quickly focusing visible children.
+- **Task Hierarchy**: Cards with a `parent`, `parent_task`, or `parentTask` property show their parent breadcrumb, and parent cards show a collapsible recursive outline of visible descendants.
+- **Card Detail Outline**: The floating card modal shows the selected task's descendant outline above the embedded note content when child tasks exist.
 - **Project Colors**: Root tasks can set `project_color` to give their hierarchy an inherited card tint that gets lighter for descendants.
 - **Configurable Card Title**: Set `cardTitleProperty: note.title` in your `.base` file to use a frontmatter property (e.g. `title`) as the card heading instead of the filename.
 - **Tags**: Color-coded tag chips on cards with a clickable filter bar to narrow the board by tag.

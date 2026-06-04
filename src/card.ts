@@ -13,7 +13,7 @@ import {
   Keymap,
 } from "obsidian";
 import { KanbanView } from "./kanban-view";
-import { ORDER_PROPERTY, sanitizeFilename } from "./constants";
+import { NO_VALUE_COLUMN, ORDER_PROPERTY, sanitizeFilename } from "./constants";
 import { relativeLuminance } from "./color-utils";
 import { CardDetailModal } from "./card-detail-modal";
 
@@ -86,6 +86,7 @@ const PROJECT_COLOR_PALETTE = [
   "#b08a3f",
   "#4d8c8a",
 ];
+const OUTLINE_PREVIEW_LIMIT = 7;
 
 interface CardHierarchyEntry {
   entry: BasesEntry;
@@ -93,17 +94,26 @@ interface CardHierarchyEntry {
   title: string;
   parentKey: string | null;
   projectColor: string | null;
+  currentStatus: string;
+}
+
+interface CardOutlineNode {
+  task: CardHierarchyEntry;
+  children: CardOutlineNode[];
 }
 
 interface CardHierarchyInfo {
   parentTitles: string[];
   directChildPaths: string[];
+  descendantCount: number;
+  outlineNodes: CardOutlineNode[];
   projectColor: string | null;
   depth: number;
 }
 
 export class CardManager {
   private view: KanbanView;
+  private collapsedOutlines: Set<string> = new Set();
 
   constructor(view: KanbanView) {
     this.view = view;
@@ -153,35 +163,7 @@ export class CardManager {
       const file = this.view.app.vault.getAbstractFileByPath(filePath);
       if (!(file instanceof TFile)) return;
 
-      // Handle standard Obsidian modifiers using Keymap.isModEvent(e)
-      const mod = Keymap.isModEvent(e);
-      if (mod) {
-        e.preventDefault();
-        void this.view.app.workspace.getLeaf(mod).openFile(file);
-        return;
-      }
-
-      const openBehavior = this.view.getCardOpenBehavior();
-      if (openBehavior === "split") {
-        if (
-          this.view.detailLeaf &&
-          this.view.isLeafAttached(this.view.detailLeaf)
-        ) {
-          void this.view.detailLeaf.openFile(file);
-        } else {
-          this.view.detailLeaf = this.view.app.workspace.getLeaf(
-            "split",
-            "vertical",
-          );
-          void this.view.detailLeaf.openFile(file);
-        }
-      } else if (openBehavior === "tab") {
-        void this.view.app.workspace.getLeaf("tab").openFile(file);
-      } else if (openBehavior === "active") {
-        void this.view.app.workspace.getLeaf(false).openFile(file);
-      } else {
-        new CardDetailModal(this.view.app, file, this.view).open();
-      }
+      this.openCardFile(file, e);
     });
 
     // Middle-click → always open in new tab
@@ -307,23 +289,11 @@ export class CardManager {
     titleEl.createSpan({ text: cardTitle });
 
     if (hierarchyInfo && hierarchyInfo.directChildPaths.length > 0) {
-      const childCount = hierarchyInfo.directChildPaths.length;
-      const childButtonEl = cardEl.createEl("button", {
-        cls: "base-board-card-child-count",
-        attr: {
-          type: "button",
-          title: "Focus child cards",
-        },
-      });
-      setIcon(childButtonEl.createSpan(), "lucide-list-tree");
-      childButtonEl.createSpan({
-        text: `${childCount} ${childCount === 1 ? "child" : "children"}`,
-      });
-      childButtonEl.addEventListener("click", (event: MouseEvent) => {
-        event.preventDefault();
-        event.stopPropagation();
-        this.focusChildCards(hierarchyInfo.directChildPaths);
-      });
+      this.renderChildOutlineToggle(titleEl, hierarchyInfo.directChildPaths);
+    }
+
+    if (hierarchyInfo && hierarchyInfo.outlineNodes.length > 0) {
+      this.renderDescendantOutline(cardEl, filePath, hierarchyInfo);
     }
 
     // ---- Edit button (visible on hover) ----
@@ -422,6 +392,215 @@ export class CardManager {
     return chip;
   }
 
+  private renderDescendantOutline(
+    cardEl: HTMLElement,
+    filePath: string,
+    hierarchyInfo: CardHierarchyInfo,
+  ): void {
+    const isCollapsed = this.collapsedOutlines.has(filePath);
+    const outlineEl = cardEl.createDiv({
+      cls: "base-board-card-outline",
+    });
+    if (isCollapsed) {
+      outlineEl.addClass("base-board-card-outline--collapsed");
+    }
+    const summaryEl = outlineEl.createDiv({
+      cls: "base-board-card-outline-summary",
+    });
+    const descendantLabel = `${hierarchyInfo.descendantCount} ${
+      hierarchyInfo.descendantCount === 1 ? "descendant" : "descendants"
+    }`;
+    const rootToggleEl = summaryEl.createEl("button", {
+      cls: "base-board-card-outline-toggle",
+      attr: {
+        type: "button",
+        title: isCollapsed
+          ? "Expand descendant outline"
+          : "Collapse descendant outline",
+      },
+    });
+    setIcon(
+      rootToggleEl.createSpan(),
+      isCollapsed ? "lucide-chevron-right" : "lucide-chevron-down",
+    );
+    rootToggleEl.addEventListener("click", (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.toggleOutlineNode(filePath);
+    });
+    summaryEl.createSpan({
+      cls: "base-board-card-outline-count",
+      text: descendantLabel,
+    });
+
+    if (isCollapsed) return;
+
+    const rows = this.flattenOutlineNodes(hierarchyInfo.outlineNodes, 0);
+    const listEl = outlineEl.createDiv({ cls: "base-board-card-outline-list" });
+    const overflowRows: HTMLElement[] = [];
+    rows.forEach(({ node, depth }, index) => {
+      const hasChildren = node.children.length > 0;
+      const isNodeCollapsed = this.collapsedOutlines.has(node.task.file.path);
+      const rowEl = listEl.createDiv({ cls: "base-board-card-outline-row" });
+      if (hasChildren) {
+        rowEl.addClass("base-board-card-outline-row--parent");
+      }
+      rowEl.style.setProperty("--outline-depth", String(Math.min(depth, 4)));
+      rowEl.setAttr("role", "button");
+      rowEl.setAttr("tabindex", "0");
+      rowEl.setAttr("title", `${node.task.title} - ${node.task.currentStatus}`);
+      if (index >= OUTLINE_PREVIEW_LIMIT) {
+        rowEl.addClass("base-board-card-outline-row--hidden");
+        overflowRows.push(rowEl);
+      }
+
+      const markerEl = rowEl.createSpan({
+        cls: "base-board-card-outline-marker",
+      });
+      if (hasChildren) {
+        const toggleEl = markerEl.createEl("button", {
+          cls: "base-board-card-outline-toggle",
+          attr: {
+            type: "button",
+            title: isNodeCollapsed
+              ? "Expand child tasks"
+              : "Collapse child tasks",
+          },
+        });
+        setIcon(
+          toggleEl.createSpan(),
+          isNodeCollapsed ? "lucide-chevron-right" : "lucide-chevron-down",
+        );
+        toggleEl.addEventListener("click", (event: MouseEvent) => {
+          event.preventDefault();
+          event.stopPropagation();
+          this.toggleOutlineNode(node.task.file.path);
+        });
+      } else {
+        setIcon(markerEl, "lucide-dot");
+      }
+      if (hasChildren) {
+        this.renderChildOutlineToggle(
+          rowEl,
+          node.children.map((child) => child.task.file.path),
+        );
+      } else {
+        rowEl.createSpan({ cls: "base-board-card-child-outline-spacer" });
+      }
+      rowEl.createSpan({
+        cls: "base-board-card-outline-title",
+        text: node.task.title,
+      });
+      rowEl.createSpan({
+        cls: "base-board-card-outline-status",
+        text: node.task.currentStatus,
+      });
+
+      rowEl.addEventListener("click", (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.openCardFile(node.task.file, event);
+      });
+      rowEl.addEventListener("keydown", (event: KeyboardEvent) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.openCardFile(node.task.file);
+      });
+    });
+
+    if (overflowRows.length === 0) return;
+
+    const overflowToggleEl = outlineEl.createEl("button", {
+      cls: "base-board-card-outline-more",
+      attr: { type: "button" },
+      text: `+${overflowRows.length} more`,
+    });
+    overflowToggleEl.addEventListener("click", (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const expanded = overflowToggleEl.classList.toggle(
+        "base-board-card-outline-more--expanded",
+      );
+      overflowRows.forEach((rowEl) => {
+        rowEl.toggleClass("base-board-card-outline-row--hidden", !expanded);
+      });
+      overflowToggleEl.setText(expanded ? "show less" : `+${overflowRows.length} more`);
+    });
+  }
+
+  private renderChildOutlineToggle(
+    parentEl: HTMLElement,
+    childPaths: string[],
+  ): void {
+    const toggleEl = parentEl.createEl("button", {
+      cls: "base-board-card-child-outline-toggle",
+      attr: { type: "button" },
+    });
+    toggleEl.dataset.childPaths = JSON.stringify(childPaths);
+    const iconEl = toggleEl.createSpan({
+      cls: "base-board-card-child-outline-toggle-icon",
+    });
+    this.syncChildOutlineToggle(toggleEl, iconEl, childPaths);
+    toggleEl.addEventListener("click", (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.focusChildCards(childPaths);
+      this.syncChildOutlineToggles();
+    });
+  }
+
+  private toggleOutlineNode(filePath: string): void {
+    if (this.collapsedOutlines.has(filePath)) {
+      this.collapsedOutlines.delete(filePath);
+    } else {
+      this.collapsedOutlines.add(filePath);
+    }
+    this.view.scheduleRender();
+  }
+
+  private openCardFile(file: TFile, event?: MouseEvent): void {
+    const mod = event ? Keymap.isModEvent(event) : false;
+    if (mod) {
+      event?.preventDefault();
+      void this.view.app.workspace.getLeaf(mod).openFile(file);
+      return;
+    }
+
+    const openBehavior = this.view.getCardOpenBehavior();
+    if (openBehavior === "split") {
+      if (this.view.detailLeaf && this.view.isLeafAttached(this.view.detailLeaf)) {
+        void this.view.detailLeaf.openFile(file);
+      } else {
+        this.view.detailLeaf = this.view.app.workspace.getLeaf(
+          "split",
+          "vertical",
+        );
+        void this.view.detailLeaf.openFile(file);
+      }
+    } else if (openBehavior === "tab") {
+      void this.view.app.workspace.getLeaf("tab").openFile(file);
+    } else if (openBehavior === "active") {
+      void this.view.app.workspace.getLeaf(false).openFile(file);
+    } else {
+      new CardDetailModal(this.view.app, file, this.view).open();
+    }
+  }
+
+  private flattenOutlineNodes(
+    nodes: CardOutlineNode[],
+    depth: number,
+  ): Array<{ node: CardOutlineNode; depth: number }> {
+    const rows: Array<{ node: CardOutlineNode; depth: number }> = [];
+    for (const node of nodes) {
+      rows.push({ node, depth });
+      if (!this.collapsedOutlines.has(node.task.file.path)) {
+        rows.push(...this.flattenOutlineNodes(node.children, depth + 1));
+      }
+    }
+    return rows;
+  }
+
   private getCardTitle(entry: BasesEntry): string {
     let cardTitle = entry.file?.basename ?? "Untitled";
     const titleProp = this.view.config.get("cardTitleProperty") as
@@ -461,6 +640,16 @@ export class CardManager {
         return parent?.file.path === current.file.path;
       })
       .map((candidate) => candidate.file.path);
+    const directChildren = entries.filter((candidate) =>
+      this.isDirectChildOf(candidate, current, entriesByIdentity),
+    );
+    const outlineNodes = this.getOutlineNodes(
+      directChildren,
+      entries,
+      entriesByIdentity,
+      new Set([current.file.path]),
+    );
+    const descendants = this.getDescendantEntries(outlineNodes);
 
     const parentTitles = this.getParentTitles(
       current,
@@ -477,6 +666,8 @@ export class CardManager {
     return {
       parentTitles,
       directChildPaths,
+      descendantCount: descendants.length,
+      outlineNodes,
       projectColor,
       depth: hierarchyRoot.depth,
     };
@@ -494,10 +685,55 @@ export class CardManager {
           title: this.getCardTitle(entry),
           parentKey: this.getParentKey(file),
           projectColor: this.getProjectColor(file),
+          currentStatus: this.getColumnName(group.key),
         });
       }
     }
     return entries;
+  }
+
+  private isDirectChildOf(
+    candidate: CardHierarchyEntry,
+    parent: CardHierarchyEntry,
+    entriesByIdentity: Map<string, CardHierarchyEntry>,
+  ): boolean {
+    if (!candidate.parentKey) return false;
+    const resolvedParent = entriesByIdentity.get(candidate.parentKey);
+    return resolvedParent?.file.path === parent.file.path;
+  }
+
+  private getOutlineNodes(
+    entries: CardHierarchyEntry[],
+    allEntries: CardHierarchyEntry[],
+    entriesByIdentity: Map<string, CardHierarchyEntry>,
+    visitedPaths: Set<string>,
+  ): CardOutlineNode[] {
+    return entries.map((entry) => {
+      const nextVisitedPaths = new Set(visitedPaths);
+      nextVisitedPaths.add(entry.file.path);
+      const children = allEntries.filter((candidate) => {
+        if (nextVisitedPaths.has(candidate.file.path)) return false;
+        return this.isDirectChildOf(candidate, entry, entriesByIdentity);
+      });
+      return {
+        task: entry,
+        children: this.getOutlineNodes(
+          children,
+          allEntries,
+          entriesByIdentity,
+          nextVisitedPaths,
+        ),
+      };
+    });
+  }
+
+  private getDescendantEntries(nodes: CardOutlineNode[]): CardHierarchyEntry[] {
+    const descendants: CardHierarchyEntry[] = [];
+    for (const node of nodes) {
+      descendants.push(node.task);
+      descendants.push(...this.getDescendantEntries(node.children));
+    }
+    return descendants;
   }
 
   private getParentTitles(
@@ -586,6 +822,24 @@ export class CardManager {
       : entry.title || entry.file.path;
   }
 
+  private getColumnName(key: unknown): string {
+    if (key === undefined || key === null || key instanceof NullValue) {
+      return NO_VALUE_COLUMN;
+    }
+    if (typeof key === "object" && key !== null) {
+      if ("value" in key) {
+        const value = (key as Record<string, unknown>).value;
+        return String(value);
+      }
+      // Bases group-key objects expose the column name via toString()
+      // eslint-disable-next-line @typescript-eslint/no-base-to-string -- Bases-controlled object with custom toString
+      return String(key);
+    }
+    if (typeof key === "string") return key;
+    if (typeof key === "number" || typeof key === "boolean") return String(key);
+    return "";
+  }
+
   private focusChildCards(childPaths: string[]): void {
     const childPathSet = new Set(childPaths);
     const selectedCards = this.view.selectedCards;
@@ -622,6 +876,54 @@ export class CardManager {
     const firstChildEl = selectedChildEls[0];
     firstChildEl?.scrollIntoView({ block: "nearest", inline: "nearest" });
     firstChildEl?.focus({ preventScroll: true });
+  }
+
+  private syncChildOutlineToggles(): void {
+    this.view.containerEl
+      .querySelectorAll<HTMLElement>(".base-board-card-child-outline-toggle")
+      .forEach((toggleEl) => {
+        const iconEl = toggleEl.querySelector<HTMLElement>(
+          ".base-board-card-child-outline-toggle-icon",
+        );
+        if (!iconEl) return;
+        const rawChildPaths = toggleEl.dataset.childPaths;
+        if (!rawChildPaths) return;
+
+        const childPaths = this.parseChildPaths(rawChildPaths);
+        this.syncChildOutlineToggle(toggleEl, iconEl, childPaths);
+      });
+  }
+
+  private syncChildOutlineToggle(
+    toggleEl: HTMLElement,
+    iconEl: HTMLElement,
+    childPaths: string[],
+  ): void {
+    const outlined = this.areChildCardsOutlined(childPaths);
+    setIcon(iconEl, outlined ? "lucide-eye" : "lucide-eye-off");
+    toggleEl.toggleClass("is-active", outlined);
+    toggleEl.setAttr(
+      "title",
+      outlined ? "Hide child outlines" : "Show child outlines",
+    );
+  }
+
+  private areChildCardsOutlined(childPaths: string[]): boolean {
+    return (
+      childPaths.length > 0 &&
+      childPaths.every((childPath) => this.view.selectedCards.has(childPath))
+    );
+  }
+
+  private parseChildPaths(rawChildPaths: string): string[] {
+    try {
+      const parsed: unknown = JSON.parse(rawChildPaths);
+      return Array.isArray(parsed)
+        ? parsed.filter((path): path is string => typeof path === "string")
+        : [];
+    } catch {
+      return [];
+    }
   }
 
   private getParentKey(file: TFile): string | null {
