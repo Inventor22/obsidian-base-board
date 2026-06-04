@@ -33,6 +33,13 @@ const ROLLOUT_HISTORY_PROPERTY = "rollout_history";
 const ROLLOUT_ENABLED_PROPERTY = "rollout_enabled";
 const ROLLOUT_ORDER_PROPERTY = "rollout_order";
 const ROLLOUT_COLUMNS = ["None", "Stage", "Canary", "Pilot", "Broad"];
+const ROLLOUT_COLUMN_COLORS: Record<string, string> = {
+  none: "#6b7280",
+  stage: "#3f7d9a",
+  canary: "#b08a3f",
+  pilot: "#7a6fba",
+  broad: "#4f8f6b",
+};
 
 export class RolloutView extends BasesView {
   type = "rollout";
@@ -147,8 +154,13 @@ export class RolloutView extends BasesView {
 
     const columnEl = boardEl.createDiv({ cls: "base-board-column" });
     columnEl.dataset.columnName = columnName;
+    const columnColor = this.getRolloutColumnColor(columnName);
+    columnEl.style.setProperty("--column-color", columnColor);
+    const accentEl = columnEl.createDiv({ cls: "base-board-column-accent" });
+    accentEl.style.backgroundColor = columnColor;
 
     const headerEl = columnEl.createDiv({ cls: "base-board-column-header" });
+    headerEl.style.setProperty("--base-board-column-color", columnColor);
     const dragHandle = headerEl.createDiv({
       cls: "base-board-column-drag-handle",
     });
@@ -325,6 +337,10 @@ export class RolloutView extends BasesView {
       (column) => column.toLowerCase() === normalized,
     );
     return match ?? ring ?? "None";
+  }
+
+  private getRolloutColumnColor(columnName: string): string {
+    return ROLLOUT_COLUMN_COLORS[columnName.trim().toLowerCase()] ?? "#6b7280";
   }
 
   private normalizeText(value: unknown): string | null {

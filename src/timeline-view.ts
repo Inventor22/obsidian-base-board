@@ -2230,11 +2230,12 @@ export class TimelineView extends BasesView {
 
   private getRolloutRingColor(ring: string | null): string {
     const normalizedRing = ring?.trim().toLowerCase();
+    if (!normalizedRing || normalizedRing === "none") return "#6b7280";
     if (normalizedRing === "stage") return "#3f7d9a";
     if (normalizedRing === "canary") return "#b08a3f";
     if (normalizedRing === "pilot") return "#7a6fba";
     if (normalizedRing === "broad") return "#4f8f6b";
-    return "var(--text-muted)";
+    return "#6b7280";
   }
 
   private getDisplayStatus(status: string | null): string {

@@ -29,9 +29,22 @@
   align-items: flex-start;
 }
 
-.base-board-archive {
+.base-board-shelves {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
   flex: 0 0 auto;
   margin: 0 12px 12px;
+}
+
+@media (max-width: 720px) {
+  .base-board-shelves {
+    grid-template-columns: 1fr;
+  }
+}
+
+.base-board-archive {
+  min-width: 0;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m);
   background-color: var(--background-secondary);
@@ -39,9 +52,9 @@
 }
 
 .base-board-archive--expanded {
-  max-height: 34%;
   display: flex;
   flex-direction: column;
+  max-height: min(260px, 34vh);
 }
 
 .base-board-archive-header {
@@ -110,6 +123,7 @@
   flex-direction: column;
   gap: 1px;
   padding: 4px;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -183,8 +197,72 @@
   white-space: nowrap;
 }
 
+.base-board-planned-shelf {
+  min-width: 0;
+}
+
+.base-board-planned-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 6px;
+}
+
+.base-board-planned-card {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 5px 8px;
+  border-left: 3px solid var(--planned-status-color, var(--text-muted));
+  background-color: color-mix(
+    in srgb,
+    var(--planned-status-color, var(--text-muted)) 6%,
+    var(--background-primary)
+  );
+}
+
+.base-board-planned-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--planned-status-color, var(--text-muted));
+}
+
+.base-board-planned-marker svg {
+  width: 14px;
+  height: 14px;
+}
+
+.base-board-planned-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.base-board-planned-status {
+  max-width: 96px;
+  overflow: hidden;
+  border-radius: var(--radius-s);
+  padding: 1px 6px;
+  background-color: color-mix(
+    in srgb,
+    var(--planned-status-color, var(--text-muted)) 13%,
+    var(--background-secondary)
+  );
+  color: var(--planned-status-color, var(--text-muted));
+  font-size: var(--font-ui-smaller);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Utility — used to hide the + button while inline card creation input is open */
-.base-board-column-header .base-board-hidden {
+.base-board-column-header .base-board-hidden,
+.base-board-archive-header .base-board-hidden {
   display: none;
 }
 
@@ -387,14 +465,22 @@
 /* ---- Column header add-card button — always visible ---- */
 
 .base-board-column-add-card {
+  appearance: none;
   display: flex;
   align-items: center;
   justify-content: center;
   width: 22px;
   height: 22px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: 0 !important;
   border-radius: var(--radius-s);
+  background: transparent !important;
+  box-shadow: none !important;
   cursor: pointer;
   color: var(--text-muted);
+  line-height: 1;
   flex-shrink: 0;
   transition:
     background-color 0.15s ease,
@@ -407,7 +493,7 @@
 }
 
 .base-board-column-add-card:hover {
-  background-color: var(--background-modifier-hover);
+  background: var(--background-modifier-hover) !important;
   color: var(--interactive-accent);
 }
 

@@ -81,6 +81,7 @@ const HIERARCHY_COLOR_PROPS = new Set([
   "hierarchy_color",
   "hierarchyColor",
 ]);
+const DEFAULT_TASK_TAG = "task";
 const PROJECT_COLOR_PALETTE = [
   "#3f7d9a",
   "#7a6fba",
@@ -1158,8 +1159,10 @@ export class CardManager {
     // The trigger button may be in the header OR in the footer, so we walk
     // up to the column element and then down into .base-board-cards.
     const columnEl = btnEl.closest(".base-board-column");
+    const shelfEl = btnEl.closest(".base-board-archive");
     const cardsEl =
       (columnEl?.querySelector(".base-board-cards") as HTMLElement | null) ??
+      (shelfEl?.querySelector(".base-board-planned-list") as HTMLElement | null) ??
       btnEl.parentElement!;
 
     btnEl.classList.add("base-board-hidden");
@@ -1213,8 +1216,17 @@ export class CardManager {
     }
 
     const overrides = (fm: Record<string, unknown>) => {
+      fm.type = "task";
       fm[groupByProp] = columnName;
       fm[ORDER_PROPERTY] = orderIndex;
+      fm.id = this.getGeneratedTaskId(title);
+      fm.feature = "";
+      fm.created = new Date().toISOString();
+      fm.people = [];
+      fm.pr = "";
+      fm.reviewers = [];
+      fm.blocked_reason = "";
+      fm.tags = [DEFAULT_TASK_TAG];
     };
 
     try {
@@ -1222,6 +1234,17 @@ export class CardManager {
     } catch (err) {
       new Notice(`Failed to create card: ${String(err)}`);
     }
+  }
+
+  private getGeneratedTaskId(title: string): string {
+    const slug = sanitizeFilename(title)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48);
+    const suffix = Math.random().toString(36).slice(2, 6);
+    return `${slug || "task"}-${suffix}`;
   }
 
   // ---------------------------------------------------------------------------

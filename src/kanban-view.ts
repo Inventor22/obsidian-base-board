@@ -26,6 +26,7 @@ import {
 import { getColumnColor } from "./status-colors";
 
 const ARCHIVE_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000;
+const PLANNED_COLUMN = "Planned";
 
 interface TransitionHistoryEntry {
   from: string | null;
@@ -40,6 +41,13 @@ interface ArchivedEntry {
   title: string;
   status: string;
   completedAt: Date;
+  columnColor: string;
+}
+
+interface PlannedEntry {
+  file: TFile;
+  title: string;
+  status: string;
   columnColor: string;
 }
 
@@ -70,6 +78,8 @@ export class KanbanView extends BasesView implements HoverParent {
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
   /** Whether the computed archive shelf is expanded. */
   private isArchiveExpanded = false;
+  /** Whether the computed planned shelf is expanded. */
+  private isPlannedExpanded = true;
   /** Label Manager for tags and filters */
   public tags: Tags;
   /** Currently selected card file paths (for batch operations) */
@@ -370,6 +380,31 @@ export class KanbanView extends BasesView implements HoverParent {
     });
   }
 
+  private getPlannedEntries(): PlannedEntry[] {
+    const plannedEntries: PlannedEntry[] = [];
+
+    for (const group of this.currentGroups) {
+      const columnName = this.getColumnName(group.key);
+      if (!this.isPlannedStatus(columnName)) continue;
+
+      for (const entry of group.entries) {
+        if (!this.entryMatchesActiveTagFilters(entry)) continue;
+        const file = entry.file;
+        if (!(file instanceof TFile)) continue;
+        plannedEntries.push({
+          file,
+          title: this.cardManager.getCardTitle(entry),
+          status: columnName,
+          columnColor: getColumnColor(this.config, columnName),
+        });
+      }
+    }
+
+    return plannedEntries.sort((first, second) =>
+      first.title.localeCompare(second.title),
+    );
+  }
+
   private getCompletedStateEnteredAt(
     file: TFile,
     groupByProp: string,
@@ -465,6 +500,10 @@ export class KanbanView extends BasesView implements HoverParent {
     return normalizedStatus === "completed" || normalizedStatus === "done";
   }
 
+  private isPlannedStatus(status: string | null): boolean {
+    return status?.trim().toLowerCase() === PLANNED_COLUMN.toLowerCase();
+  }
+
   // ---------------------------------------------------------------------------
   //  Column config  (dual-layer: .base file via config API + plugin data.json)
   // ---------------------------------------------------------------------------
@@ -499,12 +538,14 @@ export class KanbanView extends BasesView implements HoverParent {
       ? rawStored.map((col) => (col === "" ? NO_VALUE_COLUMN : col))
       : null;
 
-    const dataColumns = this.currentGroups.map((g) =>
-      this.getColumnName(g.key),
-    );
+    const dataColumns = this.currentGroups
+      .map((g) => this.getColumnName(g.key))
+      .filter((columnName) => !this.isPlannedStatus(columnName));
 
     if (stored && stored.length > 0) {
-      const result = [...stored];
+      const result = stored.filter(
+        (columnName) => !this.isPlannedStatus(columnName),
+      );
       for (const col of dataColumns) {
         if (!result.includes(col)) {
           result.push(col);
@@ -587,6 +628,9 @@ export class KanbanView extends BasesView implements HoverParent {
 
     this.currentGroups = groupedData;
     const columns = this.getColumns();
+
+    this.tags.renderFilterBar(this.containerEl);
+
     const boardEl = this.containerEl.createDiv({ cls: "base-board-board" });
 
     // Only animate cards on the very first render
@@ -595,16 +639,22 @@ export class KanbanView extends BasesView implements HoverParent {
       this.isFirstRender = false;
     }
 
-    this.tags.renderFilterBar(this.containerEl);
-
     columns.forEach((columnName, idx) => {
       const group = this.getGroupForColumn(columnName);
       this.columnManager.renderColumn(boardEl, columnName, group, idx);
     });
 
     this.columnManager.renderAddColumnButton(boardEl);
-    this.dragDropManager.initBoard(boardEl);
-    this.renderArchiveSection(this.getArchivedEntries());
+    const shelvesEl = this.containerEl.createDiv({ cls: "base-board-shelves" });
+    const plannedShelfEl = this.renderPlannedSection(
+      shelvesEl,
+      this.getPlannedEntries(),
+    );
+    this.renderArchiveSection(shelvesEl, this.getArchivedEntries());
+    this.dragDropManager.initBoard(
+      boardEl,
+      plannedShelfEl ? [plannedShelfEl] : [],
+    );
 
     // Restore scroll positions after the browser has laid out the new DOM
     const hasColumnScrolls = Object.keys(savedColumnScrolls).some(
@@ -627,10 +677,113 @@ export class KanbanView extends BasesView implements HoverParent {
     }
   }
 
-  private renderArchiveSection(archivedEntries: ArchivedEntry[]): void {
-    if (archivedEntries.length === 0) return;
+  private renderPlannedSection(
+    parentEl: HTMLElement,
+    plannedEntries: PlannedEntry[],
+  ): HTMLElement | null {
+    const plannedEl = parentEl.createDiv({
+      cls: "base-board-archive base-board-planned-shelf",
+    });
+    if (this.isPlannedExpanded) {
+      plannedEl.addClass("base-board-archive--expanded");
+    }
 
-    const archiveEl = this.containerEl.createDiv({ cls: "base-board-archive" });
+    const headerEl = plannedEl.createDiv({
+      cls: "base-board-archive-header",
+    });
+    headerEl.setAttr("role", "button");
+    headerEl.setAttr("tabindex", "0");
+    headerEl.setAttr("aria-expanded", String(this.isPlannedExpanded));
+    const chevronEl = headerEl.createSpan({
+      cls: "base-board-archive-chevron",
+    });
+    setIcon(
+      chevronEl,
+      this.isPlannedExpanded ? "lucide-chevron-down" : "lucide-chevron-right",
+    );
+    const plannedIconEl = headerEl.createSpan({ cls: "base-board-archive-icon" });
+    setIcon(plannedIconEl, "lucide-calendar-clock");
+    headerEl.createSpan({ cls: "base-board-archive-title", text: "Planned" });
+    headerEl.createSpan({
+      cls: "base-board-archive-count",
+      text: String(plannedEntries.length),
+    });
+    headerEl.createSpan({
+      cls: "base-board-archive-hint",
+      text: "Future or gated work",
+    });
+    const addPlannedBtn = headerEl.createEl("button", {
+      cls: "base-board-column-add-card base-board-planned-add-card",
+      attr: {
+        type: "button",
+        title: "Add planned card",
+      },
+    });
+    setIcon(addPlannedBtn, "plus");
+    headerEl.addEventListener("click", () => {
+      this.isPlannedExpanded = !this.isPlannedExpanded;
+      this.render();
+    });
+    headerEl.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      this.isPlannedExpanded = !this.isPlannedExpanded;
+      this.render();
+    });
+    addPlannedBtn.addEventListener("click", (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!this.isPlannedExpanded) {
+        this.isPlannedExpanded = true;
+        this.render();
+        return;
+      }
+      this.cardManager.startInlineCardCreation(
+        addPlannedBtn,
+        PLANNED_COLUMN,
+        plannedEntries.length,
+      );
+    });
+
+    if (!this.isPlannedExpanded) return plannedEl;
+
+    const listEl = plannedEl.createDiv({
+      cls: "base-board-archive-list base-board-planned-list",
+    });
+    plannedEntries.forEach((plannedEntry) => {
+      const cardEl = listEl.createDiv({
+        cls: "base-board-card base-board-planned-card",
+      });
+      cardEl.setAttr("draggable", "true");
+      cardEl.dataset.filePath = plannedEntry.file.path;
+      cardEl.dataset.columnName = plannedEntry.status;
+      cardEl.style.setProperty("--planned-status-color", plannedEntry.columnColor);
+      cardEl.setAttr("title", `${plannedEntry.title} - planned`);
+
+      const markerEl = cardEl.createSpan({ cls: "base-board-planned-marker" });
+      setIcon(markerEl, "lucide-calendar-clock");
+      cardEl.createSpan({
+        cls: "base-board-planned-title",
+        text: plannedEntry.title,
+      });
+      cardEl.createSpan({
+        cls: "base-board-planned-status",
+        text: plannedEntry.status,
+      });
+
+      cardEl.addEventListener("click", (event: MouseEvent) => {
+        this.cardManager.openCardFile(plannedEntry.file, event);
+      });
+    });
+
+    return plannedEl;
+  }
+
+  private renderArchiveSection(
+    parentEl: HTMLElement,
+    archivedEntries: ArchivedEntry[],
+  ): void {
+    const archiveEl = parentEl.createDiv({ cls: "base-board-archive" });
     if (this.isArchiveExpanded) {
       archiveEl.addClass("base-board-archive--expanded");
     }
@@ -667,7 +820,7 @@ export class KanbanView extends BasesView implements HoverParent {
       this.render();
     });
 
-    if (!this.isArchiveExpanded) return;
+    if (!this.isArchiveExpanded || archivedEntries.length === 0) return;
 
     const listEl = archiveEl.createDiv({ cls: "base-board-archive-list" });
     archivedEntries.forEach((archivedEntry) => {

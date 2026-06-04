@@ -8,6 +8,7 @@ interface ColorConfig {
 const DEFAULT_COLUMN_COLORS: Record<string, string> = {
   "to do": "#8b949e",
   todo: "#8b949e",
+  planned: "#6e7681",
   backlog: "#6e7681",
   "in progress": "#2f81f7",
   doing: "#2f81f7",

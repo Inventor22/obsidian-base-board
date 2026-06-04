@@ -21,6 +21,7 @@ export class DragDropManager {
   private app: App;
   private callbacks: DragDropCallbacks;
   private boardEl: HTMLElement | null = null;
+  private extraCardDragRoots: HTMLElement[] = [];
   private draggedEl: HTMLElement | null = null;
   private placeholderEl: HTMLElement | null = null;
   private dragType: "card" | "column" | null = null;
@@ -57,13 +58,18 @@ export class DragDropManager {
     };
   }
 
-  initBoard(boardEl: HTMLElement): void {
+  initBoard(boardEl: HTMLElement, extraCardDragRoots: HTMLElement[] = []): void {
     this.teardownBoard();
     this.boardEl = boardEl;
+    this.extraCardDragRoots = extraCardDragRoots;
     boardEl.addEventListener("dragstart", this.boundHandlers.dragStart);
     boardEl.addEventListener("dragover", this.boundHandlers.dragOver);
     boardEl.addEventListener("dragend", this.boundHandlers.dragEnd);
     boardEl.addEventListener("drop", this.boundHandlers.drop);
+    for (const rootEl of this.extraCardDragRoots) {
+      rootEl.addEventListener("dragstart", this.boundHandlers.dragStart);
+      rootEl.addEventListener("dragend", this.boundHandlers.dragEnd);
+    }
   }
 
   destroy(): void {
@@ -76,6 +82,11 @@ export class DragDropManager {
     this.boardEl.removeEventListener("dragover", this.boundHandlers.dragOver);
     this.boardEl.removeEventListener("dragend", this.boundHandlers.dragEnd);
     this.boardEl.removeEventListener("drop", this.boundHandlers.drop);
+    for (const rootEl of this.extraCardDragRoots) {
+      rootEl.removeEventListener("dragstart", this.boundHandlers.dragStart);
+      rootEl.removeEventListener("dragend", this.boundHandlers.dragEnd);
+    }
+    this.extraCardDragRoots = [];
     this.removePlaceholder();
     this.boardEl = null;
   }
