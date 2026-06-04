@@ -23,6 +23,9 @@ import {
   CONFIG_KEY_OPEN_BEHAVIOR,
   CONFIG_KEY_COLUMN_COLORS,
 } from "./constants";
+import { getColumnColor } from "./status-colors";
+
+const ARCHIVE_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface TransitionHistoryEntry {
   from: string | null;
@@ -30,6 +33,14 @@ interface TransitionHistoryEntry {
   at: string;
   property: string;
   source: "baseboard-drag-drop";
+}
+
+interface ArchivedEntry {
+  file: TFile;
+  title: string;
+  status: string;
+  completedAt: Date;
+  columnColor: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +68,8 @@ export class KanbanView extends BasesView implements HoverParent {
   private isFirstRender = true;
   /** Debounce timer for render calls. */
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Whether the computed archive shelf is expanded. */
+  private isArchiveExpanded = false;
   /** Label Manager for tags and filters */
   public tags: Tags;
   /** Currently selected card file paths (for batch operations) */
@@ -294,6 +307,163 @@ export class KanbanView extends BasesView implements HoverParent {
     return Infinity;
   }
 
+  public isArchivedEntry(entry: BasesEntry, columnName: string): boolean {
+    return this.getArchivedEntry(entry, columnName) !== null;
+  }
+
+  public entryMatchesActiveTagFilters(entry: BasesEntry): boolean {
+    if (this.tags.activeFilters.size === 0) return true;
+
+    const file = entry.file;
+    if (!(file instanceof TFile)) return false;
+
+    const fileTags = this.tags.extractTagsFromFile(file);
+    return Array.from(this.tags.activeFilters).some((filter) =>
+      fileTags.includes(filter),
+    );
+  }
+
+  private getArchivedEntry(
+    entry: BasesEntry,
+    columnName: string,
+  ): ArchivedEntry | null {
+    if (!this.isCompletedStatus(columnName)) return null;
+
+    const file = entry.file;
+    if (!(file instanceof TFile)) return null;
+
+    const groupByProp = this.getGroupByProperty();
+    if (!groupByProp) return null;
+
+    const completedAt = this.getCompletedStateEnteredAt(file, groupByProp);
+    if (!completedAt) return null;
+
+    const archiveAt = completedAt.getTime() + ARCHIVE_GRACE_PERIOD_MS;
+    if (Date.now() < archiveAt) return null;
+
+    return {
+      file,
+      title: this.cardManager.getCardTitle(entry),
+      status: columnName,
+      completedAt,
+      columnColor: getColumnColor(this.config, columnName),
+    };
+  }
+
+  private getArchivedEntries(): ArchivedEntry[] {
+    const archivedEntries: ArchivedEntry[] = [];
+
+    for (const group of this.currentGroups) {
+      const columnName = this.getColumnName(group.key);
+      for (const entry of group.entries) {
+        if (!this.entryMatchesActiveTagFilters(entry)) continue;
+        const archivedEntry = this.getArchivedEntry(entry, columnName);
+        if (archivedEntry) archivedEntries.push(archivedEntry);
+      }
+    }
+
+    return archivedEntries.sort((first, second) => {
+      const completedAtDiff =
+        second.completedAt.getTime() - first.completedAt.getTime();
+      if (completedAtDiff !== 0) return completedAtDiff;
+      return first.title.localeCompare(second.title);
+    });
+  }
+
+  private getCompletedStateEnteredAt(
+    file: TFile,
+    groupByProp: string,
+  ): Date | null {
+    const propertyName = this.plugin.data_.transitionHistory.propertyName.trim();
+    if (!propertyName) return null;
+
+    const frontmatter = this.getFrontmatter(file);
+    const rawHistory = frontmatter?.[propertyName];
+    if (!Array.isArray(rawHistory)) return null;
+
+    const historyRecords = (rawHistory as unknown[])
+      .map((rawRecord) =>
+        this.parseTransitionHistoryRecord(rawRecord, groupByProp),
+      )
+      .filter(
+        (
+          record,
+        ): record is { from: string | null; to: string | null; at: Date } =>
+          record !== null,
+      )
+      .sort((first, second) => first.at.getTime() - second.at.getTime());
+
+    let completedStateEnteredAt: Date | null = null;
+    for (const record of historyRecords) {
+      if (this.isCompletedStatus(record.to)) {
+        if (!this.isCompletedStatus(record.from)) {
+          completedStateEnteredAt = record.at;
+        }
+      } else {
+        completedStateEnteredAt = null;
+      }
+    }
+
+    return completedStateEnteredAt;
+  }
+
+  private parseTransitionHistoryRecord(
+    rawRecord: unknown,
+    groupByProp: string,
+  ): { from: string | null; to: string | null; at: Date } | null {
+    if (!rawRecord || typeof rawRecord !== "object") return null;
+    const record = rawRecord as Partial<TransitionHistoryEntry>;
+    if (
+      typeof record.property === "string" &&
+      record.property !== groupByProp
+    ) {
+      return null;
+    }
+    if (typeof record.at !== "string") return null;
+
+    const recordDate = new Date(record.at);
+    if (Number.isNaN(recordDate.getTime())) return null;
+
+    return {
+      from: this.normalizeStatus(record.from),
+      to: this.normalizeStatus(record.to),
+      at: recordDate,
+    };
+  }
+
+  private getFrontmatter(file: TFile): Record<string, unknown> | undefined {
+    const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    return frontmatter && typeof frontmatter === "object"
+      ? frontmatter
+      : undefined;
+  }
+
+  private normalizeStatus(value: unknown): string | null {
+    if (value === undefined || value === null || value instanceof NullValue) {
+      return null;
+    }
+    if (typeof value === "object") {
+      if ("value" in value) {
+        return this.normalizeStatus((value as Record<string, unknown>).value);
+      }
+      return null;
+    }
+    if (typeof value === "string") {
+      const status = value.trim();
+      return status.length > 0 ? status : null;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      const status = String(value).trim();
+      return status.length > 0 ? status : null;
+    }
+    return null;
+  }
+
+  private isCompletedStatus(status: string | null): boolean {
+    const normalizedStatus = status?.trim().toLowerCase();
+    return normalizedStatus === "completed" || normalizedStatus === "done";
+  }
+
   // ---------------------------------------------------------------------------
   //  Column config  (dual-layer: .base file via config API + plugin data.json)
   // ---------------------------------------------------------------------------
@@ -433,6 +603,7 @@ export class KanbanView extends BasesView implements HoverParent {
 
     this.columnManager.renderAddColumnButton(boardEl);
     this.dragDropManager.initBoard(boardEl);
+    this.renderArchiveSection(this.getArchivedEntries());
 
     // Restore scroll positions after the browser has laid out the new DOM
     const hasColumnScrolls = Object.keys(savedColumnScrolls).some(
@@ -453,6 +624,92 @@ export class KanbanView extends BasesView implements HoverParent {
         });
       });
     }
+  }
+
+  private renderArchiveSection(archivedEntries: ArchivedEntry[]): void {
+    if (archivedEntries.length === 0) return;
+
+    const archiveEl = this.containerEl.createDiv({ cls: "base-board-archive" });
+    if (this.isArchiveExpanded) {
+      archiveEl.addClass("base-board-archive--expanded");
+    }
+
+    const headerEl = archiveEl.createEl("button", {
+      cls: "base-board-archive-header",
+      attr: {
+        type: "button",
+        "aria-expanded": String(this.isArchiveExpanded),
+      },
+    });
+    const chevronEl = headerEl.createSpan({
+      cls: "base-board-archive-chevron",
+    });
+    setIcon(
+      chevronEl,
+      this.isArchiveExpanded ? "lucide-chevron-down" : "lucide-chevron-right",
+    );
+    const archiveIconEl = headerEl.createSpan({
+      cls: "base-board-archive-icon",
+    });
+    setIcon(archiveIconEl, "lucide-archive");
+    headerEl.createSpan({ cls: "base-board-archive-title", text: "Archived" });
+    headerEl.createSpan({
+      cls: "base-board-archive-count",
+      text: String(archivedEntries.length),
+    });
+    headerEl.createSpan({
+      cls: "base-board-archive-hint",
+      text: "Completed for 7+ days",
+    });
+    headerEl.addEventListener("click", () => {
+      this.isArchiveExpanded = !this.isArchiveExpanded;
+      this.render();
+    });
+
+    if (!this.isArchiveExpanded) return;
+
+    const listEl = archiveEl.createDiv({ cls: "base-board-archive-list" });
+    archivedEntries.forEach((archivedEntry) => {
+      const rowEl = listEl.createEl("button", {
+        cls: "base-board-archive-row",
+        attr: { type: "button" },
+      });
+      rowEl.style.setProperty(
+        "--archive-status-color",
+        archivedEntry.columnColor,
+      );
+      rowEl.setAttr(
+        "title",
+        `${archivedEntry.title} - completed ${archivedEntry.completedAt.toLocaleString()}`,
+      );
+
+      const markerEl = rowEl.createSpan({ cls: "base-board-archive-marker" });
+      setIcon(markerEl, "lucide-check");
+      rowEl.createSpan({
+        cls: "base-board-archive-row-title",
+        text: archivedEntry.title,
+      });
+      rowEl.createSpan({
+        cls: "base-board-archive-row-status",
+        text: archivedEntry.status,
+      });
+      rowEl.createSpan({
+        cls: "base-board-archive-row-date",
+        text: this.formatArchiveDate(archivedEntry.completedAt),
+      });
+      rowEl.addEventListener("click", (event: MouseEvent) => {
+        this.cardManager.openCardFile(archivedEntry.file, event);
+      });
+    });
+  }
+
+  private formatArchiveDate(date: Date): string {
+    const now = new Date();
+    const options: Intl.DateTimeFormatOptions =
+      date.getFullYear() === now.getFullYear()
+        ? { month: "short", day: "numeric" }
+        : { month: "short", day: "numeric", year: "numeric" };
+    return date.toLocaleDateString(undefined, options);
   }
 
   // ---------------------------------------------------------------------------

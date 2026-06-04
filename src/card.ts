@@ -579,7 +579,7 @@ export class CardManager {
     return `nested:${rootFilePath}:${nodeFilePath}`;
   }
 
-  private openCardFile(file: TFile, event?: MouseEvent): void {
+  public openCardFile(file: TFile, event?: MouseEvent): void {
     const mod = event ? Keymap.isModEvent(event) : false;
     if (mod) {
       event?.preventDefault();
@@ -628,7 +628,7 @@ export class CardManager {
     return rows;
   }
 
-  private getCardTitle(entry: BasesEntry): string {
+  public getCardTitle(entry: BasesEntry): string {
     let cardTitle = entry.file?.basename ?? "Untitled";
     const titleProp = this.view.config.get("cardTitleProperty") as
       | string

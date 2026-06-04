@@ -29,6 +29,160 @@
   align-items: flex-start;
 }
 
+.base-board-archive {
+  flex: 0 0 auto;
+  margin: 0 12px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-secondary);
+  overflow: hidden;
+}
+
+.base-board-archive--expanded {
+  max-height: 34%;
+  display: flex;
+  flex-direction: column;
+}
+
+.base-board-archive-header {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 0 !important;
+  border-radius: 0;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--font-ui-small);
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+
+.base-board-archive-header:hover {
+  background-color: var(--background-modifier-hover) !important;
+  color: var(--text-normal);
+}
+
+.base-board-archive-chevron,
+.base-board-archive-icon,
+.base-board-archive-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.base-board-archive-chevron svg,
+.base-board-archive-icon svg,
+.base-board-archive-marker svg {
+  width: 14px;
+  height: 14px;
+}
+
+.base-board-archive-title {
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+}
+
+.base-board-archive-count {
+  padding: 1px 6px;
+  border-radius: 10px;
+  background-color: var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+}
+
+.base-board-archive-hint {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.base-board-archive-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px;
+  overflow-y: auto;
+}
+
+.base-board-archive-row {
+  appearance: none;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 0 !important;
+  border-radius: var(--radius-s);
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--font-ui-small);
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+
+.base-board-archive-row:hover,
+.base-board-archive-row:focus-visible {
+  background-color: var(--background-modifier-hover) !important;
+  color: var(--text-normal);
+  outline: none;
+}
+
+.base-board-archive-marker {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background-color: color-mix(
+    in srgb,
+    var(--archive-status-color, var(--interactive-accent)) 14%,
+    transparent
+  );
+  color: var(--archive-status-color, var(--interactive-accent));
+}
+
+.base-board-archive-row-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-normal);
+}
+
+.base-board-archive-row-status {
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: var(--radius-s);
+  background-color: color-mix(
+    in srgb,
+    var(--archive-status-color, var(--interactive-accent)) 12%,
+    transparent
+  );
+  color: var(--archive-status-color, var(--text-muted));
+  font-size: var(--font-ui-smaller);
+}
+
+.base-board-archive-row-date {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  white-space: nowrap;
+}
+
 /* Utility — used to hide the + button while inline card creation input is open */
 .base-board-column-header .base-board-hidden {
   display: none;

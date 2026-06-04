@@ -35,18 +35,15 @@ export class ColumnManager {
       return this.view.getFileOrder(pathA) - this.view.getFileOrder(pathB);
     });
 
-    const activeFilters = this.view.tags.activeFilters;
+    const activeEntries = sorted.filter(
+      (entry) => !this.view.isArchivedEntry(entry, columnName),
+    );
     const visibleCards =
-      activeFilters.size > 0
-        ? sorted.filter((entry) => {
-            const file = entry.file;
-            if (!(file instanceof TFile)) return false;
-            const fileTags = this.view.tags.extractTagsFromFile(file);
-            return Array.from(activeFilters).some((filter) =>
-              fileTags.includes(filter),
-            );
-          })
-        : sorted;
+      this.view.tags.activeFilters.size > 0
+        ? activeEntries.filter((entry) =>
+            this.view.entryMatchesActiveTagFilters(entry),
+          )
+        : activeEntries;
 
     const columnEl = boardEl.createDiv({ cls: "base-board-column" });
     columnEl.dataset.columnName = columnName;
@@ -78,7 +75,7 @@ export class ColumnManager {
 
     // Count badge sits right after the title, inline
     const countEl = headerEl.createSpan({
-      text: String(entries.length),
+      text: String(activeEntries.length),
       cls: "base-board-column-count",
     });
 
