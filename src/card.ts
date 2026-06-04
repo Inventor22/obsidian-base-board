@@ -397,7 +397,8 @@ export class CardManager {
     filePath: string,
     hierarchyInfo: CardHierarchyInfo,
   ): void {
-    const isCollapsed = this.collapsedOutlines.has(filePath);
+    const collapseKey = this.getRootOutlineCollapseKey(filePath);
+    const isCollapsed = this.collapsedOutlines.has(collapseKey);
     const outlineEl = cardEl.createDiv({
       cls: "base-board-card-outline",
     });
@@ -426,7 +427,7 @@ export class CardManager {
     rootToggleEl.addEventListener("click", (event: MouseEvent) => {
       event.preventDefault();
       event.stopPropagation();
-      this.toggleOutlineNode(filePath);
+      this.toggleOutlineNode(collapseKey);
     });
     summaryEl.createSpan({
       cls: "base-board-card-outline-count",
@@ -435,12 +436,20 @@ export class CardManager {
 
     if (isCollapsed) return;
 
-    const rows = this.flattenOutlineNodes(hierarchyInfo.outlineNodes, 0);
+    const rows = this.flattenOutlineNodes(
+      hierarchyInfo.outlineNodes,
+      0,
+      filePath,
+    );
     const listEl = outlineEl.createDiv({ cls: "base-board-card-outline-list" });
     const overflowRows: HTMLElement[] = [];
     rows.forEach(({ node, depth }, index) => {
       const hasChildren = node.children.length > 0;
-      const isNodeCollapsed = this.collapsedOutlines.has(node.task.file.path);
+      const nodeCollapseKey = this.getNestedOutlineCollapseKey(
+        filePath,
+        node.task.file.path,
+      );
+      const isNodeCollapsed = this.collapsedOutlines.has(nodeCollapseKey);
       const rowEl = listEl.createDiv({ cls: "base-board-card-outline-row" });
       if (hasChildren) {
         rowEl.addClass("base-board-card-outline-row--parent");
@@ -474,7 +483,7 @@ export class CardManager {
         toggleEl.addEventListener("click", (event: MouseEvent) => {
           event.preventDefault();
           event.stopPropagation();
-          this.toggleOutlineNode(node.task.file.path);
+          this.toggleOutlineNode(nodeCollapseKey);
         });
       } else {
         setIcon(markerEl, "lucide-dot");
@@ -550,13 +559,24 @@ export class CardManager {
     });
   }
 
-  private toggleOutlineNode(filePath: string): void {
-    if (this.collapsedOutlines.has(filePath)) {
-      this.collapsedOutlines.delete(filePath);
+  private toggleOutlineNode(collapseKey: string): void {
+    if (this.collapsedOutlines.has(collapseKey)) {
+      this.collapsedOutlines.delete(collapseKey);
     } else {
-      this.collapsedOutlines.add(filePath);
+      this.collapsedOutlines.add(collapseKey);
     }
     this.view.scheduleRender();
+  }
+
+  private getRootOutlineCollapseKey(filePath: string): string {
+    return `root:${filePath}`;
+  }
+
+  private getNestedOutlineCollapseKey(
+    rootFilePath: string,
+    nodeFilePath: string,
+  ): string {
+    return `nested:${rootFilePath}:${nodeFilePath}`;
   }
 
   private openCardFile(file: TFile, event?: MouseEvent): void {
@@ -590,12 +610,19 @@ export class CardManager {
   private flattenOutlineNodes(
     nodes: CardOutlineNode[],
     depth: number,
+    rootFilePath: string,
   ): Array<{ node: CardOutlineNode; depth: number }> {
     const rows: Array<{ node: CardOutlineNode; depth: number }> = [];
     for (const node of nodes) {
       rows.push({ node, depth });
-      if (!this.collapsedOutlines.has(node.task.file.path)) {
-        rows.push(...this.flattenOutlineNodes(node.children, depth + 1));
+      const collapseKey = this.getNestedOutlineCollapseKey(
+        rootFilePath,
+        node.task.file.path,
+      );
+      if (!this.collapsedOutlines.has(collapseKey)) {
+        rows.push(
+          ...this.flattenOutlineNodes(node.children, depth + 1, rootFilePath),
+        );
       }
     }
     return rows;
