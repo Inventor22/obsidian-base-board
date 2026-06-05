@@ -30,6 +30,7 @@ const PLANNED_COLUMN = "Planned";
 const ARCHIVE_DROP_COLUMN = "Archived";
 const ARCHIVE_TARGET_STATUS = "Completed";
 const ARCHIVED_PROPERTY = "archived";
+const STACKED_COLUMN_GROUPS = [["Flighting", "Blocked"]];
 
 interface TransitionHistoryEntry {
   from: string | null;
@@ -646,7 +647,28 @@ export class KanbanView extends BasesView implements HoverParent {
       this.isFirstRender = false;
     }
 
+    const renderedColumns = new Set<string>();
     columns.forEach((columnName, idx) => {
+      if (renderedColumns.has(columnName)) return;
+      if (this.shouldDeferToStackAnchor(columnName, columns)) return;
+
+      const stackedGroup = this.getStackedColumnGroup(columnName, columns);
+      if (stackedGroup) {
+        const stackEl = boardEl.createDiv({ cls: "base-board-column-stack" });
+        for (const stackedColumnName of stackedGroup) {
+          renderedColumns.add(stackedColumnName);
+          const group = this.getGroupForColumn(stackedColumnName);
+          this.columnManager.renderColumn(
+            stackEl,
+            stackedColumnName,
+            group,
+            columns.indexOf(stackedColumnName),
+          );
+        }
+        return;
+      }
+
+      renderedColumns.add(columnName);
       const group = this.getGroupForColumn(columnName);
       this.columnManager.renderColumn(boardEl, columnName, group, idx);
     });
@@ -790,6 +812,30 @@ export class KanbanView extends BasesView implements HoverParent {
     });
 
     return plannedEl;
+  }
+
+  private getStackedColumnGroup(
+    columnName: string,
+    columns: string[],
+  ): string[] | null {
+    for (const group of STACKED_COLUMN_GROUPS) {
+      if (group[0] !== columnName) continue;
+      const availableColumns = group.filter((candidate) =>
+        columns.includes(candidate),
+      );
+      return availableColumns.length > 1 ? availableColumns : null;
+    }
+    return null;
+  }
+
+  private shouldDeferToStackAnchor(columnName: string, columns: string[]): boolean {
+    for (const group of STACKED_COLUMN_GROUPS) {
+      const [anchorColumn, ...stackedColumns] = group;
+      if (columnName === anchorColumn) continue;
+      if (!stackedColumns.includes(columnName)) continue;
+      return Boolean(anchorColumn && columns.includes(anchorColumn));
+    }
+    return false;
   }
 
   private renderArchiveSection(

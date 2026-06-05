@@ -14,7 +14,7 @@ const DEFAULT_COLUMN_COLORS: Record<string, string> = {
   doing: "#2f81f7",
   "in review": "#d29922",
   review: "#d29922",
-  flighting: "#13a10e",
+  flighting: "#7a6fba",
   done: "#238636",
   completed: "#238636",
   blocked: "#da3633",
