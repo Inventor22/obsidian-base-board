@@ -254,21 +254,7 @@ export class CardManager {
 
     if (file instanceof TFile) {
       const fileTags = this.view.tags.extractTagsFromFile(file);
-      for (const tag of fileTags) {
-        const tagEl = tagContainerEl.createSpan({
-          cls: "base-board-card-tag",
-          text: tag,
-        });
-        const color = this.view.tags.getColorForTag(tag);
-        if (color) {
-          tagEl.style.setProperty("--tag-color", color);
-          if (relativeLuminance(color) === "dark") {
-            tagEl.addClass("base-board-card-tag-light");
-          } else {
-            tagEl.addClass("base-board-card-tag-dark");
-          }
-        }
-      }
+      this.renderCardTags(tagContainerEl, fileTags);
     }
 
     if (hierarchyInfo && hierarchyInfo.parentTitles.length > 0) {
@@ -396,6 +382,80 @@ export class CardManager {
     chip.createSpan({ text: label, cls: "base-board-chip-label" });
     chip.createSpan({ text: value, cls: "base-board-chip-value" });
     return chip;
+  }
+
+  private renderCardTags(containerEl: HTMLElement, tags: string[]): void {
+    for (const group of this.getTagGroups(tags)) {
+      const groupEl = containerEl.createSpan({ cls: "base-board-card-tag-group" });
+      if (group.label !== "other") {
+        groupEl.createSpan({
+          cls: "base-board-card-tag-group-label",
+          text: group.label,
+        });
+      }
+      const valuesEl = groupEl.createSpan({ cls: "base-board-card-tag-values" });
+      for (const tag of group.tags) {
+        this.renderCardTag(valuesEl, tag);
+      }
+    }
+  }
+
+  private renderCardTag(parentEl: HTMLElement, tag: string): void {
+    const tagEl = parentEl.createSpan({
+      cls: "base-board-card-tag",
+      text: this.getTagLeaf(tag),
+    });
+    tagEl.setAttr("title", tag);
+    const color = this.view.tags.getColorForTag(tag);
+    if (color) {
+      tagEl.style.setProperty("--tag-color", color);
+      if (relativeLuminance(color) === "dark") {
+        tagEl.addClass("base-board-card-tag-light");
+      } else {
+        tagEl.addClass("base-board-card-tag-dark");
+      }
+    }
+  }
+
+  private getTagGroups(tags: string[]): Array<{ label: string; tags: string[] }> {
+    const groups = new Map<string, string[]>();
+    for (const tag of tags) {
+      const groupName = this.getTagGroupName(tag);
+      const groupTags = groups.get(groupName) ?? [];
+      groupTags.push(tag);
+      groups.set(groupName, groupTags);
+    }
+
+    return Array.from(groups.entries())
+      .sort(([first], [second]) => this.compareTagGroupNames(first, second))
+      .map(([label, groupTags]) => ({
+        label,
+        tags: groupTags.sort((first, second) =>
+          this.getTagLeaf(first).localeCompare(this.getTagLeaf(second)),
+        ),
+      }));
+  }
+
+  private getTagGroupName(tag: string): string {
+    const slashIndex = tag.indexOf("/");
+    return slashIndex > 0 ? tag.slice(0, slashIndex) : "other";
+  }
+
+  private getTagLeaf(tag: string): string {
+    const parts = tag.split("/").filter((part) => part.length > 0);
+    return parts[parts.length - 1] ?? tag;
+  }
+
+  private compareTagGroupNames(first: string, second: string): number {
+    const groupOrder = ["people", "repo", "feature", "kind", "meta"];
+    const firstIndex = groupOrder.indexOf(first);
+    const secondIndex = groupOrder.indexOf(second);
+    if (firstIndex !== -1 || secondIndex !== -1) {
+      if (firstIndex === -1) return 1;
+      if (secondIndex === -1) return -1;
+      return firstIndex - secondIndex;
+    }
+    return first.localeCompare(second);
   }
 
   private renderDescendantOutline(
@@ -1220,20 +1280,67 @@ export class CardManager {
       fm[groupByProp] = columnName;
       fm[ORDER_PROPERTY] = orderIndex;
       fm.id = this.getGeneratedTaskId(title);
-      fm.feature = "";
       fm.created = new Date().toISOString();
-      fm.people = [];
-      fm.pr = "";
-      fm.reviewers = [];
-      fm.blocked_reason = "";
       fm.tags = [DEFAULT_TASK_TAG];
     };
 
     try {
+      const existingPaths = new Set(
+        this.view.app.vault.getMarkdownFiles().map((file) => file.path),
+      );
       await this.view.createFileForView(title, overrides);
+      const createdFile = this.getCreatedMarkdownFile(title, existingPaths);
+      if (createdFile) {
+        await this.applyTaskPageTemplate(createdFile, title);
+      }
     } catch (err) {
       new Notice(`Failed to create card: ${String(err)}`);
     }
+  }
+
+  private getCreatedMarkdownFile(
+    title: string,
+    existingPaths: Set<string>,
+  ): TFile | null {
+    const createdFiles = this.view.app.vault
+      .getMarkdownFiles()
+      .filter((file) => !existingPaths.has(file.path));
+    if (createdFiles.length === 1) return createdFiles[0];
+
+    const expectedBasename = sanitizeFilename(title).trim();
+    return (
+      createdFiles.find((file) => file.basename === expectedBasename) ??
+      createdFiles.sort((first, second) => second.stat.ctime - first.stat.ctime)[0] ??
+      null
+    );
+  }
+
+  private async applyTaskPageTemplate(file: TFile, title: string): Promise<void> {
+    await this.view.app.vault.process(file, (content) => {
+      const frontmatterMatch = content.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+      if (!frontmatterMatch) return content;
+
+      const frontmatterBlock = frontmatterMatch[0].replace(/\s*$/, "\n");
+      const body = content.slice(frontmatterMatch[0].length).trim();
+      if (body && body !== `# ${title}`) return content;
+
+      return `${frontmatterBlock}\n${this.getTaskPageBody(title)}`;
+    });
+  }
+
+  private getTaskPageBody(title: string): string {
+    return [
+      `# Task - ${title}`,
+      "",
+      "## Definition of done",
+      "",
+      "- [ ] ",
+      "",
+      "## Notes",
+      "",
+      "## Links",
+      "",
+    ].join("\n");
   }
 
   private getGeneratedTaskId(title: string): string {

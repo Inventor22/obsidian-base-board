@@ -27,6 +27,9 @@ import { getColumnColor } from "./status-colors";
 
 const ARCHIVE_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000;
 const PLANNED_COLUMN = "Planned";
+const ARCHIVE_DROP_COLUMN = "Archived";
+const ARCHIVE_TARGET_STATUS = "Completed";
+const ARCHIVED_PROPERTY = "archived";
 
 interface TransitionHistoryEntry {
   from: string | null;
@@ -345,17 +348,21 @@ export class KanbanView extends BasesView implements HoverParent {
     const groupByProp = this.getGroupByProperty();
     if (!groupByProp) return null;
 
+    const frontmatter = this.getFrontmatter(file);
+    const explicitlyArchived = frontmatter?.[ARCHIVED_PROPERTY] === true;
     const completedAt = this.getCompletedStateEnteredAt(file, groupByProp);
-    if (!completedAt) return null;
+    if (!completedAt && !explicitlyArchived) return null;
 
-    const archiveAt = completedAt.getTime() + ARCHIVE_GRACE_PERIOD_MS;
-    if (Date.now() < archiveAt) return null;
+    if (!explicitlyArchived && completedAt) {
+      const archiveAt = completedAt.getTime() + ARCHIVE_GRACE_PERIOD_MS;
+      if (Date.now() < archiveAt) return null;
+    }
 
     return {
       file,
       title: this.cardManager.getCardTitle(entry),
       status: columnName,
-      completedAt,
+      completedAt: completedAt ?? new Date(file.stat.mtime),
       columnColor: getColumnColor(this.config, columnName),
     };
   }
@@ -629,9 +636,9 @@ export class KanbanView extends BasesView implements HoverParent {
     this.currentGroups = groupedData;
     const columns = this.getColumns();
 
-    this.tags.renderFilterBar(this.containerEl);
-
     const boardEl = this.containerEl.createDiv({ cls: "base-board-board" });
+
+    this.tags.renderFilterBar(this.containerEl);
 
     // Only animate cards on the very first render
     if (this.isFirstRender) {
@@ -650,10 +657,15 @@ export class KanbanView extends BasesView implements HoverParent {
       shelvesEl,
       this.getPlannedEntries(),
     );
-    this.renderArchiveSection(shelvesEl, this.getArchivedEntries());
+    const archiveShelfEl = this.renderArchiveSection(
+      shelvesEl,
+      this.getArchivedEntries(),
+    );
     this.dragDropManager.initBoard(
       boardEl,
-      plannedShelfEl ? [plannedShelfEl] : [],
+      [plannedShelfEl, archiveShelfEl].filter(
+        (shelfEl): shelfEl is HTMLElement => shelfEl !== null,
+      ),
     );
 
     // Restore scroll positions after the browser has laid out the new DOM
@@ -684,6 +696,7 @@ export class KanbanView extends BasesView implements HoverParent {
     const plannedEl = parentEl.createDiv({
       cls: "base-board-archive base-board-planned-shelf",
     });
+    plannedEl.dataset.columnName = PLANNED_COLUMN;
     if (this.isPlannedExpanded) {
       plannedEl.addClass("base-board-archive--expanded");
     }
@@ -782,8 +795,9 @@ export class KanbanView extends BasesView implements HoverParent {
   private renderArchiveSection(
     parentEl: HTMLElement,
     archivedEntries: ArchivedEntry[],
-  ): void {
+  ): HTMLElement | null {
     const archiveEl = parentEl.createDiv({ cls: "base-board-archive" });
+    archiveEl.dataset.columnName = ARCHIVE_DROP_COLUMN;
     if (this.isArchiveExpanded) {
       archiveEl.addClass("base-board-archive--expanded");
     }
@@ -820,14 +834,16 @@ export class KanbanView extends BasesView implements HoverParent {
       this.render();
     });
 
-    if (!this.isArchiveExpanded || archivedEntries.length === 0) return;
+    if (!this.isArchiveExpanded || archivedEntries.length === 0) return archiveEl;
 
     const listEl = archiveEl.createDiv({ cls: "base-board-archive-list" });
     archivedEntries.forEach((archivedEntry) => {
       const rowEl = listEl.createEl("button", {
-        cls: "base-board-archive-row",
-        attr: { type: "button" },
+        cls: "base-board-card base-board-archive-row",
+        attr: { type: "button", draggable: "true" },
       });
+      rowEl.dataset.filePath = archivedEntry.file.path;
+      rowEl.dataset.columnName = archivedEntry.status;
       rowEl.style.setProperty(
         "--archive-status-color",
         archivedEntry.columnColor,
@@ -855,6 +871,8 @@ export class KanbanView extends BasesView implements HoverParent {
         this.cardManager.openCardFile(archivedEntry.file, event);
       });
     });
+
+    return archiveEl;
   }
 
   private formatArchiveDate(date: Date): string {
@@ -902,6 +920,8 @@ export class KanbanView extends BasesView implements HoverParent {
   ): Promise<void> {
     const groupByProp = this.getGroupByProperty();
     if (!groupByProp) return;
+    const isArchiveDrop = targetColumnName === ARCHIVE_DROP_COLUMN;
+    const targetStatus = isArchiveDrop ? ARCHIVE_TARGET_STATUS : targetColumnName;
 
     // Snapshot the selection NOW, before any async work or re-render can clear it
     const selectedSnapshot = new Set(this.selectedCards);
@@ -935,20 +955,26 @@ export class KanbanView extends BasesView implements HoverParent {
         const file = this.app.vault.getAbstractFileByPath(fp);
         if (!file || !(file instanceof TFile)) return Promise.resolve();
         const sourceColumn = this.getCardSourceColumn(fp);
-        if (sourceColumn === targetColumnName) return Promise.resolve();
         return this.app.fileManager.processFrontMatter(
           file,
           (fm: Record<string, unknown>) => {
-            this.appendTransitionHistory(
-              fm,
-              groupByProp,
-              sourceColumn,
-              targetColumnName,
-            );
-            if (targetColumnName === NO_VALUE_COLUMN) {
+            if (sourceColumn !== targetStatus) {
+              this.appendTransitionHistory(
+                fm,
+                groupByProp,
+                sourceColumn,
+                targetStatus,
+              );
+            }
+            if (targetStatus === NO_VALUE_COLUMN) {
               delete fm[groupByProp];
             } else {
-              fm[groupByProp] = targetColumnName;
+              fm[groupByProp] = targetStatus;
+            }
+            if (isArchiveDrop) {
+              fm[ARCHIVED_PROPERTY] = true;
+            } else {
+              delete fm[ARCHIVED_PROPERTY];
             }
           },
         );

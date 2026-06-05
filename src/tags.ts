@@ -7,6 +7,7 @@ import { relativeLuminance } from "./color-utils";
 export class Tags {
   private view: KanbanView;
   public activeFilters: Set<string> = new Set();
+  private readonly filterGroupOrder = ["people", "repo", "feature", "kind", "meta"];
 
   constructor(view: KanbanView) {
     this.view = view;
@@ -129,41 +130,17 @@ export class Tags {
       if (!allTags.has(activeTag)) tagsArray.push(activeTag);
     }
 
-    for (const tag of tagsArray) {
-      const pill = barEl.createSpan({ cls: "base-board-filter-pill" });
-      pill.textContent = tag;
-
-      const tagColor = this.getColorForTag(tag);
-      if (tagColor) {
-        pill.style.setProperty("--tag-color", tagColor);
-        if (relativeLuminance(tagColor) === "dark") {
-          pill.addClass("base-board-filter-pill-light");
-        } else {
-          pill.addClass("base-board-filter-pill-dark");
-        }
-      }
-
-      if (this.activeFilters.has(tag)) {
-        pill.addClass("is-active");
-      }
-
-      setTooltip(pill, "Click to filter · Right-click to change color");
-
-      pill.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
-        new ColorPickerModal(this.view.app, tag, tagColor, (color) =>
-          this.setColor(tag, color),
-        ).open();
+    for (const group of this.getTagGroups(tagsArray)) {
+      const groupEl = barEl.createDiv({ cls: "base-board-filter-group" });
+      groupEl.createDiv({
+        cls: "base-board-filter-group-title",
+        text: group.label,
       });
+      const groupTagsEl = groupEl.createDiv({ cls: "base-board-filter-group-tags" });
 
-      pill.addEventListener("click", () => {
-        if (this.activeFilters.has(tag)) {
-          this.activeFilters.delete(tag);
-        } else {
-          this.activeFilters.add(tag);
-        }
-        this.view.scheduleRender();
-      });
+      for (const tag of group.tags) {
+        this.renderFilterPill(groupTagsEl, tag);
+      }
     }
 
     if (this.activeFilters.size > 0) {
@@ -176,6 +153,83 @@ export class Tags {
         this.view.scheduleRender();
       });
     }
+  }
+
+  private renderFilterPill(parentEl: HTMLElement, tag: string): void {
+    const pill = parentEl.createSpan({ cls: "base-board-filter-pill" });
+    pill.textContent = this.getTagLeaf(tag);
+
+    const tagColor = this.getColorForTag(tag);
+    if (tagColor) {
+      pill.style.setProperty("--tag-color", tagColor);
+      if (relativeLuminance(tagColor) === "dark") {
+        pill.addClass("base-board-filter-pill-light");
+      } else {
+        pill.addClass("base-board-filter-pill-dark");
+      }
+    }
+
+    if (this.activeFilters.has(tag)) {
+      pill.addClass("is-active");
+    }
+
+    setTooltip(pill, `${tag}\nClick to filter · Right-click to change color`);
+
+    pill.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      new ColorPickerModal(this.view.app, tag, tagColor, (color) =>
+        this.setColor(tag, color),
+      ).open();
+    });
+
+    pill.addEventListener("click", () => {
+      if (this.activeFilters.has(tag)) {
+        this.activeFilters.delete(tag);
+      } else {
+        this.activeFilters.add(tag);
+      }
+      this.view.scheduleRender();
+    });
+  }
+
+  private getTagGroups(tags: string[]): Array<{ label: string; tags: string[] }> {
+    const groups = new Map<string, string[]>();
+    for (const tag of tags) {
+      const groupName = this.getTagGroupName(tag);
+      const groupTags = groups.get(groupName) ?? [];
+      groupTags.push(tag);
+      groups.set(groupName, groupTags);
+    }
+
+    return Array.from(groups.entries())
+      .sort(([first], [second]) => this.compareTagGroupNames(first, second))
+      .map(([label, groupTags]) => ({
+        label,
+        tags: groupTags.sort((first, second) =>
+          this.getTagLeaf(first).localeCompare(this.getTagLeaf(second)),
+        ),
+      }));
+  }
+
+  private getTagGroupName(tag: string): string {
+    const slashIndex = tag.indexOf("/");
+    return slashIndex > 0 ? tag.slice(0, slashIndex) : "other";
+  }
+
+  private getTagLeaf(tag: string): string {
+    const parts = tag.split("/").filter((part) => part.length > 0);
+    return parts[parts.length - 1] ?? tag;
+  }
+
+  private compareTagGroupNames(first: string, second: string): number {
+    const firstIndex = this.filterGroupOrder.indexOf(first);
+    const secondIndex = this.filterGroupOrder.indexOf(second);
+    if (firstIndex !== -1 || secondIndex !== -1) {
+      if (firstIndex === -1) return 1;
+      if (secondIndex === -1) return -1;
+      return firstIndex - secondIndex;
+    }
+    return first.localeCompare(second);
   }
 }
 

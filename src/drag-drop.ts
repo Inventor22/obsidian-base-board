@@ -68,7 +68,9 @@ export class DragDropManager {
     boardEl.addEventListener("drop", this.boundHandlers.drop);
     for (const rootEl of this.extraCardDragRoots) {
       rootEl.addEventListener("dragstart", this.boundHandlers.dragStart);
+      rootEl.addEventListener("dragover", this.boundHandlers.dragOver);
       rootEl.addEventListener("dragend", this.boundHandlers.dragEnd);
+      rootEl.addEventListener("drop", this.boundHandlers.drop);
     }
   }
 
@@ -84,7 +86,9 @@ export class DragDropManager {
     this.boardEl.removeEventListener("drop", this.boundHandlers.drop);
     for (const rootEl of this.extraCardDragRoots) {
       rootEl.removeEventListener("dragstart", this.boundHandlers.dragStart);
+      rootEl.removeEventListener("dragover", this.boundHandlers.dragOver);
       rootEl.removeEventListener("dragend", this.boundHandlers.dragEnd);
+      rootEl.removeEventListener("drop", this.boundHandlers.drop);
     }
     this.extraCardDragRoots = [];
     this.removePlaceholder();
@@ -309,7 +313,7 @@ export class DragDropManager {
   private handleCardDragOver(e: DragEvent): void {
     // Find the cards container we're hovering over
     const closestCardsContainer = (e.target as HTMLElement).closest(
-      ".base-board-cards",
+      ".base-board-cards, .base-board-planned-list, .base-board-archive-list",
     );
     let cardsContainer =
       closestCardsContainer instanceof HTMLElement
@@ -330,6 +334,9 @@ export class DragDropManager {
     const hoveredColumn = cardsContainer?.closest(
       ".base-board-column",
     ) as HTMLElement | null;
+    const hoveredShelf = (e.target as HTMLElement).closest(
+      ".base-board-archive",
+    ) as HTMLElement | null;
 
     if (this.boardEl) {
       const allColumns = this.boardEl.querySelectorAll(".base-board-column");
@@ -341,9 +348,12 @@ export class DragDropManager {
         }
       });
     }
+    for (const rootEl of this.extraCardDragRoots) {
+      rootEl.toggleClass("base-board-shelf--drag-over", rootEl === hoveredShelf);
+    }
 
     if (!cardsContainer) {
-      this.removePlaceholder();
+      if (!hoveredShelf) this.removePlaceholder();
       return;
     }
 
@@ -508,6 +518,9 @@ export class DragDropManager {
         .querySelectorAll(".base-board-column--drag-over")
         .forEach((col) => col.classList.remove("base-board-column--drag-over"));
     }
+    for (const rootEl of this.extraCardDragRoots) {
+      rootEl.removeClass("base-board-shelf--drag-over");
+    }
     this.dragType = null;
   }
 
@@ -561,13 +574,17 @@ export class DragDropManager {
     const filePath = e.dataTransfer?.getData(CARD_MIME);
     if (!filePath) return false;
 
-    const columnEl = (e.target as HTMLElement).closest(".base-board-column");
-    if (!(columnEl instanceof HTMLElement)) return false;
+    const dropTargetEl = (e.target as HTMLElement).closest(
+      ".base-board-column, .base-board-archive",
+    );
+    if (!(dropTargetEl instanceof HTMLElement)) return false;
 
-    const targetColumnName = columnEl.dataset.columnName;
+    const targetColumnName = dropTargetEl.dataset.columnName;
     if (!targetColumnName) return false;
 
-    const cardsContainer = columnEl.querySelector(".base-board-cards");
+    const cardsContainer = dropTargetEl.querySelector(
+      ".base-board-cards, .base-board-planned-list, .base-board-archive-list",
+    );
 
     // Build ordered file paths from DOM
     const orderedPaths: string[] = [];

@@ -46,6 +46,12 @@ interface CardDetailModalOptions {
   historyIndex?: number;
 }
 
+interface CardModalSnapshot {
+  history: TFile[];
+  historyIndex: number;
+  view: CardDetailView | undefined;
+}
+
 const STATUS_PROPERTY = "status";
 const STATUS_HISTORY_PROPERTY = "status_history";
 const COMPLETED_SEGMENT_TAIL_MIN_MS = 12 * 60 * 60 * 1000;
@@ -53,7 +59,26 @@ const COMPLETED_SEGMENT_TAIL_MAX_MS = 3 * 24 * 60 * 60 * 1000;
 const COMPLETED_SEGMENT_TAIL_RATIO = 0.1;
 
 export class CardDetailModal extends Modal {
-  private static pendingForwardReopenCleanup: (() => void) | null = null;
+  private static modalStack: CardDetailModal[] = [];
+  private static forwardStack: CardModalSnapshot[] = [];
+  private static forwardStackExpireTimer: number | null = null;
+  private static stackMouseNavigationHandler: ((event: MouseEvent) => void) | null =
+    null;
+  private static stackMouseNavigationTargets: Array<Document | Window> = [];
+  private static stackLastMouseNavigationAt = 0;
+  private static stackLastMouseNavigationButton: number | null = null;
+  private static stackMouseNavigationEvents: Array<
+    "pointerdown" | "pointerup" | "mousedown" | "mouseup" | "auxclick"
+  > = ["pointerdown", "pointerup", "mousedown", "mouseup", "auxclick"];
+  private static recentModalInteraction:
+    | { modal: CardDetailModal; at: number }
+    | null = null;
+  private static patchedWorkspace:
+    | {
+        app: App;
+        openLinkText: App["workspace"]["openLinkText"];
+      }
+    | null = null;
 
   private file: TFile;
   private view: CardDetailView | undefined;
@@ -65,19 +90,14 @@ export class CardDetailModal extends Modal {
   private historyIndex = 0;
   private modalBackButtonEl: HTMLElement | null = null;
   private modalForwardButtonEl: HTMLElement | null = null;
-  private mouseNavigationHandler: ((event: MouseEvent) => void) | null = null;
-  private mouseNavigationTargets: Array<Document | Window> = [];
-  private lastMouseNavigationAt = 0;
-  private lastMouseNavigationButton: number | null = null;
-  private mouseNavigationEvents: Array<
-    "pointerdown" | "pointerup" | "mousedown" | "mouseup" | "auxclick"
-  > = [
-    "pointerdown",
-    "pointerup",
-    "mousedown",
-    "mouseup",
-    "auxclick",
-  ];
+  private internalLinkNavigationHandler: ((event: MouseEvent) => void) | null =
+    null;
+  private internalLinkNavigationEvents: Array<
+    "pointerdown" | "pointerup" | "mousedown" | "mouseup" | "click"
+  > = ["pointerdown", "pointerup", "mousedown", "mouseup", "click"];
+  private internalLinkNavigationTargets: Array<Document | HTMLElement> = [];
+  private lastInternalLinkNavigationAt = 0;
+  private lastInternalLinkNavigationPath: string | null = null;
 
   constructor(
     app: App,
@@ -101,6 +121,7 @@ export class CardDetailModal extends Modal {
     );
     this.file = this.history[this.historyIndex];
     this.modalEl.addClass("base-board-card-modal");
+    CardDetailModal.registerActiveModal(this);
 
     // Remove the native modal title because the Rogue Leaf has its own inline title
     this.titleEl.empty();
@@ -197,7 +218,7 @@ export class CardDetailModal extends Modal {
     // Add a class so CSS can control it rather than hardcoding static styles
     this.leaf.view.containerEl.addClass("base-board-rogue-leaf-container");
     this.scheduleModalNavigationControlUpdate();
-    this.registerMouseNavigationControls();
+    this.registerInternalLinkNavigation();
   }
 
   private renderDescendantOutline(containerEl: HTMLElement): void {
@@ -360,38 +381,143 @@ export class CardDetailModal extends Modal {
     this.scheduleModalNavigationControlUpdate();
   }
 
-  private registerMouseNavigationControls(): void {
-    this.mouseNavigationHandler = (event: MouseEvent) => {
-      if (event.button !== 3 && event.button !== 4) return;
+  private registerInternalLinkNavigation(): void {
+    this.internalLinkNavigationHandler = (event: MouseEvent) => {
+      if (this.isEventInsideModal(event)) {
+        CardDetailModal.rememberModalInteraction(this);
+      }
+
+      const linkedFile = this.getInternalLinkTarget(event);
+      if (!linkedFile) return;
 
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
-      if (!this.shouldActivateMouseNavigation(event)) return;
-
-      if (event.button === 3) {
-        this.goBack({ deferClose: true });
-        return;
-      }
-
-      this.goForward();
+      if (this.isDuplicateInternalLinkNavigation(linkedFile)) return;
+      this.openLinkedFileInNewModal(linkedFile);
     };
-    this.mouseNavigationTargets = [
-      activeDocument.defaultView ?? window,
-      activeDocument,
-    ];
-    for (const eventName of this.mouseNavigationEvents) {
-      for (const target of this.mouseNavigationTargets) {
+    this.internalLinkNavigationTargets = [activeDocument, this.modalEl];
+    for (const eventName of this.internalLinkNavigationEvents) {
+      for (const target of this.internalLinkNavigationTargets) {
         target.addEventListener(
           eventName,
-          this.mouseNavigationHandler as EventListener,
+          this.internalLinkNavigationHandler as EventListener,
           true,
         );
       }
     }
   }
 
-  private shouldActivateMouseNavigation(event: MouseEvent): boolean {
+  private isEventInsideModal(event: MouseEvent): boolean {
+    return event.composedPath().includes(this.modalEl);
+  }
+
+  private isDuplicateInternalLinkNavigation(file: TFile): boolean {
+    return (
+      this.lastInternalLinkNavigationPath === file.path &&
+      Date.now() - this.lastInternalLinkNavigationAt < 350
+    );
+  }
+
+  private openLinkedFileInNewModal(file: TFile): void {
+    if (this.isDuplicateInternalLinkNavigation(file)) return;
+
+    this.lastInternalLinkNavigationAt = Date.now();
+    this.lastInternalLinkNavigationPath = file.path;
+    CardDetailModal.clearForwardStack();
+    new CardDetailModal(this.app, file, this.view).open();
+  }
+
+  private static registerActiveModal(modal: CardDetailModal): void {
+    CardDetailModal.modalStack = CardDetailModal.modalStack.filter(
+      (activeModal) => activeModal !== modal,
+    );
+    CardDetailModal.modalStack.push(modal);
+    CardDetailModal.patchWorkspaceLinkOpening(modal.app);
+    CardDetailModal.ensureStackMouseNavigation(modal.app);
+  }
+
+  private static unregisterActiveModal(modal: CardDetailModal): void {
+    CardDetailModal.modalStack = CardDetailModal.modalStack.filter(
+      (activeModal) => activeModal !== modal,
+    );
+    if (CardDetailModal.recentModalInteraction?.modal === modal) {
+      CardDetailModal.recentModalInteraction = null;
+    }
+    CardDetailModal.releaseGlobalHandlersIfIdle();
+  }
+
+  private static rememberModalInteraction(modal: CardDetailModal): void {
+    CardDetailModal.recentModalInteraction = { modal, at: Date.now() };
+  }
+
+  private static ensureStackMouseNavigation(app: App): void {
+    if (CardDetailModal.stackMouseNavigationHandler) return;
+
+    CardDetailModal.stackMouseNavigationHandler = (event: MouseEvent) => {
+      CardDetailModal.handleStackMouseNavigation(app, event);
+    };
+    CardDetailModal.stackMouseNavigationTargets = [
+      activeDocument.defaultView ?? window,
+      activeDocument,
+    ];
+    for (const eventName of CardDetailModal.stackMouseNavigationEvents) {
+      for (const target of CardDetailModal.stackMouseNavigationTargets) {
+        target.addEventListener(
+          eventName,
+          CardDetailModal.stackMouseNavigationHandler as EventListener,
+          true,
+        );
+      }
+    }
+  }
+
+  private static removeStackMouseNavigation(): void {
+    if (!CardDetailModal.stackMouseNavigationHandler) return;
+
+    for (const eventName of CardDetailModal.stackMouseNavigationEvents) {
+      for (const target of CardDetailModal.stackMouseNavigationTargets) {
+        target.removeEventListener(
+          eventName,
+          CardDetailModal.stackMouseNavigationHandler as EventListener,
+          true,
+        );
+      }
+    }
+    CardDetailModal.stackMouseNavigationHandler = null;
+    CardDetailModal.stackMouseNavigationTargets = [];
+  }
+
+  private static handleStackMouseNavigation(app: App, event: MouseEvent): void {
+    if (event.button !== 3 && event.button !== 4) return;
+
+    const topModal = CardDetailModal.getTopActiveModal();
+    const canHandleBack = event.button === 3 && topModal !== null;
+    const canHandleForward =
+      event.button === 4 &&
+      ((topModal?.canGoForward() ?? false) ||
+        CardDetailModal.forwardStack.length > 0);
+    if (!canHandleBack && !canHandleForward) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    if (!CardDetailModal.shouldActivateStackMouseNavigation(event)) return;
+
+    if (event.button === 3) {
+      topModal?.goBack({ deferClose: true });
+      return;
+    }
+
+    if (topModal?.canGoForward()) {
+      topModal.goForward();
+      return;
+    }
+
+    CardDetailModal.reopenForwardSnapshot(app);
+  }
+
+  private static shouldActivateStackMouseNavigation(event: MouseEvent): boolean {
     if (
       event.type !== "pointerup" &&
       event.type !== "mouseup" &&
@@ -402,15 +528,212 @@ export class CardDetailModal extends Modal {
 
     const now = Date.now();
     if (
-      this.lastMouseNavigationButton === event.button &&
-      now - this.lastMouseNavigationAt < 250
+      CardDetailModal.stackLastMouseNavigationButton === event.button &&
+      now - CardDetailModal.stackLastMouseNavigationAt < 250
     ) {
       return false;
     }
 
-    this.lastMouseNavigationButton = event.button;
-    this.lastMouseNavigationAt = now;
+    CardDetailModal.stackLastMouseNavigationButton = event.button;
+    CardDetailModal.stackLastMouseNavigationAt = now;
     return true;
+  }
+
+  private static pushForwardSnapshot(snapshot: CardModalSnapshot): void {
+    const file = snapshot.history[snapshot.historyIndex];
+    if (!file) return;
+
+    CardDetailModal.forwardStack.push(snapshot);
+    CardDetailModal.resetForwardStackExpiry();
+  }
+
+  private static reopenForwardSnapshot(app: App): void {
+    const snapshot = CardDetailModal.forwardStack.pop();
+    if (!snapshot) {
+      CardDetailModal.clearForwardStack();
+      return;
+    }
+
+    const file = snapshot.history[snapshot.historyIndex];
+    if (!file) {
+      CardDetailModal.clearForwardStack();
+      return;
+    }
+
+    new CardDetailModal(app, file, snapshot.view, {
+      history: snapshot.history,
+      historyIndex: snapshot.historyIndex,
+    }).open();
+
+    if (CardDetailModal.forwardStack.length === 0) {
+      window.setTimeout(() => {
+        if (CardDetailModal.forwardStack.length === 0) {
+          CardDetailModal.clearForwardStack();
+        }
+      }, 50);
+    } else {
+      CardDetailModal.resetForwardStackExpiry();
+    }
+  }
+
+  private static resetForwardStackExpiry(): void {
+    if (CardDetailModal.forwardStackExpireTimer !== null) {
+      window.clearTimeout(CardDetailModal.forwardStackExpireTimer);
+    }
+    CardDetailModal.forwardStackExpireTimer = window.setTimeout(() => {
+      CardDetailModal.clearForwardStack();
+    }, 30000);
+  }
+
+  private static clearForwardStack(): void {
+    CardDetailModal.forwardStack = [];
+    if (CardDetailModal.forwardStackExpireTimer !== null) {
+      window.clearTimeout(CardDetailModal.forwardStackExpireTimer);
+      CardDetailModal.forwardStackExpireTimer = null;
+    }
+    CardDetailModal.releaseGlobalHandlersIfIdle();
+  }
+
+  private static releaseGlobalHandlersIfIdle(): void {
+    if (
+      CardDetailModal.modalStack.length > 0 ||
+      CardDetailModal.forwardStack.length > 0
+    ) {
+      return;
+    }
+
+    CardDetailModal.restoreWorkspaceLinkOpening();
+    CardDetailModal.removeStackMouseNavigation();
+  }
+
+  private static patchWorkspaceLinkOpening(app: App): void {
+    if (CardDetailModal.patchedWorkspace) return;
+
+    const originalOpenLinkText = app.workspace.openLinkText.bind(app.workspace);
+    CardDetailModal.patchedWorkspace = {
+      app,
+      openLinkText: originalOpenLinkText,
+    };
+
+    app.workspace.openLinkText = async (
+      linktext,
+      sourcePath,
+      newLeaf,
+      openViewState,
+    ) => {
+      const modal =
+        CardDetailModal.getModalForSourcePath(sourcePath) ??
+        CardDetailModal.getRecentlyInteractedModal();
+      if (!modal) {
+        return originalOpenLinkText(
+          linktext,
+          sourcePath,
+          newLeaf,
+          openViewState,
+        );
+      }
+
+      const normalizedLinktext = modal.normalizeInternalLinktext(linktext);
+      if (!normalizedLinktext) return;
+
+      const linkedFile = app.metadataCache.getFirstLinkpathDest(
+        normalizedLinktext,
+        sourcePath,
+      );
+      if (!(linkedFile instanceof TFile)) return;
+
+      modal.openLinkedFileInNewModal(linkedFile);
+    };
+  }
+
+  private static restoreWorkspaceLinkOpening(): void {
+    const patchedWorkspace = CardDetailModal.patchedWorkspace;
+    if (!patchedWorkspace) return;
+
+    patchedWorkspace.app.workspace.openLinkText = patchedWorkspace.openLinkText;
+    CardDetailModal.patchedWorkspace = null;
+  }
+
+  private static getModalForSourcePath(sourcePath: string): CardDetailModal | null {
+    return (
+      [...CardDetailModal.modalStack]
+        .reverse()
+        .find((modal) => modal.file.path === sourcePath) ?? null
+    );
+  }
+
+  private static getTopActiveModal(): CardDetailModal | null {
+    return CardDetailModal.modalStack[CardDetailModal.modalStack.length - 1] ?? null;
+  }
+
+  private isTopActiveModal(): boolean {
+    return CardDetailModal.getTopActiveModal() === this;
+  }
+
+  private static getRecentlyInteractedModal(): CardDetailModal | null {
+    const recent = CardDetailModal.recentModalInteraction;
+    if (!recent) return null;
+    if (Date.now() - recent.at > 1000) return null;
+    return CardDetailModal.modalStack.includes(recent.modal) ? recent.modal : null;
+  }
+
+  private getInternalLinkTarget(event: MouseEvent): TFile | null {
+    const linkEl = this.getInternalLinkElement(event);
+    if (!linkEl) return null;
+
+    const rawLink =
+      linkEl.getAttr("data-href") ??
+      linkEl.getAttr("data-link-path") ??
+      linkEl.getAttr("href") ??
+      "";
+    const linktext = this.normalizeInternalLinktext(rawLink);
+    if (!linktext) return null;
+
+    const targetFile = this.app.metadataCache.getFirstLinkpathDest(
+      linktext,
+      this.file.path,
+    );
+    return targetFile instanceof TFile ? targetFile : null;
+  }
+
+  private getInternalLinkElement(event: MouseEvent): HTMLElement | null {
+    const selector =
+      "a.internal-link, .internal-link, .cm-hmd-internal-link, [data-href], [data-link-path]";
+    const path = event.composedPath();
+
+    for (const pathEntry of path) {
+      if (!(pathEntry instanceof HTMLElement)) continue;
+      const linkEl = pathEntry.matches(selector)
+        ? pathEntry
+        : pathEntry.closest<HTMLElement>(selector);
+      if (linkEl && this.modalEl.contains(linkEl)) return linkEl;
+    }
+
+    const targetEl = event.target;
+    if (!(targetEl instanceof HTMLElement)) return null;
+    const linkEl = targetEl.closest<HTMLElement>(selector);
+    return linkEl && this.modalEl.contains(linkEl) ? linkEl : null;
+  }
+
+  private normalizeInternalLinktext(rawLink: string): string | null {
+    const trimmed = rawLink.trim();
+    if (!trimmed) return null;
+    if (/^(?:https?|mailto):/i.test(trimmed)) return null;
+    if (trimmed.startsWith("#")) return null;
+
+    let linktext = trimmed;
+    const hashIndex = linktext.indexOf("#");
+    if (hashIndex >= 0) linktext = linktext.slice(0, hashIndex);
+    const queryIndex = linktext.indexOf("?");
+    if (queryIndex >= 0) linktext = linktext.slice(0, queryIndex);
+
+    try {
+      linktext = decodeURIComponent(linktext);
+    } catch {
+      // Keep the original link text if it is not URI-encoded.
+    }
+
+    return linktext.trim() || null;
   }
 
   private goBack(options?: { deferClose?: boolean }): void {
@@ -419,7 +742,7 @@ export class CardDetailModal extends Modal {
       return;
     }
 
-    this.registerForwardReopenAfterClose(this.history, this.historyIndex);
+    CardDetailModal.pushForwardSnapshot(this.getSnapshot());
     if (options?.deferClose) {
       window.setTimeout(() => this.close(), 0);
     } else {
@@ -428,87 +751,21 @@ export class CardDetailModal extends Modal {
   }
 
   private goForward(): void {
-    if (this.historyIndex < this.history.length - 1) {
+    if (this.canGoForward()) {
       void this.navigateHistory(1);
     }
   }
 
-  private registerForwardReopenAfterClose(
-    history: TFile[],
-    historyIndex: number,
-  ): void {
-    CardDetailModal.pendingForwardReopenCleanup?.();
+  private canGoForward(): boolean {
+    return this.historyIndex < this.history.length - 1;
+  }
 
-    const historySnapshot = [...history];
-    const historyIndexSnapshot = historyIndex;
-    const file = historySnapshot[historyIndexSnapshot];
-    if (!file) return;
-
-    const targets: Array<Document | Window> = [
-      activeDocument.defaultView ?? window,
-      activeDocument,
-    ];
-    const events: Array<
-      "pointerdown" | "pointerup" | "mousedown" | "mouseup" | "auxclick"
-    > = ["pointerdown", "pointerup", "mousedown", "mouseup", "auxclick"];
-
-    let activated = false;
-    let lastEventAt = 0;
-    let expireTimer: number | null = null;
-    let burstCleanupTimer: number | null = null;
-
-    const cleanup = () => {
-      for (const eventName of events) {
-        for (const target of targets) {
-          target.removeEventListener(eventName, handler as EventListener, true);
-        }
-      }
-      if (expireTimer !== null) window.clearTimeout(expireTimer);
-      if (burstCleanupTimer !== null) window.clearTimeout(burstCleanupTimer);
-      if (CardDetailModal.pendingForwardReopenCleanup === cleanup) {
-        CardDetailModal.pendingForwardReopenCleanup = null;
-      }
+  private getSnapshot(): CardModalSnapshot {
+    return {
+      history: [...this.history],
+      historyIndex: this.historyIndex,
+      view: this.view,
     };
-
-    const handler = (event: MouseEvent) => {
-      if (event.button !== 4) return;
-
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      if (activated) {
-        if (burstCleanupTimer !== null) window.clearTimeout(burstCleanupTimer);
-        burstCleanupTimer = window.setTimeout(cleanup, 50);
-        return;
-      }
-      if (
-        event.type !== "pointerup" &&
-        event.type !== "mouseup" &&
-        event.type !== "auxclick"
-      ) {
-        return;
-      }
-
-      const now = Date.now();
-      if (activated || now - lastEventAt < 250) return;
-
-      activated = true;
-      lastEventAt = now;
-      new CardDetailModal(this.app, file, this.view, {
-        history: historySnapshot,
-        historyIndex: historyIndexSnapshot,
-      }).open();
-      burstCleanupTimer = window.setTimeout(cleanup, 50);
-    };
-
-    for (const eventName of events) {
-      for (const target of targets) {
-        target.addEventListener(eventName, handler as EventListener, true);
-      }
-    }
-
-    expireTimer = window.setTimeout(cleanup, 30000);
-    CardDetailModal.pendingForwardReopenCleanup = cleanup;
   }
 
   private updateModalNavigationControls(): void {
@@ -826,18 +1083,19 @@ export class CardDetailModal extends Modal {
   }
 
   onClose() {
-    if (this.mouseNavigationHandler) {
-      for (const eventName of this.mouseNavigationEvents) {
-        for (const target of this.mouseNavigationTargets) {
+    CardDetailModal.unregisterActiveModal(this);
+    if (this.internalLinkNavigationHandler && this.leaf?.view?.containerEl) {
+      for (const eventName of this.internalLinkNavigationEvents) {
+        for (const target of this.internalLinkNavigationTargets) {
           target.removeEventListener(
             eventName,
-            this.mouseNavigationHandler as EventListener,
+            this.internalLinkNavigationHandler as EventListener,
             true,
           );
         }
       }
-      this.mouseNavigationHandler = null;
-      this.mouseNavigationTargets = [];
+      this.internalLinkNavigationHandler = null;
+      this.internalLinkNavigationTargets = [];
     }
     // Gracefully clean up the rogue leaf
     if (this.leaf) {
