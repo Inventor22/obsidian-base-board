@@ -1,6 +1,7 @@
 import {
   App,
   ButtonComponent,
+  EventRef,
   Modal,
   setIcon,
   setTooltip,
@@ -98,6 +99,7 @@ export class CardDetailModal extends Modal {
   private internalLinkNavigationTargets: Array<Document | HTMLElement> = [];
   private lastInternalLinkNavigationAt = 0;
   private lastInternalLinkNavigationPath: string | null = null;
+  private fileDeleteEventRef: EventRef | null = null;
 
   constructor(
     app: App,
@@ -122,6 +124,9 @@ export class CardDetailModal extends Modal {
     this.file = this.history[this.historyIndex];
     this.modalEl.addClass("base-board-card-modal");
     CardDetailModal.registerActiveModal(this);
+    this.fileDeleteEventRef = this.app.vault.on("delete", (deletedFile) => {
+      if (deletedFile.path === this.file.path) this.close();
+    });
 
     // Remove the native modal title because the Rogue Leaf has its own inline title
     this.titleEl.empty();
@@ -1084,6 +1089,10 @@ export class CardDetailModal extends Modal {
 
   onClose() {
     CardDetailModal.unregisterActiveModal(this);
+    if (this.fileDeleteEventRef) {
+      this.app.vault.offref(this.fileDeleteEventRef);
+      this.fileDeleteEventRef = null;
+    }
     if (this.internalLinkNavigationHandler && this.leaf?.view?.containerEl) {
       for (const eventName of this.internalLinkNavigationEvents) {
         for (const target of this.internalLinkNavigationTargets) {
