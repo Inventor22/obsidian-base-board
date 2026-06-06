@@ -36,7 +36,9 @@ export class ColumnManager {
     });
 
     const activeEntries = sorted.filter(
-      (entry) => !this.view.isArchivedEntry(entry, columnName),
+      (entry) =>
+        !this.view.isArchivedEntry(entry, columnName) &&
+        this.view.entryMatchesBoardProjection(entry),
     );
     const visibleCards =
       this.view.tags.activeFilters.size > 0

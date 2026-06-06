@@ -21,6 +21,7 @@ import {
   ORDER_PROPERTY,
   CONFIG_KEY_COLUMNS,
   CONFIG_KEY_OPEN_BEHAVIOR,
+  CONFIG_KEY_BOARD_PROJECTION,
   CONFIG_KEY_COLUMN_COLORS,
 } from "./constants";
 import { getColumnColor } from "./status-colors";
@@ -53,6 +54,17 @@ interface PlannedEntry {
   title: string;
   status: string;
   columnColor: string;
+}
+
+type BoardProjectionMode = "all" | "active-frontier";
+
+interface ProjectionEntry {
+  entry: BasesEntry;
+  file: TFile;
+  title: string;
+  columnName: string;
+  parentKey: string | null;
+  dependsOnKeys: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +101,7 @@ export class KanbanView extends BasesView implements HoverParent {
   /** Currently selected card file paths (for batch operations) */
   public selectedCards: Set<string> = new Set();
   public detailLeaf: WorkspaceLeaf | null = null;
+  private projectedOutCardPaths: Set<string> = new Set();
 
   constructor(
     controller: QueryController,
@@ -176,6 +189,16 @@ export class KanbanView extends BasesView implements HoverParent {
               tab: "New tab",
             },
           },
+          {
+            key: CONFIG_KEY_BOARD_PROJECTION,
+            type: "dropdown" as const,
+            displayName: "Show cards",
+            default: "all",
+            options: {
+              all: "All cards",
+              "active-frontier": "Active frontier",
+            },
+          },
         ],
       },
     ];
@@ -259,6 +282,11 @@ export class KanbanView extends BasesView implements HoverParent {
     return "modal";
   }
 
+  public getBoardProjectionMode(): BoardProjectionMode {
+    const val = this.config?.get(CONFIG_KEY_BOARD_PROJECTION);
+    return val === "active-frontier" ? "active-frontier" : "all";
+  }
+
   public isLeafAttached(leaf: WorkspaceLeaf): boolean {
     let found = false;
     this.app.workspace.iterateAllLeaves((l) => {
@@ -337,6 +365,16 @@ export class KanbanView extends BasesView implements HoverParent {
     );
   }
 
+  public entryMatchesBoardProjection(entry: BasesEntry): boolean {
+    const filePath = entry.file?.path;
+    if (!filePath) return true;
+    return !this.projectedOutCardPaths.has(filePath);
+  }
+
+  public isActionableFrontierStatus(status: string | null): boolean {
+    return !this.isCompletedStatus(status) && !this.isPlannedStatus(status);
+  }
+
   private getArchivedEntry(
     entry: BasesEntry,
     columnName: string,
@@ -375,6 +413,7 @@ export class KanbanView extends BasesView implements HoverParent {
       const columnName = this.getColumnName(group.key);
       for (const entry of group.entries) {
         if (!this.entryMatchesActiveTagFilters(entry)) continue;
+        if (!this.entryMatchesBoardProjection(entry)) continue;
         const archivedEntry = this.getArchivedEntry(entry, columnName);
         if (archivedEntry) archivedEntries.push(archivedEntry);
       }
@@ -397,6 +436,7 @@ export class KanbanView extends BasesView implements HoverParent {
 
       for (const entry of group.entries) {
         if (!this.entryMatchesActiveTagFilters(entry)) continue;
+        if (!this.entryMatchesBoardProjection(entry)) continue;
         const file = entry.file;
         if (!(file instanceof TFile)) continue;
         plannedEntries.push({
@@ -635,6 +675,7 @@ export class KanbanView extends BasesView implements HoverParent {
     }
 
     this.currentGroups = groupedData;
+    this.projectedOutCardPaths = this.getProjectedOutCardPaths(groupedData);
     const columns = this.getColumns();
 
     const boardEl = this.containerEl.createDiv({ cls: "base-board-board" });
@@ -928,6 +969,128 @@ export class KanbanView extends BasesView implements HoverParent {
         ? { month: "short", day: "numeric" }
         : { month: "short", day: "numeric", year: "numeric" };
     return date.toLocaleDateString(undefined, options);
+  }
+
+  private getProjectedOutCardPaths(groups: BasesEntryGroup[]): Set<string> {
+    if (this.getBoardProjectionMode() !== "active-frontier") return new Set();
+
+    const projectionEntries = this.getProjectionEntries(groups);
+    const entriesByIdentity = new Map<string, ProjectionEntry>();
+    for (const projectionEntry of projectionEntries) {
+      for (const identity of this.getProjectionEntryIdentities(
+        projectionEntry,
+      )) {
+        entriesByIdentity.set(identity, projectionEntry);
+      }
+    }
+
+    const hiddenParentPaths = new Set<string>();
+    const completedIdentities = this.getCompletedProjectionIdentities(
+      projectionEntries,
+    );
+    for (const projectionEntry of projectionEntries) {
+      if (!this.isActionableFrontierStatus(projectionEntry.columnName)) continue;
+      if (
+        this.isArchivedEntry(projectionEntry.entry, projectionEntry.columnName)
+      ) {
+        continue;
+      }
+      if (!this.entryMatchesActiveTagFilters(projectionEntry.entry)) continue;
+
+      const dependenciesSatisfied = projectionEntry.dependsOnKeys.every(
+        (dependencyKey) => completedIdentities.has(dependencyKey),
+      );
+      if (!dependenciesSatisfied) {
+        hiddenParentPaths.add(projectionEntry.file.path);
+        continue;
+      }
+
+      if (!projectionEntry.parentKey) continue;
+
+      const parent = entriesByIdentity.get(projectionEntry.parentKey);
+      if (!parent || parent.file.path === projectionEntry.file.path) continue;
+      hiddenParentPaths.add(parent.file.path);
+    }
+
+    return hiddenParentPaths;
+  }
+
+  private getProjectionEntries(groups: BasesEntryGroup[]): ProjectionEntry[] {
+    const projectionEntries: ProjectionEntry[] = [];
+    for (const group of groups) {
+      const columnName = this.getColumnName(group.key);
+      for (const entry of group.entries) {
+        const file = entry.file;
+        if (!(file instanceof TFile)) continue;
+        projectionEntries.push({
+          entry,
+          file,
+          title: this.cardManager.getCardTitle(entry),
+          columnName,
+          parentKey: this.getParentKey(file),
+          dependsOnKeys: this.getDependsOnKeys(file),
+        });
+      }
+    }
+    return projectionEntries;
+  }
+
+  private getCompletedProjectionIdentities(
+    entries: ProjectionEntry[],
+  ): Set<string> {
+    const completedIdentities = new Set<string>();
+    for (const entry of entries) {
+      if (!this.isCompletedStatus(entry.columnName)) continue;
+      for (const identity of this.getProjectionEntryIdentities(entry)) {
+        completedIdentities.add(identity);
+      }
+    }
+    return completedIdentities;
+  }
+
+  private getProjectionEntryIdentities(entry: ProjectionEntry): string[] {
+    return [
+      entry.file.path.replace(/\.md$/i, "").toLowerCase(),
+      entry.file.basename.toLowerCase(),
+      entry.title.toLowerCase(),
+    ];
+  }
+
+  private getParentKey(file: TFile): string | null {
+    const frontmatter = this.getFrontmatter(file);
+    const value =
+      frontmatter?.parent ??
+      frontmatter?.parent_task ??
+      frontmatter?.parentTask ??
+      frontmatter?.feature;
+    return this.normalizeReference(value);
+  }
+
+  private getDependsOnKeys(file: TFile): string[] {
+    const frontmatter = this.getFrontmatter(file);
+    const value = frontmatter?.depends_on ?? frontmatter?.dependsOn;
+    return this.normalizeReferences(value);
+  }
+
+  private normalizeReferences(value: unknown): string[] {
+    const rawValues = Array.isArray(value) ? (value as unknown[]) : [value];
+    return rawValues
+      .map((rawValue) => this.normalizeReference(rawValue))
+      .filter((reference): reference is string => reference !== null);
+  }
+
+  private normalizeReference(value: unknown): string | null {
+    const firstValue = Array.isArray(value) ? (value as unknown[])[0] : value;
+    if (typeof firstValue !== "string") return null;
+    let normalized = firstValue.trim();
+    if (!normalized) return null;
+
+    const linkMatch = normalized.match(/^\[\[([^|\]]+)(?:\|[^\]]+)?\]\]$/);
+    if (linkMatch) normalized = linkMatch[1];
+    normalized = normalized.replace(/\.md$/i, "");
+    const slashIndex = normalized.lastIndexOf("/");
+    if (slashIndex >= 0) normalized = normalized.slice(slashIndex + 1);
+    return normalized.toLowerCase();
   }
 
   // ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@
 - **One-Click Creation**: Add new notes directly to a specific column without leaving the board view.
 - **Transition History**: Optionally append timestamped frontmatter entries when cards move between columns.
 - **Timeline View**: Visualize task lifecycle history as zoomable swimlanes grouped by parent task.
+- **Graph View**: Explore the full work graph with requirement and gated-successor relationships.
 - **Data First**: All changes are written directly to your Markdown files.
 
 ## Usage
@@ -91,6 +92,29 @@ parentTask: parent-task-id
 If a task has children, the Timeline renders it as a parent lane and recursively indents descendants beneath it. Parent completion remains manual; the timeline only visualizes the recorded task movement history.
 
 Use a parent property for feature/subtask relationships instead of a tag. Tags are best for filtering and cross-cutting labels; `parent` is better for hierarchy because it points to one owning feature task. Child relationships are inferred from `parent`, so separate child tags are not needed.
+
+### Active Frontier Kanban
+
+Kanban views can switch **Show cards** from **All cards** to **Active frontier**. In active frontier mode, parent cards stay in the hierarchy but are hidden from the board while they have an unfinished actionable child card. When the child reaches a completed status, the parent card appears again. Planned children do not hide their parent, so future gated work can remain captured without displacing the current work item.
+
+Use this mode when a feature decomposes into nested work, such as a rollout that temporarily drops into a bug-fix task before returning to the parent flighting workstream. Parallel sibling branches remain visible independently.
+
+### Graph View
+
+Base Board also provides a `Graph` Bases view for seeing the whole structure of a feature or workstream. The graph renders two relationships from frontmatter:
+
+```yaml
+parent: [[Stage Flighting]]
+```
+
+```yaml
+depends_on:
+  - [[Enable using pfgold]]
+```
+
+`parent` creates a requirement relationship below the current node. `depends_on` creates a gated successor relationship to the right: the successor waits until its dependency is completed. The graph highlights active frontier nodes, muted completed nodes, waiting nodes, and blocked nodes using the same status colors as the Kanban board.
+
+Click a graph node to open its card detail modal. Click the bottom `+` on a node to create a child requirement. Click the right-side `+` to create a gated successor that depends on the current node. New graph nodes are Markdown notes with normal task frontmatter, so they immediately participate in Kanban, Timeline, and Graph views.
 
 ## Installation
 

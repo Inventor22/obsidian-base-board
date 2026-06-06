@@ -9,6 +9,7 @@ import {
 import { KanbanView } from "./kanban-view";
 import { TimelineView } from "./timeline-view";
 import { RolloutView } from "./rollout-view";
+import { GraphView } from "./graph-view";
 import { sanitizeFilename } from "./constants";
 import { CreateBoardModal, BoardConfig } from "./modals";
 
@@ -77,6 +78,14 @@ export default class BaseBoardPlugin extends Plugin {
         new RolloutView(controller, containerEl, this),
     });
 
+    this.registerBasesView("graph", {
+      name: "Graph",
+      icon: "lucide-git-fork",
+      factory: (controller: QueryController, containerEl: HTMLElement) =>
+        new GraphView(controller, containerEl, this),
+      options: () => GraphView.getViewOptions(),
+    });
+
     // -- Command: Create new board --------------------------------------------
     this.addCommand({
       id: "create-board",
@@ -129,6 +138,13 @@ export default class BaseBoardPlugin extends Plugin {
       `    order:`,
       `      - file.name`,
       `      - note.${groupBy}`,
+      `  - type: graph`,
+      `    name: Graph`,
+      `    groupBy:`,
+      `      property: note.${groupBy}`,
+      `      direction: DESC`,
+      `    order:`,
+      `      - file.name`,
       ``,
     ].join("\n");
 
