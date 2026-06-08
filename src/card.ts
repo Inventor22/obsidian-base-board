@@ -75,6 +75,12 @@ const HIERARCHY_PROPS = new Set([
   "parentTask",
   "feature",
 ]);
+const RELATION_LIST_PROPS = [
+  ["depends_on", "dependsOn"],
+  ["breaks_to", "breaksTo"],
+  ["restarts_to", "restartsTo"],
+  ["graph_hidden_returns"],
+] as const;
 const HIERARCHY_COLOR_PROPS = new Set([
   "project_color",
   "projectColor",
@@ -234,9 +240,7 @@ export class CardManager {
     });
     const file = this.view.app.vault.getAbstractFileByPath(filePath);
     const hierarchyInfo =
-      file instanceof TFile
-        ? this.getCardHierarchyInfo(file.path)
-        : null;
+      file instanceof TFile ? this.getCardHierarchyInfo(file.path) : null;
     if (hierarchyInfo && hierarchyInfo.directChildPaths.length > 0) {
       cardEl.addClass("base-board-card--parent");
     }
@@ -386,14 +390,18 @@ export class CardManager {
 
   private renderCardTags(containerEl: HTMLElement, tags: string[]): void {
     for (const group of this.getTagGroups(tags)) {
-      const groupEl = containerEl.createSpan({ cls: "base-board-card-tag-group" });
+      const groupEl = containerEl.createSpan({
+        cls: "base-board-card-tag-group",
+      });
       if (group.label !== "other") {
         groupEl.createSpan({
           cls: "base-board-card-tag-group-label",
           text: group.label,
         });
       }
-      const valuesEl = groupEl.createSpan({ cls: "base-board-card-tag-values" });
+      const valuesEl = groupEl.createSpan({
+        cls: "base-board-card-tag-values",
+      });
       for (const tag of group.tags) {
         this.renderCardTag(valuesEl, tag);
       }
@@ -417,7 +425,9 @@ export class CardManager {
     }
   }
 
-  private getTagGroups(tags: string[]): Array<{ label: string; tags: string[] }> {
+  private getTagGroups(
+    tags: string[],
+  ): Array<{ label: string; tags: string[] }> {
     const groups = new Map<string, string[]>();
     for (const tag of tags) {
       const groupName = this.getTagGroupName(tag);
@@ -600,7 +610,9 @@ export class CardManager {
       overflowRows.forEach((rowEl) => {
         rowEl.toggleClass("base-board-card-outline-row--hidden", !expanded);
       });
-      overflowToggleEl.setText(expanded ? "show less" : `+${overflowRows.length} more`);
+      overflowToggleEl.setText(
+        expanded ? "show less" : `+${overflowRows.length} more`,
+      );
     });
   }
 
@@ -655,7 +667,10 @@ export class CardManager {
 
     const openBehavior = this.view.getCardOpenBehavior();
     if (openBehavior === "split") {
-      if (this.view.detailLeaf && this.view.isLeafAttached(this.view.detailLeaf)) {
+      if (
+        this.view.detailLeaf &&
+        this.view.isLeafAttached(this.view.detailLeaf)
+      ) {
         void this.view.detailLeaf.openFile(file);
       } else {
         this.view.detailLeaf = this.view.app.workspace.getLeaf(
@@ -744,10 +759,7 @@ export class CardManager {
     );
     const descendants = this.getDescendantEntries(outlineNodes);
 
-    const parentTitles = this.getParentTitles(
-      current,
-      entriesByIdentity,
-    );
+    const parentTitles = this.getParentTitles(current, entriesByIdentity);
     const hierarchyRoot = this.getHierarchyRoot(current, entriesByIdentity);
     const participatesInHierarchy =
       parentTitles.length > 0 || directChildPaths.length > 0;
@@ -1035,9 +1047,8 @@ export class CardManager {
   }
 
   private getFrontmatter(file: TFile): Record<string, unknown> | undefined {
-    const frontmatter = this.view.app.metadataCache.getFileCache(
-      file,
-    )?.frontmatter;
+    const frontmatter =
+      this.view.app.metadataCache.getFileCache(file)?.frontmatter;
     return frontmatter && typeof frontmatter === "object"
       ? frontmatter
       : undefined;
@@ -1153,13 +1164,170 @@ export class CardManager {
         .setTitle("Delete")
         .setIcon("lucide-trash-2")
         .onClick(async () => {
-          await this.view.app.fileManager.trashFile(file);
-          new Notice(`Moved "${file.basename}" to trash`);
+          const cleanedReferences =
+            await this.deleteCardAndCleanupReferences(file);
+          new Notice(
+            cleanedReferences > 0
+              ? `Moved "${file.basename}" to trash and cleaned ${cleanedReferences} reference${cleanedReferences === 1 ? "" : "s"}`
+              : `Moved "${file.basename}" to trash`,
+          );
         });
     });
 
     const rect = anchorEl.getBoundingClientRect();
     menu.showAtPosition({ x: rect.right, y: rect.bottom });
+  }
+
+  private async deleteCardAndCleanupReferences(file: TFile): Promise<number> {
+    let cleanedReferences = 0;
+    await this.view.applyBatchUpdate(async () => {
+      cleanedReferences = await this.cleanupReferencesToDeletedCard(file);
+      await this.view.app.fileManager.trashFile(file);
+    });
+    this.view.scheduleRender();
+    return cleanedReferences;
+  }
+
+  private async cleanupReferencesToDeletedCard(file: TFile): Promise<number> {
+    const deletedIdentities = this.getDeletedCardIdentities(file);
+    const entries = this.view
+      .getCurrentEntries()
+      .filter((entry) => entry.file instanceof TFile)
+      .filter((entry) => entry.file.path !== file.path)
+      .filter((entry) =>
+        this.frontmatterReferencesDeletedCard(
+          this.getFrontmatter(entry.file as TFile),
+          deletedIdentities,
+        ),
+      );
+    let cleanedReferences = 0;
+
+    await Promise.all(
+      entries.map((entry) =>
+        this.view.app.fileManager.processFrontMatter(
+          entry.file as TFile,
+          (frontmatter: Record<string, unknown>) => {
+            const result = this.removeReferencesFromFrontmatter(
+              frontmatter,
+              deletedIdentities,
+            );
+            cleanedReferences += result.removedCount;
+          },
+        ),
+      ),
+    );
+
+    return cleanedReferences;
+  }
+
+  private frontmatterReferencesDeletedCard(
+    frontmatter: Record<string, unknown> | undefined,
+    deletedIdentities: Set<string>,
+  ): boolean {
+    if (!frontmatter) return false;
+    for (const propertyName of HIERARCHY_PROPS) {
+      if (
+        this.referenceValueMatches(frontmatter[propertyName], deletedIdentities)
+      ) {
+        return true;
+      }
+    }
+    for (const propertyNames of RELATION_LIST_PROPS) {
+      for (const propertyName of propertyNames) {
+        const values = Array.isArray(frontmatter[propertyName])
+          ? (frontmatter[propertyName] as unknown[])
+          : [frontmatter[propertyName]];
+        if (
+          values.some((value) =>
+            this.referenceValueMatches(value, deletedIdentities),
+          )
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private removeReferencesFromFrontmatter(
+    frontmatter: Record<string, unknown>,
+    deletedIdentities: Set<string>,
+  ): { removedCount: number } {
+    let removedCount = 0;
+
+    for (const propertyName of HIERARCHY_PROPS) {
+      if (!(propertyName in frontmatter)) continue;
+      const value = frontmatter[propertyName];
+      if (this.referenceValueMatches(value, deletedIdentities)) {
+        delete frontmatter[propertyName];
+        removedCount++;
+      }
+    }
+
+    for (const propertyNames of RELATION_LIST_PROPS) {
+      for (const propertyName of propertyNames) {
+        if (!(propertyName in frontmatter)) continue;
+        const cleanup = this.removeReferenceListMatches(
+          frontmatter[propertyName],
+          deletedIdentities,
+        );
+        if (cleanup.removedCount === 0) continue;
+        removedCount += cleanup.removedCount;
+        if (cleanup.values.length === 0) {
+          delete frontmatter[propertyName];
+        } else {
+          frontmatter[propertyName] = cleanup.wasArray
+            ? cleanup.values
+            : cleanup.values[0];
+        }
+      }
+    }
+
+    return { removedCount };
+  }
+
+  private removeReferenceListMatches(
+    value: unknown,
+    deletedIdentities: Set<string>,
+  ): { values: unknown[]; removedCount: number; wasArray: boolean } {
+    const wasArray = Array.isArray(value);
+    const values = wasArray ? (value as unknown[]) : [value];
+    const keptValues: unknown[] = [];
+    let removedCount = 0;
+
+    for (const item of values) {
+      if (this.referenceValueMatches(item, deletedIdentities)) {
+        removedCount++;
+      } else if (item !== undefined && item !== null) {
+        keptValues.push(item);
+      }
+    }
+
+    return { values: keptValues, removedCount, wasArray };
+  }
+
+  private referenceValueMatches(
+    value: unknown,
+    deletedIdentities: Set<string>,
+  ): boolean {
+    const normalized = this.normalizeReference(value);
+    return normalized !== null && deletedIdentities.has(normalized);
+  }
+
+  private getDeletedCardIdentities(file: TFile): Set<string> {
+    const frontmatter = this.getFrontmatter(file);
+    const identities = new Set<string>([
+      file.path.replace(/\.md$/i, "").toLowerCase(),
+      file.basename.toLowerCase(),
+    ]);
+
+    for (const value of [frontmatter?.title, frontmatter?.id]) {
+      if (typeof value === "string" && value.trim().length > 0) {
+        identities.add(value.trim().toLowerCase());
+      }
+    }
+
+    return identities;
   }
 
   private startCardRename(titleEl: HTMLElement, file: TFile): void {
@@ -1222,7 +1390,9 @@ export class CardManager {
     const shelfEl = btnEl.closest(".base-board-archive");
     const cardsEl =
       (columnEl?.querySelector(".base-board-cards") as HTMLElement | null) ??
-      (shelfEl?.querySelector(".base-board-planned-list") as HTMLElement | null) ??
+      (shelfEl?.querySelector(
+        ".base-board-planned-list",
+      ) as HTMLElement | null) ??
       btnEl.parentElement!;
 
     btnEl.classList.add("base-board-hidden");
@@ -1310,12 +1480,17 @@ export class CardManager {
     const expectedBasename = sanitizeFilename(title).trim();
     return (
       createdFiles.find((file) => file.basename === expectedBasename) ??
-      createdFiles.sort((first, second) => second.stat.ctime - first.stat.ctime)[0] ??
+      createdFiles.sort(
+        (first, second) => second.stat.ctime - first.stat.ctime,
+      )[0] ??
       null
     );
   }
 
-  private async applyTaskPageTemplate(file: TFile, title: string): Promise<void> {
+  private async applyTaskPageTemplate(
+    file: TFile,
+    title: string,
+  ): Promise<void> {
     await this.view.app.vault.process(file, (content) => {
       const frontmatterMatch = content.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
       if (!frontmatterMatch) return content;

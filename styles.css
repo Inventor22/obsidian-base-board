@@ -2229,13 +2229,69 @@
 }
 
 .base-board-graph-edges {
+  z-index: 3;
   pointer-events: none;
   overflow: visible;
+}
+
+.base-board-graph-nodes {
+  z-index: 2;
 }
 
 .base-board-graph-edge {
   stroke: var(--background-modifier-border-hover);
   stroke-width: 2;
+}
+
+.base-board-graph-edge-hit-target {
+  pointer-events: stroke;
+  stroke: transparent;
+  stroke-width: 16;
+  cursor: context-menu;
+}
+
+.base-board-graph-edge--hovered {
+  stroke-width: 3;
+}
+
+.base-board-graph-edge--rewiring {
+  stroke-width: 3;
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--interactive-accent) 42%, transparent));
+}
+
+.base-board-graph-edge-handle {
+  pointer-events: all;
+  fill: var(--background-primary);
+  stroke: var(--background-modifier-border-hover);
+  stroke-width: 2;
+  opacity: 0;
+  cursor: grab;
+  transition:
+    opacity 120ms ease,
+    r 120ms ease,
+    stroke 120ms ease;
+}
+
+.base-board-graph-edge-handle:hover,
+.base-board-graph-edge-handle--edge-hovered,
+.base-board-graph-edge-handle--drop-target,
+.base-board-graph-edge-handle--dragging {
+  fill: color-mix(in srgb, var(--interactive-accent) 18%, var(--background-primary));
+  stroke: var(--interactive-accent);
+  opacity: 1;
+}
+
+.base-board-graph-edge-handle--edge-hovered {
+  opacity: 0.68;
+}
+
+.base-board-graph-edge-handle--drop-target {
+  stroke-width: 3;
+}
+
+.base-board-graph-edge-handle--dragging {
+  stroke-width: 3;
+  cursor: grabbing;
 }
 
 .base-board-graph-edge--gating {
@@ -2244,6 +2300,16 @@
     var(--interactive-accent) 58%,
     var(--background-modifier-border)
   );
+}
+
+.base-board-graph-edge--break {
+  stroke: color-mix(in srgb, var(--text-error) 78%, var(--background-modifier-border));
+  stroke-dasharray: 5 5;
+}
+
+.base-board-graph-edge--restart {
+  stroke: color-mix(in srgb, var(--text-success) 76%, var(--background-modifier-border));
+  stroke-dasharray: 7 5;
 }
 
 .base-board-graph-edge--requirement-start {
@@ -2265,6 +2331,14 @@
     var(--interactive-accent) 58%,
     var(--background-modifier-border)
   );
+}
+
+.base-board-graph-arrow-marker--break path {
+  fill: color-mix(in srgb, var(--text-error) 78%, var(--background-modifier-border));
+}
+
+.base-board-graph-arrow-marker--restart path {
+  fill: color-mix(in srgb, var(--text-success) 76%, var(--background-modifier-border));
 }
 
 .base-board-graph-arrow-marker--requirement-start path {
@@ -2301,11 +2375,24 @@
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
 }
 
+.base-board-graph-node--single-dragging {
+  box-shadow:
+    0 0 0 1px var(--interactive-accent),
+    0 8px 24px rgba(0, 0, 0, 0.24);
+}
+
 .base-board-graph-node:hover,
 .base-board-graph-node:focus-visible {
   border-color: color-mix(in srgb, var(--graph-node-color, var(--interactive-accent)) 70%, var(--background-modifier-border));
   outline: none;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+
+.base-board-graph-node--edge-drop-target {
+  border-color: var(--interactive-accent);
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--interactive-accent) 42%, transparent),
+    0 8px 24px rgba(0, 0, 0, 0.22);
 }
 
 .base-board-graph-node--completed {
@@ -2320,6 +2407,18 @@
 .base-board-graph-node--blocked {
   border-color: var(--text-error);
   border-left-color: var(--text-error);
+}
+
+.base-board-graph-node--interrupted {
+  border-color: var(--text-error);
+  border-left-color: var(--text-error);
+  background-color: color-mix(in srgb, var(--text-error) 7%, var(--background-secondary));
+}
+
+.base-board-graph-node--invalidated {
+  opacity: 0.45;
+  filter: grayscale(0.8);
+  border-style: dashed;
 }
 
 .base-board-graph-node--active {
@@ -2358,6 +2457,47 @@
 
 .base-board-graph-node-state--blocked {
   color: var(--text-error);
+}
+
+.base-board-graph-node-state--interrupted {
+  color: var(--text-error);
+}
+
+.base-board-graph-node-state--invalidated {
+  color: var(--text-faint);
+}
+
+.base-board-graph-collapse {
+  appearance: none;
+  position: absolute;
+  top: 8px;
+  right: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0 !important;
+  border-radius: 50%;
+  background-color: var(--background-primary) !important;
+  box-shadow: none !important;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.base-board-graph-collapse svg {
+  width: 12px;
+  height: 12px;
+}
+
+.base-board-graph-collapse:hover,
+.base-board-graph-collapse:focus-visible {
+  color: var(--interactive-accent);
+  outline: none;
 }
 
 .base-board-graph-node-title {

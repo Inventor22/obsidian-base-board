@@ -171,6 +171,10 @@ export class KanbanView extends BasesView implements HoverParent {
     }
   }
 
+  public getCurrentEntries(): BasesEntry[] {
+    return this.data?.data ?? [];
+  }
+
   static getViewOptions(): BasesAllOptions[] {
     return [
       {
@@ -457,7 +461,8 @@ export class KanbanView extends BasesView implements HoverParent {
     file: TFile,
     groupByProp: string,
   ): Date | null {
-    const propertyName = this.plugin.data_.transitionHistory.propertyName.trim();
+    const propertyName =
+      this.plugin.data_.transitionHistory.propertyName.trim();
     if (!propertyName) return null;
 
     const frontmatter = this.getFrontmatter(file);
@@ -777,7 +782,9 @@ export class KanbanView extends BasesView implements HoverParent {
       chevronEl,
       this.isPlannedExpanded ? "lucide-chevron-down" : "lucide-chevron-right",
     );
-    const plannedIconEl = headerEl.createSpan({ cls: "base-board-archive-icon" });
+    const plannedIconEl = headerEl.createSpan({
+      cls: "base-board-archive-icon",
+    });
     setIcon(plannedIconEl, "lucide-calendar-clock");
     headerEl.createSpan({ cls: "base-board-archive-title", text: "Planned" });
     headerEl.createSpan({
@@ -833,7 +840,10 @@ export class KanbanView extends BasesView implements HoverParent {
       cardEl.setAttr("draggable", "true");
       cardEl.dataset.filePath = plannedEntry.file.path;
       cardEl.dataset.columnName = plannedEntry.status;
-      cardEl.style.setProperty("--planned-status-color", plannedEntry.columnColor);
+      cardEl.style.setProperty(
+        "--planned-status-color",
+        plannedEntry.columnColor,
+      );
       cardEl.setAttr("title", `${plannedEntry.title} - planned`);
 
       const markerEl = cardEl.createSpan({ cls: "base-board-planned-marker" });
@@ -869,7 +879,10 @@ export class KanbanView extends BasesView implements HoverParent {
     return null;
   }
 
-  private shouldDeferToStackAnchor(columnName: string, columns: string[]): boolean {
+  private shouldDeferToStackAnchor(
+    columnName: string,
+    columns: string[],
+  ): boolean {
     for (const group of STACKED_COLUMN_GROUPS) {
       const [anchorColumn, ...stackedColumns] = group;
       if (columnName === anchorColumn) continue;
@@ -921,7 +934,8 @@ export class KanbanView extends BasesView implements HoverParent {
       this.render();
     });
 
-    if (!this.isArchiveExpanded || archivedEntries.length === 0) return archiveEl;
+    if (!this.isArchiveExpanded || archivedEntries.length === 0)
+      return archiveEl;
 
     const listEl = archiveEl.createDiv({ cls: "base-board-archive-list" });
     archivedEntries.forEach((archivedEntry) => {
@@ -985,11 +999,11 @@ export class KanbanView extends BasesView implements HoverParent {
     }
 
     const hiddenParentPaths = new Set<string>();
-    const completedIdentities = this.getCompletedProjectionIdentities(
-      projectionEntries,
-    );
+    const completedIdentities =
+      this.getCompletedProjectionIdentities(projectionEntries);
     for (const projectionEntry of projectionEntries) {
-      if (!this.isActionableFrontierStatus(projectionEntry.columnName)) continue;
+      if (!this.isActionableFrontierStatus(projectionEntry.columnName))
+        continue;
       if (
         this.isArchivedEntry(projectionEntry.entry, projectionEntry.columnName)
       ) {
@@ -1130,7 +1144,9 @@ export class KanbanView extends BasesView implements HoverParent {
     const groupByProp = this.getGroupByProperty();
     if (!groupByProp) return;
     const isArchiveDrop = targetColumnName === ARCHIVE_DROP_COLUMN;
-    const targetStatus = isArchiveDrop ? ARCHIVE_TARGET_STATUS : targetColumnName;
+    const targetStatus = isArchiveDrop
+      ? ARCHIVE_TARGET_STATUS
+      : targetColumnName;
 
     // Snapshot the selection NOW, before any async work or re-render can clear it
     const selectedSnapshot = new Set(this.selectedCards);
