@@ -616,15 +616,15 @@
     var(--background-primary)
   );
   border-left: 3px solid
-    color-mix(in srgb, var(--card-hierarchy-color) 68%, var(--background-primary));
+    color-mix(
+      in srgb,
+      var(--card-hierarchy-color) 68%,
+      var(--background-primary)
+    );
 }
 
 .base-board-card--hierarchy-color .base-board-card-hierarchy-icon {
-  color: color-mix(
-    in srgb,
-    var(--card-hierarchy-color) 72%,
-    var(--text-muted)
-  );
+  color: color-mix(in srgb, var(--card-hierarchy-color) 72%, var(--text-muted));
 }
 
 .base-board-card--hierarchy-color .base-board-card-child-count {
@@ -1500,7 +1500,8 @@
   outline: none;
 }
 
-.base-board-card-modal-outline-row--parent .base-board-card-modal-outline-row-title {
+.base-board-card-modal-outline-row--parent
+  .base-board-card-modal-outline-row-title {
   color: var(--text-normal);
 }
 
@@ -2256,7 +2257,13 @@
 
 .base-board-graph-edge--rewiring {
   stroke-width: 3;
-  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--interactive-accent) 42%, transparent));
+  filter: drop-shadow(
+    0 0 4px color-mix(in srgb, var(--interactive-accent) 42%, transparent)
+  );
+}
+
+.base-board-graph-edge--link-preview {
+  stroke-width: 2;
 }
 
 .base-board-graph-edge-handle {
@@ -2276,7 +2283,11 @@
 .base-board-graph-edge-handle--edge-hovered,
 .base-board-graph-edge-handle--drop-target,
 .base-board-graph-edge-handle--dragging {
-  fill: color-mix(in srgb, var(--interactive-accent) 18%, var(--background-primary));
+  fill: color-mix(
+    in srgb,
+    var(--interactive-accent) 18%,
+    var(--background-primary)
+  );
   stroke: var(--interactive-accent);
   opacity: 1;
 }
@@ -2303,12 +2314,20 @@
 }
 
 .base-board-graph-edge--break {
-  stroke: color-mix(in srgb, var(--text-error) 78%, var(--background-modifier-border));
+  stroke: color-mix(
+    in srgb,
+    var(--text-error) 78%,
+    var(--background-modifier-border)
+  );
   stroke-dasharray: 5 5;
 }
 
 .base-board-graph-edge--restart {
-  stroke: color-mix(in srgb, var(--text-success) 76%, var(--background-modifier-border));
+  stroke: color-mix(
+    in srgb,
+    var(--text-success) 76%,
+    var(--background-modifier-border)
+  );
   stroke-dasharray: 7 5;
 }
 
@@ -2321,7 +2340,11 @@
 }
 
 .base-board-graph-edge--requirement-return {
-  stroke: color-mix(in srgb, var(--text-success) 58%, var(--background-modifier-border));
+  stroke: color-mix(
+    in srgb,
+    var(--text-success) 58%,
+    var(--background-modifier-border)
+  );
   stroke-dasharray: 8 6;
 }
 
@@ -2334,11 +2357,19 @@
 }
 
 .base-board-graph-arrow-marker--break path {
-  fill: color-mix(in srgb, var(--text-error) 78%, var(--background-modifier-border));
+  fill: color-mix(
+    in srgb,
+    var(--text-error) 78%,
+    var(--background-modifier-border)
+  );
 }
 
 .base-board-graph-arrow-marker--restart path {
-  fill: color-mix(in srgb, var(--text-success) 76%, var(--background-modifier-border));
+  fill: color-mix(
+    in srgb,
+    var(--text-success) 76%,
+    var(--background-modifier-border)
+  );
 }
 
 .base-board-graph-arrow-marker--requirement-start path {
@@ -2350,7 +2381,11 @@
 }
 
 .base-board-graph-arrow-marker--requirement-return path {
-  fill: color-mix(in srgb, var(--text-success) 58%, var(--background-modifier-border));
+  fill: color-mix(
+    in srgb,
+    var(--text-success) 58%,
+    var(--background-modifier-border)
+  );
 }
 
 .base-board-graph-node {
@@ -2383,7 +2418,11 @@
 
 .base-board-graph-node:hover,
 .base-board-graph-node:focus-visible {
-  border-color: color-mix(in srgb, var(--graph-node-color, var(--interactive-accent)) 70%, var(--background-modifier-border));
+  border-color: color-mix(
+    in srgb,
+    var(--graph-node-color, var(--interactive-accent)) 70%,
+    var(--background-modifier-border)
+  );
   outline: none;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
 }
@@ -2393,6 +2432,114 @@
   box-shadow:
     0 0 0 2px color-mix(in srgb, var(--interactive-accent) 42%, transparent),
     0 8px 24px rgba(0, 0, 0, 0.22);
+}
+
+.base-board-graph-link-handle {
+  position: absolute;
+  z-index: 5;
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--interactive-accent);
+  border-radius: 50%;
+  background-color: color-mix(
+    in srgb,
+    var(--interactive-accent) 18%,
+    var(--background-primary)
+  );
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+  cursor: crosshair;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.base-board-graph-link-handle--visible,
+.base-board-graph-link-handle--dragging,
+.base-board-graph-link-handle--drop-target,
+.base-board-graph-link-handle:hover {
+  opacity: 1;
+}
+
+.base-board-graph-link-handle--drop-target {
+  border-color: var(--text-accent);
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--interactive-accent) 32%, transparent),
+    0 4px 12px rgba(0, 0, 0, 0.24);
+}
+
+.base-board-graph-template-modal-body {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.9fr) minmax(220px, 1.1fr);
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.base-board-graph-template-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.base-board-graph-template-option {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 8px;
+  border: 0 !important;
+  border-radius: var(--radius-s);
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--font-ui-small);
+  text-align: left;
+  cursor: pointer;
+}
+
+.base-board-graph-template-option:hover,
+.base-board-graph-template-option:focus-visible {
+  background-color: var(--background-modifier-hover) !important;
+  color: var(--text-normal);
+  outline: none;
+}
+
+.base-board-graph-template-option-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 16px;
+}
+
+.base-board-graph-template-option-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.base-board-graph-template-preview {
+  min-height: 180px;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--background-secondary);
+}
+
+.base-board-graph-template-preview-title {
+  margin-bottom: 8px;
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+}
+
+.base-board-graph-template-preview-tree {
+  margin: 0;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+  white-space: pre-wrap;
 }
 
 .base-board-graph-node--completed {
@@ -2412,7 +2559,11 @@
 .base-board-graph-node--interrupted {
   border-color: var(--text-error);
   border-left-color: var(--text-error);
-  background-color: color-mix(in srgb, var(--text-error) 7%, var(--background-secondary));
+  background-color: color-mix(
+    in srgb,
+    var(--text-error) 7%,
+    var(--background-secondary)
+  );
 }
 
 .base-board-graph-node--invalidated {
@@ -2422,7 +2573,11 @@
 }
 
 .base-board-graph-node--active {
-  border-color: color-mix(in srgb, var(--interactive-accent) 70%, var(--background-modifier-border));
+  border-color: color-mix(
+    in srgb,
+    var(--interactive-accent) 70%,
+    var(--background-modifier-border)
+  );
   box-shadow:
     0 0 0 1px color-mix(in srgb, var(--interactive-accent) 32%, transparent),
     0 4px 16px rgba(0, 0, 0, 0.16);
@@ -2532,46 +2687,4 @@
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.base-board-graph-add {
-  appearance: none;
-  position: absolute;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  min-width: 0;
-  min-height: 0;
-  margin: 0;
-  padding: 0;
-  border: 1px solid var(--background-modifier-border) !important;
-  border-radius: 50%;
-  background-color: var(--background-primary) !important;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18) !important;
-  color: var(--text-muted);
-  cursor: pointer;
-}
-
-.base-board-graph-add svg {
-  width: 14px;
-  height: 14px;
-}
-
-.base-board-graph-add:hover,
-.base-board-graph-add:focus-visible {
-  border-color: var(--interactive-accent) !important;
-  color: var(--interactive-accent);
-  outline: none;
-}
-
-.base-board-graph-add--successor {
-  top: 34px;
-  right: -13px;
-}
-
-.base-board-graph-add--requirement {
-  left: calc(50% - 12px);
-  bottom: -13px;
 }

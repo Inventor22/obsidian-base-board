@@ -1501,7 +1501,7 @@ export class TimelineView extends BasesView {
 
   private extractTagsFromFile(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
-    const tags = frontmatter?.tags ?? frontmatter?.tag;
+    const tags = frontmatter?.tags;
     if (Array.isArray(tags)) {
       return tags
         .filter((tag): tag is string => typeof tag === "string")
@@ -1519,21 +1519,13 @@ export class TimelineView extends BasesView {
 
   private getParentKey(file: TFile): string | null {
     const frontmatter = this.getFrontmatter(file);
-    const value =
-      frontmatter?.parent ??
-      frontmatter?.parent_task ??
-      frontmatter?.parentTask ??
-      frontmatter?.feature;
+    const value = frontmatter?.parent;
     return this.normalizeReference(value);
   }
 
   private getParentDisplayTitle(file: TFile): string | null {
     const frontmatter = this.getFrontmatter(file);
-    const value =
-      frontmatter?.parent ??
-      frontmatter?.parent_task ??
-      frontmatter?.parentTask ??
-      frontmatter?.feature;
+    const value = frontmatter?.parent;
     const firstValue = Array.isArray(value) ? (value as unknown[])[0] : value;
     if (typeof firstValue !== "string") return null;
     let display = firstValue.trim();

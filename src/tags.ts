@@ -7,7 +7,13 @@ import { relativeLuminance } from "./color-utils";
 export class Tags {
   private view: KanbanView;
   public activeFilters: Set<string> = new Set();
-  private readonly filterGroupOrder = ["people", "repo", "feature", "kind", "meta"];
+  private readonly filterGroupOrder = [
+    "people",
+    "repo",
+    "feature",
+    "kind",
+    "meta",
+  ];
 
   constructor(view: KanbanView) {
     this.view = view;
@@ -61,8 +67,7 @@ export class Tags {
 
   public extractTagsFromFile(file: TFile): string[] {
     const cache = this.view.app.metadataCache.getFileCache(file);
-    const tags = (cache?.frontmatter?.tags ??
-      cache?.frontmatter?.tag) as unknown;
+    const tags = cache?.frontmatter?.tags as unknown;
     let fileTags: string[] = [];
     if (Array.isArray(tags)) {
       fileTags = tags.filter((t): t is string => typeof t === "string");
@@ -85,7 +90,6 @@ export class Tags {
         (fm: Record<string, unknown>) => {
           if (newTags.length === 0) {
             delete fm.tags;
-            delete fm.tag;
           } else {
             fm.tags = newTags;
           }
@@ -136,7 +140,9 @@ export class Tags {
         cls: "base-board-filter-group-title",
         text: group.label,
       });
-      const groupTagsEl = groupEl.createDiv({ cls: "base-board-filter-group-tags" });
+      const groupTagsEl = groupEl.createDiv({
+        cls: "base-board-filter-group-tags",
+      });
 
       for (const tag of group.tags) {
         this.renderFilterPill(groupTagsEl, tag);
@@ -192,7 +198,9 @@ export class Tags {
     });
   }
 
-  private getTagGroups(tags: string[]): Array<{ label: string; tags: string[] }> {
+  private getTagGroups(
+    tags: string[],
+  ): Array<{ label: string; tags: string[] }> {
     const groups = new Map<string, string[]>();
     for (const tag of tags) {
       const groupName = this.getTagGroupName(tag);

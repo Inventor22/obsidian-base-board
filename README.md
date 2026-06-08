@@ -18,7 +18,7 @@
 - **Inline Power**: Rename cards or column titles directly on the board.
 - **Native Editing Modal**: Open any card into a fully-functional Obsidian editor floating directly over your workspace.
 - **Rich Cards**: View key metadata fields as chips on each card for a quick overview.
-- **Task Hierarchy**: Cards with a `parent`, `parent_task`, or `parentTask` property show their parent breadcrumb, and parent cards show a collapsible recursive outline of visible descendants.
+- **Task Hierarchy**: Cards with a `parent` property show their parent breadcrumb, and parent cards show a collapsible recursive outline of visible descendants.
 - **Card Detail Outline**: The floating card modal shows the selected task's descendant outline above the embedded note content when child tasks exist.
 - **Project Colors**: Root tasks can set `project_color` to give their hierarchy an inherited card tint that gets lighter for descendants.
 - **Configurable Card Title**: Set `cardTitleProperty: note.title` in your `.base` file to use a frontmatter property (e.g. `title`) as the card heading instead of the filename.
@@ -38,11 +38,11 @@ Open the **Command palette** (`Ctrl/Cmd + P`) and run **"Base Board: Create new 
 
 By default, clicking a card opens it in Base Board's floating card modal. Modifier keys still respect native Obsidian conventions:
 
-* **Click:** Open the card in a floating modal.
-* **Ctrl/Cmd + Click:** Open the note in a new tab.
-* **Ctrl/Cmd + Alt + Click** (or **Cmd + Option + Click** on macOS): Open the note to the side in a split pane.
-* **Alt / Option + Click:** Toggle selection of a card (for bulk actions or dragging).
-* **Shift + Click:** Select a range of cards.
+- **Click:** Open the card in a floating modal.
+- **Ctrl/Cmd + Click:** Open the note in a new tab.
+- **Ctrl/Cmd + Alt + Click** (or **Cmd + Option + Click** on macOS): Open the note to the side in a split pane.
+- **Alt / Option + Click:** Toggle selection of a card (for bulk actions or dragging).
+- **Shift + Click:** Select a range of cards.
 
 You can customize the default click behavior (e.g. to always open in a floating modal, split pane, or new tab) via the board toolbar under the view options menu.
 
@@ -75,18 +75,10 @@ The timeline uses the same group-by property as the board, so a board grouped by
 
 Drag timeline lanes vertically to save a custom timeline order. This writes `timeline_order` to the affected task notes and does not change their Kanban column order.
 
-Parent task pools are inferred from one of these frontmatter properties on child tasks:
+Parent task pools are inferred from `parent` on child tasks:
 
 ```yaml
 parent: [[Parent Task]]
-```
-
-```yaml
-parent_task: Parent Task
-```
-
-```yaml
-parentTask: parent-task-id
 ```
 
 If a task has children, the Timeline renders it as a parent lane and recursively indents descendants beneath it. Parent completion remains manual; the timeline only visualizes the recorded task movement history.
@@ -114,7 +106,7 @@ depends_on:
 
 `parent` creates a requirement relationship below the current node. `depends_on` creates a gated successor relationship to the right: the successor waits until its dependency is completed. The graph highlights active frontier nodes, muted completed nodes, waiting nodes, and blocked nodes using the same status colors as the Kanban board.
 
-Click a graph node to open its card detail modal. Click the bottom `+` on a node to create a child requirement. Click the right-side `+` to create a gated successor that depends on the current node. New graph nodes are Markdown notes with normal task frontmatter, so they immediately participate in Kanban, Timeline, and Graph views.
+Click a graph node to open its card detail modal. Right-click empty graph space to create a node or insert a top-level feature template. Right-click a node to create a child node, insert relevant downstream templates, or delete the node with graph reference cleanup. Hover near a node boundary to reveal a link anchor, then drag to another node to create a subprocess, dependency/gating, break, or restart link. New graph nodes are Markdown notes with normal task frontmatter, so they immediately participate in Kanban, Timeline, and Graph views.
 
 ## Installation
 

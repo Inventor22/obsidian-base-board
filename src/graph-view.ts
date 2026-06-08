@@ -1,13 +1,16 @@
 import {
+  App,
   BasesEntry,
   BasesPropertyId,
   BasesView,
   Menu,
+  Modal,
   Notice,
   NullValue,
   QueryController,
   setIcon,
   setTooltip,
+  Setting,
   TFile,
 } from "obsidian";
 import type BaseBoardPlugin from "./main";
@@ -17,6 +20,7 @@ import { ORDER_PROPERTY, sanitizeFilename } from "./constants";
 import { getColumnColor } from "./status-colors";
 
 type GraphRelationKind = "requirement" | "successor";
+type GraphLinkCreationKind = GraphRelationKind | "break" | "restart";
 type GraphNodeState =
   | "active"
   | "waiting"
@@ -27,20 +31,29 @@ type GraphNodeState =
   | "idle";
 type GraphEdgeKind = "requirement-start" | "requirement-return" | "gating";
 type GraphFlowEdgeKind = GraphEdgeKind | "break" | "restart";
-type GraphWorkflowTemplate = "rollout-attempt" | "bug-recovery" | "iteration";
+type GraphWorkflowTemplate =
+  | "feature-simple"
+  | "feature-detailed"
+  | "iteration"
+  | "dev"
+  | "rollout-repo"
+  | "ring-flagged"
+  | "ring-basic";
 type GraphAnchorSide = "top" | "right" | "bottom" | "left";
 type GraphEdgeEndpoint = "from" | "to";
 type GraphReferenceListKind =
-  | "dependsOn"
-  | "breaksTo"
-  | "restartsTo"
-  | "hiddenReturn";
+  | "depends_on"
+  | "breaks_to"
+  | "restarts_to"
+  | "graph_hidden_returns";
 
 interface GraphEndpointAnchorOverride {
   side: GraphAnchorSide;
   xRatio: number;
   yRatio: number;
 }
+
+type GraphNodeAnchorSlot = GraphEndpointAnchorOverride;
 
 interface GraphAnchorPoint {
   x: number;
@@ -49,6 +62,110 @@ interface GraphAnchorPoint {
 }
 
 type GraphAnchorLane = "normal" | "return" | "restart";
+
+interface GraphTemplateDefinition {
+  id: GraphWorkflowTemplate;
+  name: string;
+  icon: string;
+  placeholder: string;
+  preview: string[];
+}
+
+const GRAPH_NODE_TYPE_OPTIONS = [
+  "feature",
+  "iteration",
+  "dev",
+  "rollout",
+  "repo",
+  "stage",
+  "canary",
+  "pilot",
+  "broad",
+  "design",
+  "implementation",
+  "review",
+  "await",
+  "enable",
+  "verify",
+  "task",
+] as const;
+
+const GRAPH_TEMPLATE_DEFINITIONS: GraphTemplateDefinition[] = [
+  {
+    id: "feature-simple",
+    name: "Simple feature",
+    icon: "lucide-sparkles",
+    placeholder: "New feature",
+    preview: ["Feature", "  dev", "  rollout"],
+  },
+  {
+    id: "feature-detailed",
+    name: "Detailed feature",
+    icon: "lucide-sparkles",
+    placeholder: "New feature",
+    preview: [
+      "Feature",
+      "  dev",
+      "    design",
+      "    implementation",
+      "    review",
+      "  rollout",
+      "    repo",
+      "      stage",
+      "      canary",
+      "      pilot",
+      "      broad",
+    ],
+  },
+  {
+    id: "iteration",
+    name: "Iteration",
+    icon: "lucide-refresh-cw",
+    placeholder: "Iteration 1",
+    preview: ["Iteration", "  dev", "  rollout"],
+  },
+  {
+    id: "dev",
+    name: "Dev",
+    icon: "lucide-code-2",
+    placeholder: "dev",
+    preview: ["dev", "  design", "  implementation", "  review"],
+  },
+  {
+    id: "rollout-repo",
+    name: "Rollout repo",
+    icon: "lucide-radio-tower",
+    placeholder: "rollout",
+    preview: [
+      "rollout",
+      "  repo",
+      "    stage",
+      "    canary",
+      "    pilot",
+      "    broad",
+    ],
+  },
+  {
+    id: "ring-flagged",
+    name: "Flagged ring",
+    icon: "lucide-flag",
+    placeholder: "ring",
+    preview: [
+      "ring",
+      "  await build rollout",
+      "  enable feature flag",
+      "  await feature flag rollout",
+      "  verify",
+    ],
+  },
+  {
+    id: "ring-basic",
+    name: "Basic ring",
+    icon: "lucide-check-circle-2",
+    placeholder: "ring",
+    preview: ["ring", "  await build rollout", "  verify"],
+  },
+];
 
 interface GraphNode {
   entry: BasesEntry;
@@ -83,7 +200,7 @@ interface GraphEdge {
   kind: GraphFlowEdgeKind;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.07.5";
+const GRAPH_BUILD_VERSION = "2026.06.08.15";
 const NODE_WIDTH = 220;
 const NODE_MIN_HEIGHT = 92;
 const X_STEP = 300;
@@ -102,6 +219,23 @@ const GRAPH_POSITION_PROPERTY_Y = "graph_y";
 const GRAPH_COLLAPSED_PROPERTY = "graph_collapsed";
 const GRAPH_HIDDEN_RETURNS_PROPERTY = "graph_hidden_returns";
 const GRAPH_EDGE_HANDLE_RADIUS = 7;
+const GRAPH_LINK_HANDLE_PROXIMITY_PX = 40;
+const GRAPH_TEMPLATE_CHILD_Y_STEP = 150;
+const GRAPH_TEMPLATE_CHILD_X_STEP = 260;
+const GRAPH_NODE_ANCHOR_SLOTS: GraphNodeAnchorSlot[] = [
+  { side: "top", xRatio: 0.2, yRatio: 0 },
+  { side: "top", xRatio: 0.4, yRatio: 0 },
+  { side: "top", xRatio: 0.6, yRatio: 0 },
+  { side: "top", xRatio: 0.8, yRatio: 0 },
+  { side: "right", xRatio: 1, yRatio: 1 / 3 },
+  { side: "right", xRatio: 1, yRatio: 2 / 3 },
+  { side: "bottom", xRatio: 0.2, yRatio: 1 },
+  { side: "bottom", xRatio: 0.4, yRatio: 1 },
+  { side: "bottom", xRatio: 0.6, yRatio: 1 },
+  { side: "bottom", xRatio: 0.8, yRatio: 1 },
+  { side: "left", xRatio: 0, yRatio: 1 / 3 },
+  { side: "left", xRatio: 0, yRatio: 2 / 3 },
+];
 
 export class GraphView extends BasesView {
   type = "graph";
@@ -252,6 +386,9 @@ export class GraphView extends BasesView {
     canvasEl.style.width = `${bounds.width}px`;
     canvasEl.style.height = `${bounds.height}px`;
     this.applyGraphZoom(zoomContentEl, canvasEl, bounds);
+    canvasEl.addEventListener("contextmenu", (event: MouseEvent) => {
+      this.showCanvasCreateMenu(event, canvasEl);
+    });
 
     const svgEl = activeDocument.createElementNS(
       "http://www.w3.org/2000/svg",
@@ -630,7 +767,7 @@ export class GraphView extends BasesView {
     const targetEl = event.target instanceof HTMLElement ? event.target : null;
     if (
       targetEl?.closest(
-        ".base-board-graph-node, button, input, textarea, select",
+        ".base-board-graph-node, .base-board-graph-link-handle, button, input, textarea, select",
       )
     ) {
       return;
@@ -740,26 +877,28 @@ export class GraphView extends BasesView {
       });
     }
 
-    const requirementBtn = nodeEl.createEl("button", {
-      cls: "base-board-graph-add base-board-graph-add--requirement",
-      attr: { type: "button", title: "Add requirement" },
+    const linkHandleEl = nodeEl.createDiv({
+      cls: "base-board-graph-link-handle",
     });
-    setIcon(requirementBtn, "lucide-plus");
-    requirementBtn.addEventListener("click", (event: MouseEvent) => {
+    linkHandleEl.dataset.side = "right";
+    window.requestAnimationFrame(() => {
+      this.snapNodeLinkHandleToSlot(nodeEl, linkHandleEl, {
+        side: "right",
+        xRatio: 1,
+        yRatio: 0.5,
+      });
+    });
+    setTooltip(linkHandleEl, "Drag to create a link");
+    nodeEl.addEventListener("mousemove", (event: MouseEvent) => {
+      this.positionNodeLinkHandle(event, nodeEl, linkHandleEl);
+    });
+    nodeEl.addEventListener("mouseleave", () => {
+      linkHandleEl.removeClass("base-board-graph-link-handle--visible");
+    });
+    linkHandleEl.addEventListener("mousedown", (event: MouseEvent) => {
       event.preventDefault();
       event.stopPropagation();
-      this.showCreateMenu(event, node, "requirement");
-    });
-
-    const successorBtn = nodeEl.createEl("button", {
-      cls: "base-board-graph-add base-board-graph-add--successor",
-      attr: { type: "button", title: "Add gated successor" },
-    });
-    setIcon(successorBtn, "lucide-plus");
-    successorBtn.addEventListener("click", (event: MouseEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-      this.showCreateMenu(event, node, "successor");
+      this.startNodeLinkDrag(event, node, linkHandleEl);
     });
 
     nodeEl.addEventListener("click", (event: MouseEvent) => {
@@ -773,6 +912,9 @@ export class GraphView extends BasesView {
     nodeEl.addEventListener("mousedown", (event: MouseEvent) => {
       this.startNodeDrag(event, node);
     });
+    nodeEl.addEventListener("contextmenu", (event: MouseEvent) => {
+      this.showNodeContextMenu(event, node);
+    });
     nodeEl.addEventListener("keydown", (event: KeyboardEvent) => {
       if (event.key !== "Enter" && event.key !== " ") return;
       event.preventDefault();
@@ -783,7 +925,12 @@ export class GraphView extends BasesView {
   private startNodeDrag(event: MouseEvent, node: GraphNode): void {
     if (event.button !== 0) return;
     const targetEl = event.target instanceof HTMLElement ? event.target : null;
-    if (targetEl?.closest("button, input, textarea, select")) return;
+    if (
+      targetEl?.closest(
+        ".base-board-graph-link-handle, button, input, textarea, select",
+      )
+    )
+      return;
 
     event.preventDefault();
     event.stopPropagation();
@@ -878,6 +1025,367 @@ export class GraphView extends BasesView {
     activeWindow.addEventListener("mouseup", upHandler);
   }
 
+  private positionNodeLinkHandle(
+    event: MouseEvent,
+    nodeEl: HTMLElement,
+    handleEl: HTMLElement,
+  ): void {
+    const slot = this.getNearestNodeAnchorSlot(event, nodeEl, true);
+    if (!slot) {
+      handleEl.removeClass("base-board-graph-link-handle--visible");
+      return;
+    }
+    this.snapNodeLinkHandleToSlot(nodeEl, handleEl, slot);
+    handleEl.addClass("base-board-graph-link-handle--visible");
+  }
+
+  private getNearestNodeAnchorSlot(
+    event: MouseEvent,
+    nodeEl: HTMLElement,
+    requireBorderProximity: boolean,
+  ): GraphNodeAnchorSlot | null {
+    const rect = nodeEl.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    const borderDistance = Math.min(x, rect.width - x, y, rect.height - y);
+    if (
+      requireBorderProximity &&
+      borderDistance > GRAPH_LINK_HANDLE_PROXIMITY_PX
+    ) {
+      return null;
+    }
+
+    return GRAPH_NODE_ANCHOR_SLOTS.reduce((nearestSlot, candidateSlot) =>
+      this.getNodeAnchorSlotDistance(candidateSlot, rect, x, y) <
+      this.getNodeAnchorSlotDistance(nearestSlot, rect, x, y)
+        ? candidateSlot
+        : nearestSlot,
+    );
+  }
+
+  private getNodeAnchorSlotDistance(
+    slot: GraphNodeAnchorSlot,
+    rect: DOMRect,
+    x: number,
+    y: number,
+  ): number {
+    const anchorX = rect.width * slot.xRatio;
+    const anchorY = rect.height * slot.yRatio;
+    return Math.hypot(anchorX - x, anchorY - y);
+  }
+
+  private snapNodeLinkHandleToSlot(
+    nodeEl: HTMLElement,
+    handleEl: HTMLElement,
+    slot: GraphNodeAnchorSlot,
+  ): void {
+    const width = nodeEl.offsetWidth;
+    const height = nodeEl.offsetHeight;
+    const halfSize = handleEl.offsetWidth / 2;
+    const style = activeWindow.getComputedStyle(nodeEl);
+    const borderLeft = Number.parseFloat(style.borderLeftWidth) || 0;
+    const borderTop = Number.parseFloat(style.borderTopWidth) || 0;
+    handleEl.dataset.side = slot.side;
+    handleEl.dataset.xRatio = String(slot.xRatio);
+    handleEl.dataset.yRatio = String(slot.yRatio);
+    handleEl.style.left = `${width * slot.xRatio - borderLeft - halfSize}px`;
+    handleEl.style.top = `${height * slot.yRatio - borderTop - halfSize}px`;
+  }
+
+  private startNodeLinkDrag(
+    event: MouseEvent,
+    sourceNode: GraphNode,
+    handleEl: HTMLElement,
+  ): void {
+    if (event.button !== 0) return;
+    const svgEl = this.containerEl.querySelector<SVGSVGElement>(
+      ".base-board-graph-edges",
+    );
+    if (!svgEl) return;
+
+    const sourceSlot = this.getNodeAnchorSlotFromHandle(handleEl);
+    const sourceNodeEl = this.getRenderedGraphNodeEl(sourceNode);
+    if (sourceNodeEl) {
+      this.snapNodeLinkHandleToSlot(sourceNodeEl, handleEl, sourceSlot);
+    }
+    const start = this.getGraphPointFromElementCenter(
+      handleEl,
+      svgEl,
+      sourceSlot.side,
+    );
+    handleEl.addClass("base-board-graph-link-handle--dragging");
+    handleEl.addClass("base-board-graph-link-handle--visible");
+    const previewEl = activeDocument.createElementNS(
+      "http://www.w3.org/2000/svg",
+      "path",
+    );
+    previewEl.addClass("base-board-graph-edge");
+    previewEl.addClass("base-board-graph-edge--gating");
+    previewEl.addClass("base-board-graph-edge--rewiring");
+    previewEl.addClass("base-board-graph-edge--link-preview");
+    previewEl.setAttribute("fill", "none");
+    previewEl.setAttribute("marker-end", "url(#base-board-graph-arrow-gating)");
+    svgEl.appendChild(previewEl);
+
+    let dropNode: GraphNode | null = null;
+    let dropNodeEl: HTMLElement | null = null;
+    let dropSlot: GraphNodeAnchorSlot | null = null;
+    let dropHandleEl: HTMLElement | null = null;
+
+    const clearDropTarget = () => {
+      dropNodeEl?.removeClass("base-board-graph-node--edge-drop-target");
+      dropHandleEl?.removeClass("base-board-graph-link-handle--drop-target");
+      dropHandleEl?.removeClass("base-board-graph-link-handle--visible");
+      dropNodeEl = null;
+      dropNode = null;
+      dropSlot = null;
+      dropHandleEl = null;
+    };
+
+    const moveHandler = (moveEvent: MouseEvent) => {
+      moveEvent.preventDefault();
+      const candidate = this.getGraphNodeFromPoint(
+        moveEvent.clientX,
+        moveEvent.clientY,
+      );
+      const nextDropNode =
+        candidate && candidate.file.path !== sourceNode.file.path
+          ? candidate
+          : null;
+      const nextDropNodeEl = nextDropNode
+        ? this.getRenderedGraphNodeEl(nextDropNode)
+        : null;
+      const nextDropSlot = nextDropNodeEl
+        ? this.getNearestNodeAnchorSlot(moveEvent, nextDropNodeEl, false)
+        : null;
+      const end =
+        nextDropNode && nextDropSlot
+          ? this.getNodeAnchorPointForSlot(nextDropNode, nextDropSlot)
+          : {
+              ...this.getGraphPointFromMouseEvent(moveEvent, svgEl),
+              side: this.getOppositeAnchorSide(sourceSlot.side),
+            };
+      previewEl.setAttribute(
+        "d",
+        this.getPerpendicularCurvePath(start, end, 72),
+      );
+
+      if (
+        nextDropNode?.file.path === dropNode?.file.path &&
+        nextDropSlot?.xRatio === dropSlot?.xRatio &&
+        nextDropSlot?.yRatio === dropSlot?.yRatio &&
+        nextDropSlot?.side === dropSlot?.side
+      ) {
+        return;
+      }
+      clearDropTarget();
+      if (!nextDropNode || !nextDropNodeEl || !nextDropSlot) return;
+      dropNode = nextDropNode;
+      dropNodeEl = nextDropNodeEl;
+      dropSlot = nextDropSlot;
+      dropNodeEl.addClass("base-board-graph-node--edge-drop-target");
+      dropHandleEl = this.getNodeLinkHandleEl(dropNodeEl);
+      if (dropHandleEl) {
+        this.snapNodeLinkHandleToSlot(dropNodeEl, dropHandleEl, dropSlot);
+        dropHandleEl.addClass("base-board-graph-link-handle--visible");
+        dropHandleEl.addClass("base-board-graph-link-handle--drop-target");
+      }
+    };
+
+    const upHandler = (upEvent: MouseEvent) => {
+      activeWindow.removeEventListener("mousemove", moveHandler);
+      activeWindow.removeEventListener("mouseup", upHandler);
+      handleEl.removeClass("base-board-graph-link-handle--dragging");
+      handleEl.removeClass("base-board-graph-link-handle--visible");
+      previewEl.remove();
+      const targetNode = dropNode;
+      const targetSlot = dropSlot;
+      clearDropTarget();
+      if (!targetNode || !targetSlot) return;
+      upEvent.preventDefault();
+      upEvent.stopPropagation();
+      this.showNewLinkTypeMenu(
+        upEvent,
+        sourceNode,
+        targetNode,
+        sourceSlot,
+        targetSlot,
+      );
+    };
+
+    activeWindow.addEventListener("mousemove", moveHandler);
+    activeWindow.addEventListener("mouseup", upHandler);
+  }
+
+  private getNodeLinkHandleEl(nodeEl: HTMLElement): HTMLElement | null {
+    return nodeEl.querySelector<HTMLElement>(".base-board-graph-link-handle");
+  }
+
+  private getNodeAnchorSlotFromHandle(
+    handleEl: HTMLElement,
+  ): GraphNodeAnchorSlot {
+    const side = (handleEl.dataset.side ?? "right") as GraphAnchorSide;
+    const fallback = this.getFallbackAnchorSlot(side);
+    return {
+      side,
+      xRatio: this.parseAnchorRatio(handleEl.dataset.xRatio, fallback.xRatio),
+      yRatio: this.parseAnchorRatio(handleEl.dataset.yRatio, fallback.yRatio),
+    };
+  }
+
+  private getFallbackAnchorSlot(side: GraphAnchorSide): GraphNodeAnchorSlot {
+    if (side === "top") return { side, xRatio: 0.5, yRatio: 0 };
+    if (side === "bottom") return { side, xRatio: 0.5, yRatio: 1 };
+    if (side === "left") return { side, xRatio: 0, yRatio: 0.5 };
+    return { side, xRatio: 1, yRatio: 0.5 };
+  }
+
+  private parseAnchorRatio(
+    value: string | undefined,
+    fallback: number,
+  ): number {
+    if (value === undefined) return fallback;
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? this.clampRatio(parsed) : fallback;
+  }
+
+  private getNodeAnchorPointForSlot(
+    node: GraphNode,
+    slot: GraphNodeAnchorSlot,
+  ): GraphAnchorPoint {
+    const size = this.getRenderedGraphNodeSize(node);
+    return {
+      side: slot.side,
+      x: node.x + size.width * slot.xRatio,
+      y: node.y + size.height * slot.yRatio,
+    };
+  }
+
+  private showNewLinkTypeMenu(
+    event: MouseEvent,
+    sourceNode: GraphNode,
+    targetNode: GraphNode,
+    sourceSlot: GraphNodeAnchorSlot,
+    targetSlot: GraphNodeAnchorSlot,
+  ): void {
+    const menu = new Menu();
+    menu.addItem((item) => {
+      item
+        .setTitle("Subprocess")
+        .setIcon("lucide-git-branch")
+        .onClick(() => {
+          void this.createGraphLink(
+            sourceNode,
+            targetNode,
+            "requirement",
+            sourceSlot,
+            targetSlot,
+          );
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Dependency / gating")
+        .setIcon("lucide-lock")
+        .onClick(() => {
+          void this.createGraphLink(
+            sourceNode,
+            targetNode,
+            "successor",
+            sourceSlot,
+            targetSlot,
+          );
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Break")
+        .setIcon("lucide-unlink")
+        .onClick(() => {
+          void this.createGraphLink(
+            sourceNode,
+            targetNode,
+            "break",
+            sourceSlot,
+            targetSlot,
+          );
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Restart")
+        .setIcon("lucide-refresh-cw")
+        .onClick(() => {
+          void this.createGraphLink(
+            sourceNode,
+            targetNode,
+            "restart",
+            sourceSlot,
+            targetSlot,
+          );
+        });
+    });
+    menu.showAtMouseEvent(event);
+  }
+
+  private async createGraphLink(
+    sourceNode: GraphNode,
+    targetNode: GraphNode,
+    kind: GraphLinkCreationKind,
+    sourceSlot: GraphNodeAnchorSlot,
+    targetSlot: GraphNodeAnchorSlot,
+  ): Promise<void> {
+    if (kind === "requirement") {
+      await this.updateGraphParent(targetNode, sourceNode);
+    } else if (kind === "successor") {
+      await this.addGraphReference(targetNode, "depends_on", sourceNode);
+    } else if (kind === "break") {
+      await this.addGraphReference(sourceNode, "breaks_to", targetNode);
+    } else {
+      await this.addGraphReference(sourceNode, "restarts_to", targetNode);
+    }
+    this.setCreatedGraphLinkAnchorOverrides(
+      sourceNode,
+      targetNode,
+      kind,
+      sourceSlot,
+      targetSlot,
+    );
+    new Notice("Created link");
+    this.render();
+  }
+
+  private setCreatedGraphLinkAnchorOverrides(
+    sourceNode: GraphNode,
+    targetNode: GraphNode,
+    kind: GraphLinkCreationKind,
+    sourceSlot: GraphNodeAnchorSlot,
+    targetSlot: GraphNodeAnchorSlot,
+  ): void {
+    const edge: GraphEdge = {
+      from: sourceNode,
+      to: targetNode,
+      kind: this.getCreatedGraphLinkEdgeKind(kind),
+    };
+    this.graphEndpointAnchorOverrides.set(
+      this.getEdgeEndpointOverrideKey(edge, "from"),
+      sourceSlot,
+    );
+    this.graphEndpointAnchorOverrides.set(
+      this.getEdgeEndpointOverrideKey(edge, "to"),
+      targetSlot,
+    );
+  }
+
+  private getCreatedGraphLinkEdgeKind(
+    kind: GraphLinkCreationKind,
+  ): GraphFlowEdgeKind {
+    if (kind === "requirement") return "requirement-start";
+    if (kind === "successor") return "gating";
+    if (kind === "break") return "break";
+    return "restart";
+  }
+
   private getMovableSubgraph(node: GraphNode): GraphNode[] {
     const result: GraphNode[] = [];
     const visitedPaths = new Set<string>();
@@ -937,6 +1445,35 @@ export class GraphView extends BasesView {
     return {
       x: (event.clientX - rect.left) / this.graphZoom,
       y: (event.clientY - rect.top) / this.graphZoom,
+    };
+  }
+
+  private getGraphPointFromElement(
+    event: MouseEvent,
+    element: HTMLElement,
+  ): { x: number; y: number } {
+    const rect = element.getBoundingClientRect();
+    return {
+      x: (event.clientX - rect.left) / this.graphZoom,
+      y: (event.clientY - rect.top) / this.graphZoom,
+    };
+  }
+
+  private getGraphPointFromElementCenter(
+    element: HTMLElement,
+    svgEl: SVGSVGElement,
+    side: GraphAnchorSide,
+  ): GraphAnchorPoint {
+    const elementRect = element.getBoundingClientRect();
+    const svgRect = svgEl.getBoundingClientRect();
+    return {
+      side,
+      x:
+        (elementRect.left + elementRect.width / 2 - svgRect.left) /
+        this.graphZoom,
+      y:
+        (elementRect.top + elementRect.height / 2 - svgRect.top) /
+        this.graphZoom,
     };
   }
 
@@ -1157,13 +1694,13 @@ export class GraphView extends BasesView {
     if (edge.kind === "requirement-start") {
       await this.updateGraphParent(edge.to, null, edge.from);
     } else if (edge.kind === "requirement-return") {
-      await this.addGraphReference(edge.from, "hiddenReturn", edge.to);
+      await this.addGraphReference(edge.from, "graph_hidden_returns", edge.to);
     } else if (edge.kind === "gating") {
-      await this.removeGraphReference(edge.to, "dependsOn", edge.from);
+      await this.removeGraphReference(edge.to, "depends_on", edge.from);
     } else {
       await this.removeGraphReference(
         edge.from,
-        edge.kind === "break" ? "breaksTo" : "restartsTo",
+        edge.kind === "break" ? "breaks_to" : "restarts_to",
         edge.to,
       );
     }
@@ -1179,6 +1716,153 @@ export class GraphView extends BasesView {
       edge.kind === "requirement-return" ? "Hid return line" : "Deleted line",
     );
     this.render();
+  }
+
+  private async deleteGraphNode(node: GraphNode): Promise<void> {
+    const cleanedReferences = await this.cleanupReferencesToGraphNodes([node]);
+    await this.app.fileManager.trashFile(node.file);
+    this.graphEndpointAnchorOverrides.clear();
+    new Notice(
+      cleanedReferences > 0
+        ? `Moved "${node.title}" to trash and cleaned ${cleanedReferences} reference${cleanedReferences === 1 ? "" : "s"}`
+        : `Moved "${node.title}" to trash`,
+    );
+    this.render();
+  }
+
+  private async deleteDownstreamGraphNodes(node: GraphNode): Promise<void> {
+    const subtreeNodes = [node, ...this.getDownstreamGraphNodes(node)];
+
+    const cleanedReferences =
+      await this.cleanupReferencesToGraphNodes(subtreeNodes);
+    await Promise.all(
+      subtreeNodes.map((subtreeNode) =>
+        this.app.fileManager.trashFile(subtreeNode.file),
+      ),
+    );
+    this.graphEndpointAnchorOverrides.clear();
+    new Notice(
+      `Moved ${subtreeNodes.length} node${subtreeNodes.length === 1 ? "" : "s"} to trash${cleanedReferences > 0 ? ` and cleaned ${cleanedReferences} reference${cleanedReferences === 1 ? "" : "s"}` : ""}`,
+    );
+    this.render();
+  }
+
+  private getDownstreamGraphNodes(node: GraphNode): GraphNode[] {
+    const result: GraphNode[] = [];
+    const visitedPaths = new Set<string>([node.file.path]);
+    const queue = [...node.children, ...this.getGatedSuccessors(node)];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || visitedPaths.has(current.file.path)) continue;
+      visitedPaths.add(current.file.path);
+      result.push(current);
+      queue.push(...current.children, ...this.getGatedSuccessors(current));
+    }
+
+    return result;
+  }
+
+  private getGatedSuccessors(node: GraphNode): GraphNode[] {
+    const restartTargetPaths = new Set(
+      node.restartTargets.map((target) => target.file.path),
+    );
+    return node.successors.filter(
+      (successor) => !restartTargetPaths.has(successor.file.path),
+    );
+  }
+
+  private async cleanupReferencesToGraphNodes(
+    nodes: GraphNode[],
+  ): Promise<number> {
+    const identities = new Set<string>();
+    for (const node of nodes) {
+      for (const identity of this.getNodeIdentities(node)) {
+        identities.add(identity);
+      }
+    }
+    const deletedPaths = new Set(nodes.map((node) => node.file.path));
+    const candidates = this.visibleNodes.filter(
+      (candidate) => !deletedPaths.has(candidate.file.path),
+    );
+    let cleanedReferences = 0;
+
+    await Promise.all(
+      candidates.map((candidate) =>
+        this.app.fileManager.processFrontMatter(
+          candidate.file,
+          (frontmatter: Record<string, unknown>) => {
+            cleanedReferences += this.removeGraphNodeReferencesFromFrontmatter(
+              frontmatter,
+              identities,
+            );
+          },
+        ),
+      ),
+    );
+
+    return cleanedReferences;
+  }
+
+  private removeGraphNodeReferencesFromFrontmatter(
+    frontmatter: Record<string, unknown>,
+    identities: Set<string>,
+  ): number {
+    let removedCount = 0;
+
+    if (
+      "parent" in frontmatter &&
+      this.frontmatterReferenceMatchesIdentities(frontmatter.parent, identities)
+    ) {
+      delete frontmatter.parent;
+      removedCount++;
+    }
+
+    for (const relationKind of [
+      "depends_on",
+      "breaks_to",
+      "restarts_to",
+      "graph_hidden_returns",
+    ] as const) {
+      const propertyName = this.getGraphReferenceListPropertyName(
+        frontmatter,
+        relationKind,
+      );
+      if (!(propertyName in frontmatter)) continue;
+      const references = this.getFrontmatterReferenceList(
+        frontmatter[propertyName],
+      );
+      const nextReferences = references.filter(
+        (reference) => !this.referenceMatchesIdentities(reference, identities),
+      );
+      const removed = references.length - nextReferences.length;
+      if (removed === 0) continue;
+      removedCount += removed;
+      this.setFrontmatterReferenceList(
+        frontmatter,
+        propertyName,
+        nextReferences,
+      );
+    }
+
+    return removedCount;
+  }
+
+  private frontmatterReferenceMatchesIdentities(
+    value: unknown,
+    identities: Set<string>,
+  ): boolean {
+    return this.getFrontmatterReferenceList(value).some((reference) =>
+      this.referenceMatchesIdentities(reference, identities),
+    );
+  }
+
+  private referenceMatchesIdentities(
+    reference: string,
+    identities: Set<string>,
+  ): boolean {
+    const normalizedReference = this.normalizeReference(reference);
+    return normalizedReference !== null && identities.has(normalizedReference);
   }
 
   private async reassignGraphEdgeEndpoint(
@@ -1208,18 +1892,18 @@ export class GraphView extends BasesView {
       if (endpoint === "from") {
         await this.replaceGraphReference(
           edge.to,
-          "dependsOn",
+          "depends_on",
           edge.from,
           targetNode,
         );
       } else {
         await Promise.all([
-          this.removeGraphReference(edge.to, "dependsOn", edge.from),
-          this.addGraphReference(targetNode, "dependsOn", edge.from),
+          this.removeGraphReference(edge.to, "depends_on", edge.from),
+          this.addGraphReference(targetNode, "depends_on", edge.from),
         ]);
       }
     } else {
-      const relationKind = edge.kind === "break" ? "breaksTo" : "restartsTo";
+      const relationKind = edge.kind === "break" ? "breaks_to" : "restarts_to";
       if (endpoint === "from") {
         await Promise.all([
           this.removeGraphReference(edge.from, relationKind, edge.to),
@@ -1355,29 +2039,16 @@ export class GraphView extends BasesView {
   private getGraphParentPropertyName(
     frontmatter: Record<string, unknown>,
   ): string {
-    return (
-      ["parent", "parent_task", "parentTask", "feature"].find(
-        (propertyName) => propertyName in frontmatter,
-      ) ?? "parent"
-    );
+    return "parent";
   }
 
   private getGraphReferenceListPropertyName(
     frontmatter: Record<string, unknown>,
     relationKind: GraphReferenceListKind,
   ): string {
-    const propertyNames =
-      relationKind === "dependsOn"
-        ? ["depends_on", "dependsOn"]
-        : relationKind === "breaksTo"
-          ? ["breaks_to", "breaksTo"]
-          : relationKind === "restartsTo"
-            ? ["restarts_to", "restartsTo"]
-            : [GRAPH_HIDDEN_RETURNS_PROPERTY];
-    return (
-      propertyNames.find((propertyName) => propertyName in frontmatter) ??
-      propertyNames[0]
-    );
+    return relationKind === "graph_hidden_returns"
+      ? GRAPH_HIDDEN_RETURNS_PROPERTY
+      : relationKind;
   }
 
   private getFrontmatterReferenceList(value: unknown): string[] {
@@ -1460,54 +2131,252 @@ export class GraphView extends BasesView {
     this.render();
   }
 
-  private showCreateMenu(
-    event: MouseEvent,
-    sourceNode: GraphNode,
-    relation: GraphRelationKind,
-  ): void {
+  private showCanvasCreateMenu(event: MouseEvent, canvasEl: HTMLElement): void {
+    const targetEl = event.target instanceof Element ? event.target : null;
+    if (
+      targetEl?.closest(
+        ".base-board-graph-node, .base-board-graph-edge-hit-target, .base-board-graph-edge-handle, button, input, textarea, select",
+      )
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const point = this.getGraphPointFromElement(event, canvasEl);
     const menu = new Menu();
+    this.addGraphCreateMenuItems(menu, null, point);
+
+    menu.showAtMouseEvent(event);
+  }
+
+  private addGraphCreateMenuItems(
+    menu: Menu,
+    sourceNode: GraphNode | null,
+    point?: { x: number; y: number },
+  ): void {
     menu.addItem((item) => {
       item
-        .setTitle(
-          relation === "requirement"
-            ? "Add requirement"
-            : "Add gated successor",
-        )
+        .setTitle("Add Node")
         .setIcon("lucide-plus")
         .onClick(() => {
-          this.promptCreateRelatedNode(sourceNode, relation);
+          this.showAddNodeModal(sourceNode, point);
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Add Template")
+        .setIcon("lucide-layout-template")
+        .onClick(() => {
+          this.showAddTemplateModal(sourceNode, point);
+        });
+    });
+  }
+
+  private showAddNodeModal(
+    sourceNode: GraphNode | null,
+    point?: { x: number; y: number },
+  ): void {
+    new GraphNodeModal(
+      this.app,
+      sourceNode ? "Add child node" : "Add node",
+      (value) => {
+        if (sourceNode) {
+          void this.createChildNode(sourceNode, value.title, value.type);
+        } else if (point) {
+          void this.createStandaloneNode(value.type, value.title, point);
+        }
+      },
+    ).open();
+  }
+
+  private showAddTemplateModal(
+    sourceNode: GraphNode | null,
+    point?: { x: number; y: number },
+  ): void {
+    const templates = sourceNode
+      ? this.getScopedTemplateDefinitions(sourceNode)
+      : GRAPH_TEMPLATE_DEFINITIONS;
+    new GraphTemplateModal(this.app, templates, (template) => {
+      if (sourceNode) {
+        this.promptInsertTemplate(sourceNode, template.id);
+      } else if (point) {
+        this.promptInsertRootTemplate(template.id, point);
+      }
+    }).open();
+  }
+
+  private async createStandaloneNode(
+    type: string,
+    title: string,
+    point: { x: number; y: number },
+  ): Promise<void> {
+    const safeTitle = title.trim();
+    if (!safeTitle) return;
+    await this.createTemplateNode({
+      title: safeTitle,
+      type,
+      workflow: this.getWorkflowForNodeType(type),
+      status: type === "feature" ? "In Progress" : "To Do",
+      tags: this.visibleNodes[0] ? this.getTags(this.visibleNodes[0].file) : [],
+      x: point.x,
+      y: point.y,
+    });
+    new Notice(`Created ${safeTitle}`);
+  }
+
+  private async createChildNode(
+    sourceNode: GraphNode,
+    title: string,
+    type: string,
+  ): Promise<void> {
+    const safeTitle = title.trim();
+    if (!safeTitle) return;
+    await this.createTemplateNode({
+      title: safeTitle,
+      type,
+      workflow: this.getWorkflowForNodeType(type),
+      status: type === "feature" ? "In Progress" : "To Do",
+      parent: this.getWikiLink(sourceNode.file),
+      tags: this.getTags(sourceNode.file),
+    });
+    new Notice(`Created ${safeTitle}`);
+  }
+
+  private promptInsertRootTemplate(
+    template: GraphWorkflowTemplate,
+    point: { x: number; y: number },
+  ): void {
+    const title = this.getRootTemplatePromptTitle(template);
+    const placeholder = this.getRootTemplatePlaceholder(template);
+    new InputModal(
+      this.app,
+      title,
+      placeholder,
+      (value) => {
+        void this.insertRootTemplate(template, value, point);
+      },
+      placeholder,
+    ).open();
+  }
+
+  private getRootTemplatePromptTitle(template: GraphWorkflowTemplate): string {
+    return this.getTemplatePromptTitle(template);
+  }
+
+  private getRootTemplatePlaceholder(template: GraphWorkflowTemplate): string {
+    if (template === "iteration") return "Iteration 1";
+    if (template === "dev") return "dev";
+    if (template === "rollout-repo") return "rollout";
+    if (template === "ring-flagged" || template === "ring-basic") {
+      return "ring";
+    }
+    return "New feature";
+  }
+
+  private async insertRootTemplate(
+    template: GraphWorkflowTemplate,
+    rawTitle: string,
+    point: { x: number; y: number },
+  ): Promise<void> {
+    const title = rawTitle.trim();
+    if (!title) return;
+    try {
+      if (template === "feature-simple" || template === "feature-detailed") {
+        await this.insertFeatureTemplate(null, title, {
+          detailed: template === "feature-detailed",
+          point,
+        });
+      } else if (template === "iteration") {
+        await this.insertIterationTemplate(null, title, { point });
+      } else if (template === "dev") {
+        await this.insertDevTemplate(null, title, { point });
+      } else if (template === "rollout-repo") {
+        await this.insertRolloutRepoTemplate(null, title, { point });
+      } else if (template === "ring-flagged") {
+        await this.insertRingStepsTemplate(null, title, true, { point });
+      } else {
+        await this.insertRingStepsTemplate(null, title, false, { point });
+      }
+    } catch (error) {
+      console.error("Failed to insert graph template", error);
+      new Notice(`Failed to insert ${title}`);
+      return;
+    }
+    new Notice(`Inserted ${title}`);
+  }
+
+  private showNodeContextMenu(event: MouseEvent, sourceNode: GraphNode): void {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const menu = new Menu();
+    this.addGraphCreateMenuItems(menu, sourceNode);
+    menu.addSeparator();
+    const subtreeCount = 1 + this.getDownstreamGraphNodes(sourceNode).length;
+    menu.addItem((item) => {
+      item
+        .setTitle(`Delete node and descendants (${subtreeCount})`)
+        .setIcon("lucide-trash")
+        .onClick(() => {
+          void this.deleteDownstreamGraphNodes(sourceNode);
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Delete node")
+        .setIcon("lucide-trash-2")
+        .onClick(() => {
+          void this.deleteGraphNode(sourceNode);
         });
     });
 
-    if (relation === "requirement") {
-      menu.addSeparator();
-      menu.addItem((item) => {
-        item
-          .setTitle("Insert rollout attempt")
-          .setIcon("lucide-radio-tower")
-          .onClick(() => {
-            this.promptInsertTemplate(sourceNode, "rollout-attempt");
-          });
-      });
-      menu.addItem((item) => {
-        item
-          .setTitle("Insert bug recovery workflow")
-          .setIcon("lucide-bug")
-          .onClick(() => {
-            this.promptInsertTemplate(sourceNode, "bug-recovery");
-          });
-      });
-      menu.addItem((item) => {
-        item
-          .setTitle("Insert iteration")
-          .setIcon("lucide-refresh-cw")
-          .onClick(() => {
-            this.promptInsertTemplate(sourceNode, "iteration");
-          });
-      });
+    menu.showAtMouseEvent(event);
+  }
+
+  private getScopedTemplateDefinitions(
+    node: GraphNode,
+  ): GraphTemplateDefinition[] {
+    const nodeType = node.nodeType?.toLowerCase() ?? "";
+    const workflow = node.workflow?.toLowerCase() ?? "";
+    const title = node.title.toLowerCase();
+
+    if (nodeType === "feature") {
+      return this.getGraphTemplateDefinitionsById(["iteration"]);
+    }
+    if (nodeType === "iteration") {
+      return this.getGraphTemplateDefinitionsById(["dev", "rollout-repo"]);
+    }
+    if (nodeType === "dev" || workflow === "dev" || workflow === "loop") {
+      return this.getGraphTemplateDefinitionsById(["dev"]);
+    }
+    if (nodeType === "rollout" || workflow === "rollout") {
+      return this.getGraphTemplateDefinitionsById(["rollout-repo"]);
+    }
+    if (
+      ["stage", "canary", "pilot", "broad"].some((ring) => title.includes(ring))
+    ) {
+      return this.getGraphTemplateDefinitionsById([
+        "ring-flagged",
+        "ring-basic",
+      ]);
     }
 
-    menu.showAtMouseEvent(event);
+    return GRAPH_TEMPLATE_DEFINITIONS;
+  }
+
+  private getGraphTemplateDefinitionsById(
+    ids: GraphWorkflowTemplate[],
+  ): GraphTemplateDefinition[] {
+    return ids
+      .map((id) =>
+        GRAPH_TEMPLATE_DEFINITIONS.find((template) => template.id === id),
+      )
+      .filter(
+        (template): template is GraphTemplateDefinition =>
+          template !== undefined,
+      );
   }
 
   private promptInsertTemplate(
@@ -1528,19 +2397,50 @@ export class GraphView extends BasesView {
   }
 
   private getTemplatePromptTitle(template: GraphWorkflowTemplate): string {
-    if (template === "rollout-attempt") return "Insert rollout attempt";
-    if (template === "bug-recovery") return "Insert bug recovery workflow";
-    return "Insert iteration";
+    if (template === "feature-simple") return "Insert simple feature";
+    if (template === "feature-detailed") return "Insert detailed feature";
+    if (template === "dev") return "Insert dev template";
+    if (template === "rollout-repo") return "Insert rollout repo";
+    if (template === "ring-flagged") return "Insert flagged ring steps";
+    if (template === "ring-basic") return "Insert basic ring steps";
+    return "Insert next iteration";
   }
 
   private getTemplatePlaceholder(
     template: GraphWorkflowTemplate,
     sourceNode: GraphNode,
   ): string {
-    if (template === "rollout-attempt")
-      return `${sourceNode.title} rollout attempt`;
-    if (template === "bug-recovery") return `${sourceNode.title} bug recovery`;
-    return `${sourceNode.title} iteration`;
+    if (template === "feature-simple" || template === "feature-detailed") {
+      return `${sourceNode.title} feature`;
+    }
+    if (template === "dev") return `${sourceNode.title} dev`;
+    if (template === "rollout-repo") return `${sourceNode.title} repo`;
+    if (template === "ring-flagged" || template === "ring-basic") {
+      return sourceNode.title;
+    }
+    return `${sourceNode.title} Iteration ${this.getNextIterationNumber(sourceNode)}`;
+  }
+
+  private getNextIterationNumber(sourceNode: GraphNode): number {
+    const iterationNumbers = sourceNode.children
+      .map((child) => this.getIterationNumber(child))
+      .filter((value): value is number => value !== null);
+    return iterationNumbers.length > 0 ? Math.max(...iterationNumbers) + 1 : 1;
+  }
+
+  private getIterationNumber(node: GraphNode): number | null {
+    const frontmatter = this.getFrontmatter(node.file);
+    const rawNumber = frontmatter?.iteration_number;
+    if (typeof rawNumber === "number" && Number.isFinite(rawNumber)) {
+      return rawNumber;
+    }
+    if (typeof rawNumber === "string") {
+      const parsed = Number.parseInt(rawNumber, 10);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+
+    const match = node.title.match(/\biteration\s+(\d+)\b/i);
+    return match ? Number.parseInt(match[1], 10) : null;
   }
 
   private async insertWorkflowTemplate(
@@ -1551,125 +2451,388 @@ export class GraphView extends BasesView {
     const title = rawTitle.trim();
     if (!title) return;
 
-    if (template === "rollout-attempt") {
-      await this.insertRolloutAttemptTemplate(sourceNode, title);
-    } else if (template === "bug-recovery") {
-      await this.insertBugRecoveryTemplate(sourceNode, title);
-    } else {
+    if (template === "feature-simple" || template === "feature-detailed") {
+      await this.insertFeatureTemplate(sourceNode, title, {
+        detailed: template === "feature-detailed",
+      });
+    } else if (template === "iteration") {
       await this.insertIterationTemplate(sourceNode, title);
+    } else if (template === "dev") {
+      await this.insertDevTemplate(sourceNode, title);
+    } else if (template === "rollout-repo") {
+      await this.insertRolloutRepoTemplate(sourceNode, title);
+    } else if (template === "ring-flagged") {
+      await this.insertRingStepsTemplate(sourceNode, title, true);
+    } else {
+      await this.insertRingStepsTemplate(sourceNode, title, false);
     }
 
     new Notice(`Inserted ${title}`);
   }
 
-  private async insertRolloutAttemptTemplate(
-    sourceNode: GraphNode,
+  private async insertFeatureTemplate(
+    sourceNode: GraphNode | null,
     title: string,
+    options: { detailed: boolean; point?: { x: number; y: number } },
   ): Promise<void> {
-    const workflow = await this.createTemplateNode({
+    const origin = this.getTemplateOrigin(sourceNode, options.point);
+    const feature = await this.createTemplateNode({
       title,
-      type: "workflow",
-      workflow: "rollout-attempt",
+      type: "feature",
       status: "In Progress",
-      parent: this.getWikiLink(sourceNode.file),
-      tags: this.getTags(sourceNode.file),
+      parent: sourceNode ? this.getWikiLink(sourceNode.file) : undefined,
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      x: origin.x,
+      y: origin.y,
     });
-    const stage = await this.createTemplateNode({
-      title: `${title} - Stage`,
-      type: "task",
-      status: "To Do",
-      parent: this.getWikiLink(workflow),
-      tags: this.getTags(sourceNode.file),
-    });
-    const canary = await this.createTemplateNode({
-      title: `${title} - Canary`,
-      type: "task",
-      status: "To Do",
-      parent: this.getWikiLink(workflow),
-      dependsOn: [this.getWikiLink(stage)],
-      tags: this.getTags(sourceNode.file),
-    });
-    const pilot = await this.createTemplateNode({
-      title: `${title} - Pilot`,
-      type: "task",
-      status: "To Do",
-      parent: this.getWikiLink(workflow),
-      dependsOn: [this.getWikiLink(canary)],
-      tags: this.getTags(sourceNode.file),
-    });
-    await this.createTemplateNode({
-      title: `${title} - Broad`,
-      type: "task",
-      status: "To Do",
-      parent: this.getWikiLink(workflow),
-      dependsOn: [this.getWikiLink(pilot)],
-      tags: this.getTags(sourceNode.file),
-    });
-  }
 
-  private async insertBugRecoveryTemplate(
-    sourceNode: GraphNode,
-    title: string,
-  ): Promise<void> {
-    const workflow = await this.createTemplateNode({
+    const featureNode = this.getSyntheticTemplateNode(
+      feature,
       title,
-      type: "workflow",
-      workflow: "bug-recovery",
-      status: "In Progress",
-      parent: this.getWikiLink(sourceNode.file),
-      tags: this.getTags(sourceNode.file),
-    });
-    const mitigate = await this.createTemplateNode({
-      title: `${title} - Disable feature`,
-      type: "task",
+      "feature",
+    );
+    const dev = await this.createTemplateNode({
+      title: `${title} - dev`,
+      type: "dev",
+      workflow: "dev",
       status: "To Do",
-      parent: this.getWikiLink(workflow),
-      tags: this.getTags(sourceNode.file),
+      parent: this.getWikiLink(feature),
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, -0.5, 1),
     });
-    const investigate = await this.createTemplateNode({
-      title: `${title} - Investigate bug`,
-      type: "task",
+
+    if (options.detailed) {
+      await this.insertDevTemplate(
+        this.getSyntheticTemplateNode(dev, `${title} - dev`, "dev", "dev"),
+        `${title} - dev`,
+      );
+    }
+
+    const rollout = await this.createTemplateNode({
+      title: `${title} - rollout`,
+      type: "rollout",
+      workflow: "rollout",
       status: "To Do",
-      parent: this.getWikiLink(workflow),
-      tags: this.getTags(sourceNode.file),
+      parent: this.getWikiLink(feature),
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, 0.5, 1),
     });
-    const fix = await this.createTemplateNode({
-      title: `${title} - Fix and unit tests`,
-      type: "task",
-      status: "To Do",
-      parent: this.getWikiLink(workflow),
-      dependsOn: [this.getWikiLink(investigate)],
-      tags: this.getTags(sourceNode.file),
-    });
-    const review = await this.createTemplateNode({
-      title: `${title} - Review fix`,
-      type: "task",
-      status: "To Do",
-      parent: this.getWikiLink(workflow),
-      dependsOn: [this.getWikiLink(fix), this.getWikiLink(mitigate)],
-      tags: this.getTags(sourceNode.file),
-    });
-    await this.createTemplateNode({
-      title: `${title} - Iterate if necessary`,
-      type: "task",
-      status: "To Do",
-      parent: this.getWikiLink(workflow),
-      dependsOn: [this.getWikiLink(review)],
-      tags: this.getTags(sourceNode.file),
-    });
+
+    if (options.detailed) {
+      await this.insertRolloutRepoTemplate(
+        this.getSyntheticTemplateNode(
+          rollout,
+          `${title} - rollout`,
+          "rollout",
+          "rollout",
+        ),
+        `${title} - repo`,
+      );
+    }
+
+    featureNode.children = [];
   }
 
   private async insertIterationTemplate(
-    sourceNode: GraphNode,
+    sourceNode: GraphNode | null,
     title: string,
-  ): Promise<void> {
-    await this.createTemplateNode({
+    options: { point?: { x: number; y: number } } = {},
+  ): Promise<TFile> {
+    const origin = this.getTemplateOrigin(sourceNode, options.point);
+    const iterationNumber = sourceNode
+      ? this.getNextIterationNumber(sourceNode)
+      : 1;
+    const iteration = await this.createTemplateNode({
       title,
       type: "iteration",
       status: "To Do",
-      parent: this.getWikiLink(sourceNode.file),
-      tags: this.getTags(sourceNode.file),
+      parent: sourceNode ? this.getWikiLink(sourceNode.file) : undefined,
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      x: origin.x,
+      y: origin.y,
     });
+    await this.app.fileManager.processFrontMatter(
+      iteration,
+      (frontmatter: Record<string, unknown>) => {
+        frontmatter.iteration_number = iterationNumber;
+      },
+    );
+
+    await this.createTemplateNode({
+      title: `${title} - dev`,
+      type: "dev",
+      workflow: "dev",
+      status: "To Do",
+      parent: this.getWikiLink(iteration),
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, -0.5, 1),
+    });
+
+    await this.createTemplateNode({
+      title: `${title} - rollout`,
+      type: "rollout",
+      workflow: "rollout",
+      status: "To Do",
+      parent: this.getWikiLink(iteration),
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, 0.5, 1),
+    });
+
+    return iteration;
+  }
+
+  private async insertDevTemplate(
+    sourceNode: GraphNode | null,
+    title: string,
+    options: { point?: { x: number; y: number } } = {},
+  ): Promise<void> {
+    const origin = this.getTemplateOrigin(sourceNode, options.point);
+    const parentNode =
+      sourceNode &&
+      (sourceNode.nodeType?.toLowerCase() === "dev" ||
+        sourceNode.workflow?.toLowerCase() === "dev")
+        ? sourceNode
+        : this.getSyntheticTemplateNode(
+            await this.createTemplateNode({
+              title,
+              type: "dev",
+              workflow: "dev",
+              status: "To Do",
+              parent: sourceNode
+                ? this.getWikiLink(sourceNode.file)
+                : undefined,
+              tags: sourceNode
+                ? this.getTags(sourceNode.file)
+                : this.getRootTags(),
+              x: origin.x,
+              y: origin.y,
+            }),
+            title,
+            "dev",
+            "dev",
+          );
+
+    const design = await this.createTemplateNode({
+      title: `${title} - design`,
+      type: "design",
+      status: "To Do",
+      parent: this.getWikiLink(parentNode.file),
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, -1, 1),
+    });
+    const implementation = await this.createTemplateNode({
+      title: `${title} - implementation`,
+      type: "implementation",
+      status: "To Do",
+      parent: this.getWikiLink(parentNode.file),
+      dependsOn: [this.getWikiLink(design)],
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, 0, 1),
+    });
+    await this.createTemplateNode({
+      title: `${title} - review`,
+      type: "review",
+      status: "To Do",
+      parent: this.getWikiLink(parentNode.file),
+      dependsOn: [this.getWikiLink(implementation)],
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, 1, 1),
+    });
+  }
+
+  private async insertRolloutRepoTemplate(
+    sourceNode: GraphNode | null,
+    title: string,
+    options: { point?: { x: number; y: number } } = {},
+  ): Promise<TFile> {
+    const origin = this.getTemplateOrigin(sourceNode, options.point);
+    const rolloutNode =
+      sourceNode &&
+      (sourceNode.nodeType?.toLowerCase() === "rollout" ||
+        sourceNode.workflow?.toLowerCase() === "rollout")
+        ? sourceNode
+        : this.getSyntheticTemplateNode(
+            await this.createTemplateNode({
+              title,
+              type: "rollout",
+              workflow: "rollout",
+              status: "To Do",
+              parent: sourceNode
+                ? this.getWikiLink(sourceNode.file)
+                : undefined,
+              tags: sourceNode
+                ? this.getTags(sourceNode.file)
+                : this.getRootTags(),
+              x: origin.x,
+              y: origin.y,
+            }),
+            title,
+            "rollout",
+            "rollout",
+          );
+
+    const repo = await this.createTemplateNode({
+      title: `${title} - repo`,
+      type: "repo",
+      status: "To Do",
+      parent: this.getWikiLink(rolloutNode.file),
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, 0, 1),
+    });
+
+    let previousRing: TFile | null = null;
+    const rings = ["stage", "canary", "pilot", "broad"];
+    for (let index = 0; index < rings.length; index++) {
+      const ring = rings[index];
+      const ringFile = await this.createTemplateNode({
+        title: `${title} - ${ring}`,
+        type: ring,
+        status: "To Do",
+        parent: this.getWikiLink(repo),
+        dependsOn: previousRing ? [this.getWikiLink(previousRing)] : undefined,
+        tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+        ...this.getTemplateChildPosition(origin, index - 1.5, 2),
+      });
+      previousRing = ringFile;
+    }
+
+    return repo;
+  }
+
+  private async insertRingStepsTemplate(
+    sourceNode: GraphNode | null,
+    title: string,
+    includeFlag: boolean,
+    options: { point?: { x: number; y: number } } = {},
+  ): Promise<void> {
+    const origin = this.getTemplateOrigin(sourceNode, options.point);
+    const ringNode = sourceNode
+      ? sourceNode
+      : this.getSyntheticTemplateNode(
+          await this.createTemplateNode({
+            title,
+            type: "ring",
+            status: "To Do",
+            tags: this.getRootTags(),
+            x: origin.x,
+            y: origin.y,
+          }),
+          title,
+          "ring",
+        );
+
+    const awaitBuild = await this.createTemplateNode({
+      title: `${title} - await build rollout`,
+      type: "await",
+      status: "To Do",
+      parent: this.getWikiLink(ringNode.file),
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, includeFlag ? -1.5 : -0.5, 1),
+    });
+
+    let previous = awaitBuild;
+    if (includeFlag) {
+      const enableFlag = await this.createTemplateNode({
+        title: `${title} - enable feature flag`,
+        type: "enable",
+        status: "To Do",
+        parent: this.getWikiLink(ringNode.file),
+        dependsOn: [this.getWikiLink(previous)],
+        tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+        ...this.getTemplateChildPosition(origin, -0.5, 1),
+      });
+      previous = await this.createTemplateNode({
+        title: `${title} - await feature flag rollout`,
+        type: "await",
+        status: "To Do",
+        parent: this.getWikiLink(ringNode.file),
+        dependsOn: [this.getWikiLink(enableFlag)],
+        tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+        ...this.getTemplateChildPosition(origin, 0.5, 1),
+      });
+    }
+
+    await this.createTemplateNode({
+      title: `${title} - verify`,
+      type: "verify",
+      status: "To Do",
+      parent: this.getWikiLink(ringNode.file),
+      dependsOn: [this.getWikiLink(previous)],
+      tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      ...this.getTemplateChildPosition(origin, includeFlag ? 1.5 : 0.5, 1),
+    });
+  }
+
+  private getSyntheticTemplateNode(
+    file: TFile,
+    title: string,
+    nodeType: string,
+    workflow: string | null = null,
+  ): GraphNode {
+    return {
+      entry: {} as BasesEntry,
+      file,
+      title,
+      status: "To Do",
+      parentKey: null,
+      parentValue: null,
+      dependsOnKeys: [],
+      breaksToKeys: [],
+      restartsToKeys: [],
+      hiddenReturnKeys: [],
+      nodeType,
+      workflow,
+      collapsed: false,
+      descendantCount: 0,
+      children: [],
+      successors: [],
+      predecessors: [],
+      breakTargets: [],
+      restartTargets: [],
+      x: 0,
+      y: 0,
+      savedX: null,
+      savedY: null,
+      state: "idle",
+    };
+  }
+
+  private getWorkflowForNodeType(type: string): string | undefined {
+    if (type === "dev" || type === "rollout") return type;
+    return undefined;
+  }
+
+  private getTemplateOrigin(
+    sourceNode: GraphNode | null,
+    point: { x: number; y: number } | undefined,
+  ): { x: number; y: number } {
+    if (point) return point;
+    if (!sourceNode) return { x: EDGE_MARGIN, y: EDGE_MARGIN };
+    return {
+      x: sourceNode.x,
+      y:
+        sourceNode.y +
+        this.getRenderedGraphNodeSize(sourceNode).height +
+        GRAPH_TEMPLATE_CHILD_Y_STEP,
+    };
+  }
+
+  private getTemplateChildPosition(
+    origin: { x: number; y: number },
+    horizontalSlot: number,
+    depth: number,
+  ): { x: number; y: number } {
+    return {
+      x: Math.max(
+        EDGE_MARGIN,
+        origin.x + horizontalSlot * GRAPH_TEMPLATE_CHILD_X_STEP,
+      ),
+      y: Math.max(EDGE_MARGIN, origin.y + depth * GRAPH_TEMPLATE_CHILD_Y_STEP),
+    };
+  }
+
+  private getRootTags(): string[] {
+    return this.visibleNodes[0] ? this.getTags(this.visibleNodes[0].file) : [];
   }
 
   private async createTemplateNode(options: {
@@ -1680,6 +2843,8 @@ export class GraphView extends BasesView {
     workflow?: string;
     dependsOn?: string[];
     tags?: string[];
+    x?: number;
+    y?: number;
   }): Promise<TFile> {
     const safeTitle = sanitizeFilename(options.title.trim());
     const folder = this.visibleNodes[0]?.file.parent?.path ?? "";
@@ -1698,6 +2863,12 @@ export class GraphView extends BasesView {
     }
     if (options.parent) {
       lines.push(`parent: ${this.formatYamlScalar(options.parent)}`);
+    }
+    if (typeof options.x === "number" && Number.isFinite(options.x)) {
+      lines.push(`graph_x: ${Math.round(options.x)}`);
+    }
+    if (typeof options.y === "number" && Number.isFinite(options.y)) {
+      lines.push(`graph_y: ${Math.round(options.y)}`);
     }
     if (options.dependsOn && options.dependsOn.length > 0) {
       lines.push("depends_on:");
@@ -1729,7 +2900,7 @@ export class GraphView extends BasesView {
     const title =
       relation === "requirement" ? "Add requirement" : "Add gated successor";
     const placeholder =
-      relation === "requirement" ? "Debug exception" : "Canary flighting";
+      relation === "requirement" ? "Debug exception" : "Canary rollout";
     new InputModal(this.app, title, placeholder, (value) => {
       void this.createRelatedNode(sourceNode, relation, value);
     }).open();
@@ -2593,12 +3764,7 @@ export class GraphView extends BasesView {
 
   private getParentRawValue(file: TFile): unknown {
     const frontmatter = this.getFrontmatter(file);
-    return (
-      frontmatter?.parent ??
-      frontmatter?.parent_task ??
-      frontmatter?.parentTask ??
-      frontmatter?.feature
-    );
+    return frontmatter?.parent;
   }
 
   private getNodeType(file: TFile): string | null {
@@ -2618,23 +3784,17 @@ export class GraphView extends BasesView {
 
   private getDependsOnKeys(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
-    return this.normalizeReferences(
-      frontmatter?.depends_on ?? frontmatter?.dependsOn,
-    );
+    return this.normalizeReferences(frontmatter?.depends_on);
   }
 
   private getBreaksToKeys(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
-    return this.normalizeReferences(
-      frontmatter?.breaks_to ?? frontmatter?.breaksTo,
-    );
+    return this.normalizeReferences(frontmatter?.breaks_to);
   }
 
   private getRestartsToKeys(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
-    return this.normalizeReferences(
-      frontmatter?.restarts_to ?? frontmatter?.restartsTo,
-    );
+    return this.normalizeReferences(frontmatter?.restarts_to);
   }
 
   private getHiddenReturnKeys(file: TFile): string[] {
@@ -2646,7 +3806,7 @@ export class GraphView extends BasesView {
 
   private getTags(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
-    const rawTags = frontmatter?.tags ?? frontmatter?.tag;
+    const rawTags = frontmatter?.tags;
     if (Array.isArray(rawTags)) {
       return rawTags.filter((tag): tag is string => typeof tag === "string");
     }
@@ -2728,7 +3888,7 @@ export class GraphView extends BasesView {
 
   private getOrder(file: TFile): number {
     const frontmatter = this.getFrontmatter(file);
-    const graphOrder = frontmatter?.graph_order ?? frontmatter?.graphOrder;
+    const graphOrder = frontmatter?.graph_order;
     if (typeof graphOrder === "number") return graphOrder;
     const kanbanOrder = frontmatter?.[ORDER_PROPERTY];
     return typeof kanbanOrder === "number"
@@ -2817,16 +3977,25 @@ export class GraphView extends BasesView {
     folder: string,
     title: string,
   ): Promise<string> {
-    const basePath = folder ? `${folder}/${title}.md` : `${title}.md`;
+    const normalizedFolder = this.normalizeFolderPath(folder);
+    const basePath = normalizedFolder
+      ? `${normalizedFolder}/${title}.md`
+      : `${title}.md`;
     if (!this.app.vault.getAbstractFileByPath(basePath)) return basePath;
 
     for (let suffix = 2; suffix < 1000; suffix++) {
-      const candidate = folder
-        ? `${folder}/${title} ${suffix}.md`
+      const candidate = normalizedFolder
+        ? `${normalizedFolder}/${title} ${suffix}.md`
         : `${title} ${suffix}.md`;
       if (!this.app.vault.getAbstractFileByPath(candidate)) return candidate;
     }
     throw new Error(`Unable to find available file path for ${title}`);
+  }
+
+  private normalizeFolderPath(folder: string): string {
+    const trimmed = folder.trim();
+    if (trimmed === "/" || trimmed === "\\") return "";
+    return trimmed.replace(/[\\/]+$/g, "");
   }
 
   private getWikiLink(file: TFile): string {
@@ -2845,5 +4014,147 @@ export class GraphView extends BasesView {
 
   private formatYamlScalar(value: string): string {
     return JSON.stringify(value);
+  }
+}
+
+class GraphNodeModal extends Modal {
+  private titleValue = "";
+  private typeValue = "";
+  private submitButtonEl: HTMLButtonElement | null = null;
+
+  constructor(
+    app: App,
+    private modalTitle: string,
+    private onSubmit: (value: { title: string; type: string }) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("base-board-graph-node-modal");
+    contentEl.createEl("h3", { text: this.modalTitle });
+
+    new Setting(contentEl).setName("Name").addText((text) => {
+      text.setPlaceholder("Node name");
+      text.onChange((value) => {
+        this.titleValue = value.trim();
+        this.updateSubmitState();
+      });
+      window.setTimeout(() => {
+        text.inputEl.focus();
+        text.inputEl.addEventListener("keydown", (event: KeyboardEvent) => {
+          if (event.key !== "Enter") return;
+          event.preventDefault();
+          this.submit();
+        });
+      }, 50);
+    });
+
+    new Setting(contentEl).setName("Type").addDropdown((dropdown) => {
+      dropdown.addOption("", "Select type");
+      for (const type of GRAPH_NODE_TYPE_OPTIONS) {
+        dropdown.addOption(type, type);
+      }
+      dropdown.onChange((value) => {
+        this.typeValue = value;
+        this.updateSubmitState();
+      });
+    });
+
+    new Setting(contentEl).addButton((button) => {
+      button
+        .setButtonText("Add")
+        .setCta()
+        .onClick(() => this.submit());
+      this.submitButtonEl = button.buttonEl;
+      this.updateSubmitState();
+    });
+  }
+
+  private updateSubmitState(): void {
+    if (!this.submitButtonEl) return;
+    this.submitButtonEl.disabled = !this.titleValue || !this.typeValue;
+  }
+
+  private submit(): void {
+    if (!this.titleValue || !this.typeValue) return;
+    this.onSubmit({ title: this.titleValue, type: this.typeValue });
+    this.close();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+class GraphTemplateModal extends Modal {
+  private selectedTemplate: GraphTemplateDefinition;
+  private previewEl: HTMLElement | null = null;
+
+  constructor(
+    app: App,
+    private templates: GraphTemplateDefinition[],
+    private onChoose: (template: GraphTemplateDefinition) => void,
+  ) {
+    super(app);
+    this.selectedTemplate = templates[0] ?? GRAPH_TEMPLATE_DEFINITIONS[0];
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("base-board-graph-template-modal");
+    contentEl.createEl("h3", { text: "Add Template" });
+
+    const bodyEl = contentEl.createDiv({
+      cls: "base-board-graph-template-modal-body",
+    });
+    const listEl = bodyEl.createDiv({ cls: "base-board-graph-template-list" });
+    this.previewEl = bodyEl.createDiv({
+      cls: "base-board-graph-template-preview",
+    });
+
+    for (const template of this.templates) {
+      const optionEl = listEl.createEl("button", {
+        cls: "base-board-graph-template-option",
+        attr: { type: "button" },
+      });
+      setIcon(
+        optionEl.createSpan({ cls: "base-board-graph-template-option-icon" }),
+        template.icon,
+      );
+      optionEl.createSpan({ text: template.name });
+      optionEl.addEventListener("mouseenter", () =>
+        this.renderPreview(template),
+      );
+      optionEl.addEventListener("focus", () => this.renderPreview(template));
+      optionEl.addEventListener("click", () => {
+        this.onChoose(template);
+        this.close();
+      });
+    }
+
+    this.renderPreview(this.selectedTemplate);
+  }
+
+  private renderPreview(template: GraphTemplateDefinition): void {
+    this.selectedTemplate = template;
+    if (!this.previewEl) return;
+    this.previewEl.empty();
+    this.previewEl.createDiv({
+      cls: "base-board-graph-template-preview-title",
+      text: template.name,
+    });
+    const treeEl = this.previewEl.createEl("pre", {
+      cls: "base-board-graph-template-preview-tree",
+      text: template.preview.join("\n"),
+    });
+    treeEl.setAttr("aria-label", `${template.name} preview`);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }

@@ -1072,17 +1072,13 @@ export class KanbanView extends BasesView implements HoverParent {
 
   private getParentKey(file: TFile): string | null {
     const frontmatter = this.getFrontmatter(file);
-    const value =
-      frontmatter?.parent ??
-      frontmatter?.parent_task ??
-      frontmatter?.parentTask ??
-      frontmatter?.feature;
+    const value = frontmatter?.parent;
     return this.normalizeReference(value);
   }
 
   private getDependsOnKeys(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
-    const value = frontmatter?.depends_on ?? frontmatter?.dependsOn;
+    const value = frontmatter?.depends_on;
     return this.normalizeReferences(value);
   }
 

@@ -69,24 +69,14 @@ const FILE_PROPS_TO_SKIP = new Set([
   "tags",
 ]);
 
-const HIERARCHY_PROPS = new Set([
-  "parent",
-  "parent_task",
-  "parentTask",
-  "feature",
-]);
+const HIERARCHY_PROPS = new Set(["parent"]);
 const RELATION_LIST_PROPS = [
-  ["depends_on", "dependsOn"],
-  ["breaks_to", "breaksTo"],
-  ["restarts_to", "restartsTo"],
+  ["depends_on"],
+  ["breaks_to"],
+  ["restarts_to"],
   ["graph_hidden_returns"],
 ] as const;
-const HIERARCHY_COLOR_PROPS = new Set([
-  "project_color",
-  "projectColor",
-  "hierarchy_color",
-  "hierarchyColor",
-]);
+const HIERARCHY_COLOR_PROPS = new Set(["project_color"]);
 const DEFAULT_TASK_TAG = "task";
 const PROJECT_COLOR_PALETTE = [
   "#3f7d9a",
@@ -893,11 +883,7 @@ export class CardManager {
 
   private getProjectColor(file: TFile): string | null {
     const frontmatter = this.getFrontmatter(file);
-    const value =
-      frontmatter?.project_color ??
-      frontmatter?.projectColor ??
-      frontmatter?.hierarchy_color ??
-      frontmatter?.hierarchyColor;
+    const value = frontmatter?.project_color;
     return this.normalizeHexColor(value);
   }
 
@@ -1038,12 +1024,7 @@ export class CardManager {
 
   private getParentValue(file: TFile): unknown {
     const frontmatter = this.getFrontmatter(file);
-    return (
-      frontmatter?.parent ??
-      frontmatter?.parent_task ??
-      frontmatter?.parentTask ??
-      frontmatter?.feature
-    );
+    return frontmatter?.parent;
   }
 
   private getFrontmatter(file: TFile): Record<string, unknown> | undefined {

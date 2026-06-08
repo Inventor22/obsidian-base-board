@@ -63,23 +63,23 @@ export class CardDetailModal extends Modal {
   private static modalStack: CardDetailModal[] = [];
   private static forwardStack: CardModalSnapshot[] = [];
   private static forwardStackExpireTimer: number | null = null;
-  private static stackMouseNavigationHandler: ((event: MouseEvent) => void) | null =
-    null;
+  private static stackMouseNavigationHandler:
+    | ((event: MouseEvent) => void)
+    | null = null;
   private static stackMouseNavigationTargets: Array<Document | Window> = [];
   private static stackLastMouseNavigationAt = 0;
   private static stackLastMouseNavigationButton: number | null = null;
   private static stackMouseNavigationEvents: Array<
     "pointerdown" | "pointerup" | "mousedown" | "mouseup" | "auxclick"
   > = ["pointerdown", "pointerup", "mousedown", "mouseup", "auxclick"];
-  private static recentModalInteraction:
-    | { modal: CardDetailModal; at: number }
-    | null = null;
-  private static patchedWorkspace:
-    | {
-        app: App;
-        openLinkText: App["workspace"]["openLinkText"];
-      }
-    | null = null;
+  private static recentModalInteraction: {
+    modal: CardDetailModal;
+    at: number;
+  } | null = null;
+  private static patchedWorkspace: {
+    app: App;
+    openLinkText: App["workspace"]["openLinkText"];
+  } | null = null;
 
   private file: TFile;
   private view: CardDetailView | undefined;
@@ -116,7 +116,9 @@ export class CardDetailModal extends Modal {
 
   async onOpen() {
     const { contentEl } = this;
-    this.history = this.initialHistory?.length ? [...this.initialHistory] : [this.file];
+    this.history = this.initialHistory?.length
+      ? [...this.initialHistory]
+      : [this.file];
     this.historyIndex = Math.min(
       Math.max(this.initialHistoryIndex, 0),
       this.history.length - 1,
@@ -149,12 +151,15 @@ export class CardDetailModal extends Modal {
       event.stopPropagation();
       this.goBack();
     });
-    this.modalBackButtonEl.addEventListener("keydown", (event: KeyboardEvent) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      event.stopPropagation();
-      this.goBack();
-    });
+    this.modalBackButtonEl.addEventListener(
+      "keydown",
+      (event: KeyboardEvent) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.goBack();
+      },
+    );
     this.modalForwardButtonEl = navActionsEl.createDiv({
       cls: "base-board-card-modal-nav-btn",
       attr: { role: "button", tabindex: "0", title: "Forward" },
@@ -165,12 +170,15 @@ export class CardDetailModal extends Modal {
       event.stopPropagation();
       this.goForward();
     });
-    this.modalForwardButtonEl.addEventListener("keydown", (event: KeyboardEvent) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      event.stopPropagation();
-      this.goForward();
-    });
+    this.modalForwardButtonEl.addEventListener(
+      "keydown",
+      (event: KeyboardEvent) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.goForward();
+      },
+    );
 
     // Open in Tab Button
     new ButtonComponent(actionsEl)
@@ -522,7 +530,9 @@ export class CardDetailModal extends Modal {
     CardDetailModal.reopenForwardSnapshot(app);
   }
 
-  private static shouldActivateStackMouseNavigation(event: MouseEvent): boolean {
+  private static shouldActivateStackMouseNavigation(
+    event: MouseEvent,
+  ): boolean {
     if (
       event.type !== "pointerup" &&
       event.type !== "mouseup" &&
@@ -659,7 +669,9 @@ export class CardDetailModal extends Modal {
     CardDetailModal.patchedWorkspace = null;
   }
 
-  private static getModalForSourcePath(sourcePath: string): CardDetailModal | null {
+  private static getModalForSourcePath(
+    sourcePath: string,
+  ): CardDetailModal | null {
     return (
       [...CardDetailModal.modalStack]
         .reverse()
@@ -668,7 +680,9 @@ export class CardDetailModal extends Modal {
   }
 
   private static getTopActiveModal(): CardDetailModal | null {
-    return CardDetailModal.modalStack[CardDetailModal.modalStack.length - 1] ?? null;
+    return (
+      CardDetailModal.modalStack[CardDetailModal.modalStack.length - 1] ?? null
+    );
   }
 
   private isTopActiveModal(): boolean {
@@ -679,7 +693,9 @@ export class CardDetailModal extends Modal {
     const recent = CardDetailModal.recentModalInteraction;
     if (!recent) return null;
     if (Date.now() - recent.at > 1000) return null;
-    return CardDetailModal.modalStack.includes(recent.modal) ? recent.modal : null;
+    return CardDetailModal.modalStack.includes(recent.modal)
+      ? recent.modal
+      : null;
   }
 
   private getInternalLinkTarget(event: MouseEvent): TFile | null {
@@ -823,14 +839,10 @@ export class CardDetailModal extends Modal {
       return {
         file,
         title: this.getTaskTitle(file, frontmatter),
-        parentKey: this.normalizeReference(
-          frontmatter?.parent ??
-            frontmatter?.parent_task ??
-            frontmatter?.parentTask ??
-            frontmatter?.feature,
-        ),
+        parentKey: this.normalizeReference(frontmatter?.parent),
         status:
-          this.normalizeStatus(frontmatter?.[STATUS_PROPERTY]) ?? NO_VALUE_COLUMN,
+          this.normalizeStatus(frontmatter?.[STATUS_PROPERTY]) ??
+          NO_VALUE_COLUMN,
       };
     });
   }
