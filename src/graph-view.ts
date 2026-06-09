@@ -206,7 +206,7 @@ interface GraphViewportState {
   zoom: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.08.21";
+const GRAPH_BUILD_VERSION = "2026.06.09.5";
 const NODE_WIDTH = 220;
 const NODE_MIN_HEIGHT = 92;
 const X_STEP = 300;
@@ -265,7 +265,9 @@ export class GraphView extends BasesView {
     string,
     GraphEndpointAnchorOverride
   >();
-  private graphViewportSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private graphViewportState: GraphViewportState | null = null;
+  private graphViewportPersistTimer: ReturnType<typeof setTimeout> | null =
+    null;
 
   constructor(
     controller: QueryController,
@@ -296,9 +298,9 @@ export class GraphView extends BasesView {
     );
     const viewportState = previousViewportEl
       ? this.getGraphViewportState(previousViewportEl)
-      : this.getSavedGraphViewportState();
+      : (this.graphViewportState ?? this.getSavedGraphViewportState());
     if (previousViewportEl) {
-      this.persistGraphViewportState(viewportState);
+      this.graphViewportState = viewportState;
     }
     if (viewportState) {
       this.graphZoom = this.clampGraphZoom(viewportState.zoom);
@@ -323,7 +325,7 @@ export class GraphView extends BasesView {
       viewportEl.scrollTop = viewportState
         ? viewportState.scrollTop
         : GRAPH_PAN_MARGIN_Y - EDGE_MARGIN;
-      this.schedulePersistGraphViewportState(viewportEl);
+      this.graphViewportState = this.getGraphViewportState(viewportEl);
     });
   }
 
@@ -382,7 +384,7 @@ export class GraphView extends BasesView {
       cls: "base-board-graph-viewport",
     });
     viewportEl.addEventListener("scroll", () => {
-      this.schedulePersistGraphViewportState(viewportEl);
+      this.graphViewportState = this.getGraphViewportState(viewportEl);
     });
     viewportEl.addEventListener(
       "wheel",
@@ -391,7 +393,7 @@ export class GraphView extends BasesView {
       },
       { passive: false },
     );
-    viewportEl.addEventListener("mousedown", (event: MouseEvent) => {
+    viewportEl.addEventListener("pointerdown", (event: PointerEvent) => {
       this.startGraphPan(event, viewportEl);
     });
 
@@ -774,7 +776,8 @@ export class GraphView extends BasesView {
     this.applyGraphZoom(zoomContentEl, canvasEl, bounds);
     viewportEl.scrollLeft = GRAPH_PAN_MARGIN_X + graphX * nextZoom - pointerX;
     viewportEl.scrollTop = GRAPH_PAN_MARGIN_Y + graphY * nextZoom - pointerY;
-    this.persistGraphViewportState(this.getGraphViewportState(viewportEl));
+    this.graphViewportState = this.getGraphViewportState(viewportEl);
+    this.schedulePersistGraphViewportState();
   }
 
   private clampGraphZoom(zoom: number): number {
@@ -810,18 +813,9 @@ export class GraphView extends BasesView {
     };
   }
 
-  private schedulePersistGraphViewportState(viewportEl: HTMLElement): void {
-    if (this.graphViewportSaveTimer) {
-      window.clearTimeout(this.graphViewportSaveTimer);
-    }
-    this.graphViewportSaveTimer = window.setTimeout(() => {
-      this.persistGraphViewportState(this.getGraphViewportState(viewportEl));
-      this.graphViewportSaveTimer = null;
-    }, 120);
-  }
-
   private persistGraphViewportState(state: GraphViewportState | null): void {
     if (!state) return;
+    this.graphViewportState = state;
     this.config?.set(CONFIG_KEY_GRAPH_VIEWPORT, {
       scrollLeft: Math.round(state.scrollLeft),
       scrollTop: Math.round(state.scrollTop),
@@ -829,15 +823,33 @@ export class GraphView extends BasesView {
     });
   }
 
-  private startGraphPan(event: MouseEvent, viewportEl: HTMLElement): void {
+  private schedulePersistGraphViewportState(): void {
+    if (this.graphViewportPersistTimer) {
+      window.clearTimeout(this.graphViewportPersistTimer);
+    }
+    this.graphViewportPersistTimer = window.setTimeout(() => {
+      this.persistGraphViewportState(this.graphViewportState);
+      this.graphViewportPersistTimer = null;
+    }, 400);
+  }
+
+  private startGraphPan(event: PointerEvent, viewportEl: HTMLElement): void {
     if (event.button !== 0) return;
-    const targetEl = event.target instanceof HTMLElement ? event.target : null;
+    const targetEl = event.target instanceof Element ? event.target : null;
     if (
       targetEl?.closest(
-        ".base-board-graph-node, .base-board-graph-link-handle, button, input, textarea, select",
+        ".base-board-graph-node, .base-board-graph-link-handle, .base-board-graph-edge-handle, button, input, textarea, select",
       )
     ) {
       return;
+    }
+
+    event.preventDefault();
+    try {
+      viewportEl.setPointerCapture(event.pointerId);
+    } catch {
+      // Window-level capture listeners below keep panning alive if pointer
+      // capture is unavailable or lost.
     }
 
     const startX = event.clientX;
@@ -845,10 +857,15 @@ export class GraphView extends BasesView {
     const startScrollLeft = viewportEl.scrollLeft;
     const startScrollTop = viewportEl.scrollTop;
     let didPan = false;
+    let isFinished = false;
 
-    const moveHandler = (moveEvent: MouseEvent) => {
-      const deltaX = moveEvent.clientX - startX;
-      const deltaY = moveEvent.clientY - startY;
+    const moveByClientPoint = (
+      clientX: number,
+      clientY: number,
+      moveEvent: Event,
+    ) => {
+      const deltaX = clientX - startX;
+      const deltaY = clientY - startY;
       if (!didPan && Math.hypot(deltaX, deltaY) >= GRAPH_PAN_THRESHOLD_PX) {
         didPan = true;
         viewportEl.addClass("base-board-graph-viewport--panning");
@@ -859,9 +876,36 @@ export class GraphView extends BasesView {
       viewportEl.scrollTop = startScrollTop - deltaY;
     };
 
-    const upHandler = () => {
-      activeWindow.removeEventListener("mousemove", moveHandler);
-      activeWindow.removeEventListener("mouseup", upHandler);
+    const pointerMoveHandler = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) return;
+      moveByClientPoint(moveEvent.clientX, moveEvent.clientY, moveEvent);
+    };
+
+    const mouseMoveHandler = (moveEvent: MouseEvent) => {
+      moveByClientPoint(moveEvent.clientX, moveEvent.clientY, moveEvent);
+    };
+
+    const finishPan = () => {
+      if (isFinished) return;
+      isFinished = true;
+      viewportEl.removeEventListener("pointermove", pointerMoveHandler);
+      viewportEl.removeEventListener("pointerup", pointerUpHandler);
+      viewportEl.removeEventListener("pointercancel", pointerCancelHandler);
+      viewportEl.removeEventListener("lostpointercapture", lostCaptureHandler);
+      activeWindow.removeEventListener("pointermove", pointerMoveHandler, true);
+      activeWindow.removeEventListener("pointerup", pointerUpHandler, true);
+      activeWindow.removeEventListener(
+        "pointercancel",
+        pointerCancelHandler,
+        true,
+      );
+      activeWindow.removeEventListener("mousemove", mouseMoveHandler, true);
+      activeWindow.removeEventListener("mouseup", mouseUpHandler, true);
+
+      if (viewportEl.hasPointerCapture(event.pointerId)) {
+        viewportEl.releasePointerCapture(event.pointerId);
+      }
+
       viewportEl.removeClass("base-board-graph-viewport--panning");
       if (didPan) {
         this.suppressNextNodeClick = true;
@@ -872,8 +916,37 @@ export class GraphView extends BasesView {
       }
     };
 
-    activeWindow.addEventListener("mousemove", moveHandler);
-    activeWindow.addEventListener("mouseup", upHandler);
+    const pointerUpHandler = (upEvent: PointerEvent) => {
+      if (upEvent.pointerId !== event.pointerId) return;
+      finishPan();
+    };
+
+    const mouseUpHandler = () => {
+      finishPan();
+    };
+
+    const pointerCancelHandler = (cancelEvent: PointerEvent) => {
+      if (cancelEvent.pointerId !== event.pointerId) return;
+      // Do not finish here: Chromium can emit pointercancel/lost-capture while
+      // the mouse button is still physically down. Mouse/pointer up is the
+      // authoritative end signal for graph panning.
+    };
+
+    const lostCaptureHandler = (lostEvent: PointerEvent) => {
+      if (lostEvent.pointerId !== event.pointerId) return;
+      // Window-level mousemove/mouseup listeners keep the pan alive after
+      // capture loss, so do not treat this as a completed pan.
+    };
+
+    viewportEl.addEventListener("pointermove", pointerMoveHandler);
+    viewportEl.addEventListener("pointerup", pointerUpHandler);
+    viewportEl.addEventListener("pointercancel", pointerCancelHandler);
+    viewportEl.addEventListener("lostpointercapture", lostCaptureHandler);
+    activeWindow.addEventListener("pointermove", pointerMoveHandler, true);
+    activeWindow.addEventListener("pointerup", pointerUpHandler, true);
+    activeWindow.addEventListener("pointercancel", pointerCancelHandler, true);
+    activeWindow.addEventListener("mousemove", mouseMoveHandler, true);
+    activeWindow.addEventListener("mouseup", mouseUpHandler, true);
   }
 
   private renderNode(parentEl: HTMLElement, node: GraphNode): void {
@@ -3576,12 +3649,6 @@ export class GraphView extends BasesView {
       return endpoint === "from"
         ? this.getSemanticAnchorPoint(edge.from, "bottom", 0.5)
         : this.getSemanticAnchorPoint(edge.to, "top", 0.5);
-    }
-
-    if (edge.kind === "requirement-return") {
-      return endpoint === "from"
-        ? this.getSemanticAnchorPoint(edge.from, "bottom", 0.75)
-        : this.getSemanticAnchorPoint(edge.to, "top", 0.75);
     }
 
     if (edge.kind === "gating") {
