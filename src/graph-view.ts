@@ -200,7 +200,13 @@ interface GraphEdge {
   kind: GraphFlowEdgeKind;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.08.15";
+interface GraphViewportState {
+  scrollLeft: number;
+  scrollTop: number;
+  zoom: number;
+}
+
+const GRAPH_BUILD_VERSION = "2026.06.08.21";
 const NODE_WIDTH = 220;
 const NODE_MIN_HEIGHT = 92;
 const X_STEP = 300;
@@ -217,9 +223,10 @@ const GRAPH_PAN_MARGIN_Y = 320;
 const GRAPH_POSITION_PROPERTY_X = "graph_x";
 const GRAPH_POSITION_PROPERTY_Y = "graph_y";
 const GRAPH_COLLAPSED_PROPERTY = "graph_collapsed";
+const CONFIG_KEY_GRAPH_VIEWPORT = "graphViewport";
 const GRAPH_HIDDEN_RETURNS_PROPERTY = "graph_hidden_returns";
 const GRAPH_EDGE_HANDLE_RADIUS = 7;
-const GRAPH_LINK_HANDLE_PROXIMITY_PX = 40;
+const GRAPH_LINK_HANDLE_PROXIMITY_PX = 14;
 const GRAPH_TEMPLATE_CHILD_Y_STEP = 150;
 const GRAPH_TEMPLATE_CHILD_X_STEP = 260;
 const GRAPH_NODE_ANCHOR_SLOTS: GraphNodeAnchorSlot[] = [
@@ -258,6 +265,7 @@ export class GraphView extends BasesView {
     string,
     GraphEndpointAnchorOverride
   >();
+  private graphViewportSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     controller: QueryController,
@@ -286,9 +294,15 @@ export class GraphView extends BasesView {
     const previousViewportEl = this.containerEl.querySelector<HTMLElement>(
       ".base-board-graph-viewport",
     );
-    const hadPreviousViewport = previousViewportEl !== null;
-    const previousScrollLeft = previousViewportEl?.scrollLeft ?? 0;
-    const previousScrollTop = previousViewportEl?.scrollTop ?? 0;
+    const viewportState = previousViewportEl
+      ? this.getGraphViewportState(previousViewportEl)
+      : this.getSavedGraphViewportState();
+    if (previousViewportEl) {
+      this.persistGraphViewportState(viewportState);
+    }
+    if (viewportState) {
+      this.graphZoom = this.clampGraphZoom(viewportState.zoom);
+    }
 
     this.containerEl.empty();
     const nodes = this.getGraphNodes();
@@ -303,12 +317,13 @@ export class GraphView extends BasesView {
     const viewportEl = this.renderCanvas(nodes, edges);
 
     window.requestAnimationFrame(() => {
-      viewportEl.scrollLeft = hadPreviousViewport
-        ? previousScrollLeft
+      viewportEl.scrollLeft = viewportState
+        ? viewportState.scrollLeft
         : GRAPH_PAN_MARGIN_X - EDGE_MARGIN;
-      viewportEl.scrollTop = hadPreviousViewport
-        ? previousScrollTop
+      viewportEl.scrollTop = viewportState
+        ? viewportState.scrollTop
         : GRAPH_PAN_MARGIN_Y - EDGE_MARGIN;
+      this.schedulePersistGraphViewportState(viewportEl);
     });
   }
 
@@ -365,6 +380,9 @@ export class GraphView extends BasesView {
     const bounds = this.getGraphBounds(nodes);
     const viewportEl = this.containerEl.createDiv({
       cls: "base-board-graph-viewport",
+    });
+    viewportEl.addEventListener("scroll", () => {
+      this.schedulePersistGraphViewportState(viewportEl);
     });
     viewportEl.addEventListener(
       "wheel",
@@ -756,10 +774,59 @@ export class GraphView extends BasesView {
     this.applyGraphZoom(zoomContentEl, canvasEl, bounds);
     viewportEl.scrollLeft = GRAPH_PAN_MARGIN_X + graphX * nextZoom - pointerX;
     viewportEl.scrollTop = GRAPH_PAN_MARGIN_Y + graphY * nextZoom - pointerY;
+    this.persistGraphViewportState(this.getGraphViewportState(viewportEl));
   }
 
   private clampGraphZoom(zoom: number): number {
     return Math.max(GRAPH_MIN_ZOOM, Math.min(GRAPH_MAX_ZOOM, zoom));
+  }
+
+  private getGraphViewportState(viewportEl: HTMLElement): GraphViewportState {
+    return {
+      scrollLeft: Math.max(0, viewportEl.scrollLeft),
+      scrollTop: Math.max(0, viewportEl.scrollTop),
+      zoom: this.graphZoom,
+    };
+  }
+
+  private getSavedGraphViewportState(): GraphViewportState | null {
+    const raw = this.config?.get(CONFIG_KEY_GRAPH_VIEWPORT);
+    if (!raw || typeof raw !== "object") return null;
+    const state = raw as Partial<GraphViewportState>;
+    if (
+      typeof state.scrollLeft !== "number" ||
+      typeof state.scrollTop !== "number" ||
+      typeof state.zoom !== "number" ||
+      !Number.isFinite(state.scrollLeft) ||
+      !Number.isFinite(state.scrollTop) ||
+      !Number.isFinite(state.zoom)
+    ) {
+      return null;
+    }
+    return {
+      scrollLeft: Math.max(0, state.scrollLeft),
+      scrollTop: Math.max(0, state.scrollTop),
+      zoom: this.clampGraphZoom(state.zoom),
+    };
+  }
+
+  private schedulePersistGraphViewportState(viewportEl: HTMLElement): void {
+    if (this.graphViewportSaveTimer) {
+      window.clearTimeout(this.graphViewportSaveTimer);
+    }
+    this.graphViewportSaveTimer = window.setTimeout(() => {
+      this.persistGraphViewportState(this.getGraphViewportState(viewportEl));
+      this.graphViewportSaveTimer = null;
+    }, 120);
+  }
+
+  private persistGraphViewportState(state: GraphViewportState | null): void {
+    if (!state) return;
+    this.config?.set(CONFIG_KEY_GRAPH_VIEWPORT, {
+      scrollLeft: Math.round(state.scrollLeft),
+      scrollTop: Math.round(state.scrollTop),
+      zoom: state.zoom,
+    });
   }
 
   private startGraphPan(event: MouseEvent, viewportEl: HTMLElement): void {
@@ -801,6 +868,7 @@ export class GraphView extends BasesView {
         window.setTimeout(() => {
           this.suppressNextNodeClick = false;
         }, 0);
+        this.persistGraphViewportState(this.getGraphViewportState(viewportEl));
       }
     };
 
@@ -2493,6 +2561,7 @@ export class GraphView extends BasesView {
     );
     const dev = await this.createTemplateNode({
       title: `${title} - dev`,
+      displayTitle: "dev",
       type: "dev",
       workflow: "dev",
       status: "To Do",
@@ -2503,17 +2572,25 @@ export class GraphView extends BasesView {
 
     if (options.detailed) {
       await this.insertDevTemplate(
-        this.getSyntheticTemplateNode(dev, `${title} - dev`, "dev", "dev"),
+        this.getSyntheticTemplateNode(
+          dev,
+          `${title} - dev`,
+          "dev",
+          "dev",
+          this.getTemplateChildPosition(origin, -0.5, 1),
+        ),
         `${title} - dev`,
       );
     }
 
     const rollout = await this.createTemplateNode({
       title: `${title} - rollout`,
+      displayTitle: "rollout",
       type: "rollout",
       workflow: "rollout",
       status: "To Do",
       parent: this.getWikiLink(feature),
+      dependsOn: [this.getWikiLink(dev)],
       tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
       ...this.getTemplateChildPosition(origin, 0.5, 1),
     });
@@ -2525,6 +2602,7 @@ export class GraphView extends BasesView {
           `${title} - rollout`,
           "rollout",
           "rollout",
+          this.getTemplateChildPosition(origin, 0.5, 1),
         ),
         `${title} - repo`,
       );
@@ -2558,8 +2636,9 @@ export class GraphView extends BasesView {
       },
     );
 
-    await this.createTemplateNode({
+    const dev = await this.createTemplateNode({
       title: `${title} - dev`,
+      displayTitle: "dev",
       type: "dev",
       workflow: "dev",
       status: "To Do",
@@ -2570,10 +2649,12 @@ export class GraphView extends BasesView {
 
     await this.createTemplateNode({
       title: `${title} - rollout`,
+      displayTitle: "rollout",
       type: "rollout",
       workflow: "rollout",
       status: "To Do",
       parent: this.getWikiLink(iteration),
+      dependsOn: [this.getWikiLink(dev)],
       tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
       ...this.getTemplateChildPosition(origin, 0.5, 1),
     });
@@ -2595,6 +2676,7 @@ export class GraphView extends BasesView {
         : this.getSyntheticTemplateNode(
             await this.createTemplateNode({
               title,
+              displayTitle: title,
               type: "dev",
               workflow: "dev",
               status: "To Do",
@@ -2610,10 +2692,12 @@ export class GraphView extends BasesView {
             title,
             "dev",
             "dev",
+            origin,
           );
 
     const design = await this.createTemplateNode({
       title: `${title} - design`,
+      displayTitle: "design",
       type: "design",
       status: "To Do",
       parent: this.getWikiLink(parentNode.file),
@@ -2622,6 +2706,7 @@ export class GraphView extends BasesView {
     });
     const implementation = await this.createTemplateNode({
       title: `${title} - implementation`,
+      displayTitle: "implementation",
       type: "implementation",
       status: "To Do",
       parent: this.getWikiLink(parentNode.file),
@@ -2631,6 +2716,7 @@ export class GraphView extends BasesView {
     });
     await this.createTemplateNode({
       title: `${title} - review`,
+      displayTitle: "review",
       type: "review",
       status: "To Do",
       parent: this.getWikiLink(parentNode.file),
@@ -2654,6 +2740,7 @@ export class GraphView extends BasesView {
         : this.getSyntheticTemplateNode(
             await this.createTemplateNode({
               title,
+              displayTitle: title,
               type: "rollout",
               workflow: "rollout",
               status: "To Do",
@@ -2669,10 +2756,12 @@ export class GraphView extends BasesView {
             title,
             "rollout",
             "rollout",
+            origin,
           );
 
     const repo = await this.createTemplateNode({
       title: `${title} - repo`,
+      displayTitle: "repo",
       type: "repo",
       status: "To Do",
       parent: this.getWikiLink(rolloutNode.file),
@@ -2686,6 +2775,7 @@ export class GraphView extends BasesView {
       const ring = rings[index];
       const ringFile = await this.createTemplateNode({
         title: `${title} - ${ring}`,
+        displayTitle: ring,
         type: ring,
         status: "To Do",
         parent: this.getWikiLink(repo),
@@ -2711,6 +2801,7 @@ export class GraphView extends BasesView {
       : this.getSyntheticTemplateNode(
           await this.createTemplateNode({
             title,
+            displayTitle: title,
             type: "ring",
             status: "To Do",
             tags: this.getRootTags(),
@@ -2719,10 +2810,13 @@ export class GraphView extends BasesView {
           }),
           title,
           "ring",
+          null,
+          origin,
         );
 
     const awaitBuild = await this.createTemplateNode({
       title: `${title} - await build rollout`,
+      displayTitle: "await build rollout",
       type: "await",
       status: "To Do",
       parent: this.getWikiLink(ringNode.file),
@@ -2734,6 +2828,7 @@ export class GraphView extends BasesView {
     if (includeFlag) {
       const enableFlag = await this.createTemplateNode({
         title: `${title} - enable feature flag`,
+        displayTitle: "enable feature flag",
         type: "enable",
         status: "To Do",
         parent: this.getWikiLink(ringNode.file),
@@ -2743,6 +2838,7 @@ export class GraphView extends BasesView {
       });
       previous = await this.createTemplateNode({
         title: `${title} - await feature flag rollout`,
+        displayTitle: "await feature flag rollout",
         type: "await",
         status: "To Do",
         parent: this.getWikiLink(ringNode.file),
@@ -2754,6 +2850,7 @@ export class GraphView extends BasesView {
 
     await this.createTemplateNode({
       title: `${title} - verify`,
+      displayTitle: "verify",
       type: "verify",
       status: "To Do",
       parent: this.getWikiLink(ringNode.file),
@@ -2768,6 +2865,7 @@ export class GraphView extends BasesView {
     title: string,
     nodeType: string,
     workflow: string | null = null,
+    position: { x: number; y: number } = { x: 0, y: 0 },
   ): GraphNode {
     return {
       entry: {} as BasesEntry,
@@ -2789,8 +2887,8 @@ export class GraphView extends BasesView {
       predecessors: [],
       breakTargets: [],
       restartTargets: [],
-      x: 0,
-      y: 0,
+      x: position.x,
+      y: position.y,
       savedX: null,
       savedY: null,
       state: "idle",
@@ -2837,6 +2935,7 @@ export class GraphView extends BasesView {
 
   private async createTemplateNode(options: {
     title: string;
+    displayTitle?: string;
     type: string;
     status: string;
     parent?: string;
@@ -2847,10 +2946,12 @@ export class GraphView extends BasesView {
     y?: number;
   }): Promise<TFile> {
     const safeTitle = sanitizeFilename(options.title.trim());
+    const displayTitle = (options.displayTitle ?? options.title).trim();
     const folder = this.visibleNodes[0]?.file.parent?.path ?? "";
     const filePath = await this.getAvailableFilePath(folder, safeTitle);
     const lines = [
       "---",
+      `title: ${this.formatYamlScalar(displayTitle)}`,
       `status: ${this.formatYamlScalar(options.status)}`,
       `type: ${this.formatYamlScalar(options.type)}`,
       `kanban_order: ${this.getNextOrder(options.status)}`,
@@ -2882,7 +2983,7 @@ export class GraphView extends BasesView {
         lines.push(`  - ${this.formatYamlScalar(tag)}`);
       }
     }
-    lines.push("---", "", `# ${options.title}`, "", "## Notes", "");
+    lines.push("---", "", `# ${displayTitle}`, "", "## Notes", "");
     await this.app.vault.create(filePath, lines.join("\n"));
     const file = this.app.vault.getAbstractFileByPath(filePath);
     if (!(file instanceof TFile)) {
@@ -3345,6 +3446,7 @@ export class GraphView extends BasesView {
   }
 
   private assignNodeStates(nodes: GraphNode[]): void {
+    const parentByPath = this.getResolvedParentsByPath(nodes);
     for (const node of nodes) {
       if (this.isInvalidatedStatus(node.status)) {
         node.state = "invalidated";
@@ -3354,14 +3456,57 @@ export class GraphView extends BasesView {
         node.state = "completed";
       } else if (this.isBlockedStatus(node.status)) {
         node.state = "blocked";
-      } else if (!this.areDependenciesCompleted(node)) {
+      } else if (
+        !this.areDependenciesCompleted(node) ||
+        !this.areAncestorDependenciesCompleted(node, parentByPath)
+      ) {
         node.state = "waiting";
       } else if (this.hasIncompleteChildren(node)) {
-        node.state = "idle";
+        node.state = "completed";
       } else {
         node.state = "active";
       }
     }
+  }
+
+  private getResolvedParentsByPath(nodes: GraphNode[]): Map<string, GraphNode> {
+    const nodesByIdentity = new Map<string, GraphNode>();
+    for (const node of nodes) {
+      for (const identity of this.getNodeIdentities(node)) {
+        nodesByIdentity.set(identity, node);
+      }
+    }
+
+    const parentByPath = new Map<string, GraphNode>();
+    for (const node of nodes) {
+      if (!node.parentKey) continue;
+      const parent = nodesByIdentity.get(node.parentKey);
+      if (!parent || parent.file.path === node.file.path) continue;
+      parentByPath.set(node.file.path, parent);
+    }
+    return parentByPath;
+  }
+
+  private areAncestorDependenciesCompleted(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+  ): boolean {
+    const visitedPaths = new Set<string>();
+    let parent = parentByPath.get(node.file.path);
+    while (parent) {
+      if (visitedPaths.has(parent.file.path)) return false;
+      visitedPaths.add(parent.file.path);
+      if (
+        this.isBlockedStatus(parent.status) ||
+        this.isInterruptedStatus(parent.status) ||
+        this.isInvalidatedStatus(parent.status) ||
+        !this.areDependenciesCompleted(parent)
+      ) {
+        return false;
+      }
+      parent = parentByPath.get(parent.file.path);
+    }
+    return true;
   }
 
   private getResolvedParent(
@@ -3379,7 +3524,9 @@ export class GraphView extends BasesView {
   }
 
   private hasIncompleteChildren(node: GraphNode): boolean {
-    return node.children.some((child) => !this.isCompletedStatus(child.status));
+    return node.children.some(
+      (child) => !this.isTerminalDependencyStatus(child.status),
+    );
   }
 
   private areDependenciesCompleted(node: GraphNode): boolean {
@@ -3425,11 +3572,84 @@ export class GraphView extends BasesView {
     edge: GraphEdge,
     endpoint: GraphEdgeEndpoint,
   ): GraphAnchorPoint {
+    if (edge.kind === "requirement-start") {
+      return endpoint === "from"
+        ? this.getSemanticAnchorPoint(edge.from, "bottom", 0.5)
+        : this.getSemanticAnchorPoint(edge.to, "top", 0.5);
+    }
+
+    if (edge.kind === "requirement-return") {
+      return endpoint === "from"
+        ? this.getSemanticAnchorPoint(edge.from, "bottom", 0.75)
+        : this.getSemanticAnchorPoint(edge.to, "top", 0.75);
+    }
+
+    if (edge.kind === "gating") {
+      const fromCenter = this.getNodeCenter(edge.from);
+      const toCenter = this.getNodeCenter(edge.to);
+      const isMostlyHorizontal =
+        Math.abs(toCenter.x - fromCenter.x) >=
+        Math.abs(toCenter.y - fromCenter.y) * 0.75;
+      if (isMostlyHorizontal) {
+        const fromIsLeft = fromCenter.x <= toCenter.x;
+        return endpoint === "from"
+          ? this.getSemanticAnchorPoint(
+              edge.from,
+              fromIsLeft ? "right" : "left",
+              2 / 3,
+            )
+          : this.getSemanticAnchorPoint(
+              edge.to,
+              fromIsLeft ? "left" : "right",
+              2 / 3,
+            );
+      }
+
+      return endpoint === "from"
+        ? this.getSemanticAnchorPoint(
+            edge.from,
+            fromCenter.y <= toCenter.y ? "bottom" : "top",
+            0.5,
+          )
+        : this.getSemanticAnchorPoint(
+            edge.to,
+            fromCenter.y <= toCenter.y ? "top" : "bottom",
+            0.5,
+          );
+    }
+
     const lane = this.getEdgeAnchorLane(edge);
     if (endpoint === "from") {
       return this.getNodeAnchorPoint(edge.from, edge.to, "out", lane);
     }
     return this.getNodeAnchorPoint(edge.to, edge.from, "in", lane);
+  }
+
+  private getSemanticAnchorPoint(
+    node: GraphNode,
+    side: GraphAnchorSide,
+    ratio: number,
+  ): GraphAnchorPoint {
+    const nodeSize = this.getRenderedGraphNodeSize(node);
+    const clampedRatio = this.clampRatio(ratio);
+    if (side === "top") {
+      return { side, x: node.x + nodeSize.width * clampedRatio, y: node.y };
+    }
+    if (side === "bottom") {
+      return {
+        side,
+        x: node.x + nodeSize.width * clampedRatio,
+        y: node.y + nodeSize.height,
+      };
+    }
+    if (side === "left") {
+      return { side, x: node.x, y: node.y + nodeSize.height * clampedRatio };
+    }
+    return {
+      side,
+      x: node.x + nodeSize.width,
+      y: node.y + nodeSize.height * clampedRatio,
+    };
   }
 
   private getEdgeEndpointOverrideKey(
@@ -3722,7 +3942,18 @@ export class GraphView extends BasesView {
 
     const frontmatter = this.getFrontmatter(file);
     const title = frontmatter?.title;
-    return typeof title === "string" && title.trim() ? title : file.basename;
+    if (typeof title === "string" && title.trim()) return title;
+    return this.getLocalFallbackTitle(file, frontmatter);
+  }
+
+  private getLocalFallbackTitle(
+    file: TFile,
+    frontmatter: Record<string, unknown> | undefined,
+  ): string {
+    if (frontmatter?.parent && file.basename.includes(" - ")) {
+      return file.basename.split(" - ").pop() ?? file.basename;
+    }
+    return file.basename;
   }
 
   private getCurrentStatus(file: TFile): string | null {

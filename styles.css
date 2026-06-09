@@ -2543,12 +2543,33 @@
 }
 
 .base-board-graph-node--completed {
-  opacity: 0.66;
+  border-color: color-mix(
+    in srgb,
+    var(--text-success) 58%,
+    var(--background-modifier-border)
+  );
+  border-left-color: var(--text-success);
+  background-color: color-mix(
+    in srgb,
+    var(--text-success) 6%,
+    var(--background-secondary)
+  );
 }
 
 .base-board-graph-node--waiting {
-  opacity: 0.78;
+  opacity: 0.72;
   border-style: dashed;
+  border-color: color-mix(
+    in srgb,
+    var(--text-muted) 48%,
+    var(--background-modifier-border)
+  );
+  border-left-color: var(--text-muted);
+  background-color: color-mix(
+    in srgb,
+    var(--text-muted) 4%,
+    var(--background-secondary)
+  );
 }
 
 .base-board-graph-node--blocked {

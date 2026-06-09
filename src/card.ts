@@ -700,11 +700,22 @@ export class CardManager {
   }
 
   public getCardTitle(entry: BasesEntry): string {
-    let cardTitle = entry.file?.basename ?? "Untitled";
+    const file = entry.file;
+    let cardTitle = file?.basename ?? "Untitled";
     const titleProp = this.view.config.get("cardTitleProperty") as
       | string
       | undefined;
-    if (!titleProp) return cardTitle;
+    if (!titleProp) {
+      if (file instanceof TFile) {
+        const frontmatter = this.getFrontmatter(file);
+        const frontmatterTitle = frontmatter?.title;
+        if (typeof frontmatterTitle === "string" && frontmatterTitle.trim()) {
+          return frontmatterTitle.trim();
+        }
+        return this.getLocalFallbackTitle(file, frontmatter);
+      }
+      return cardTitle;
+    }
 
     const propId = titleProp.startsWith("note.")
       ? titleProp
@@ -714,6 +725,16 @@ export class CardManager {
       cardTitle = formatValueForChip(value);
     }
     return cardTitle;
+  }
+
+  private getLocalFallbackTitle(
+    file: TFile,
+    frontmatter: Record<string, unknown> | undefined,
+  ): string {
+    if (frontmatter?.parent && file.basename.includes(" - ")) {
+      return file.basename.split(" - ").pop() ?? file.basename;
+    }
+    return file.basename;
   }
 
   private getCardHierarchyInfo(filePath: string): CardHierarchyInfo | null {
