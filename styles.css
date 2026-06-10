@@ -2185,12 +2185,64 @@
   white-space: nowrap;
 }
 
+.base-board-graph-zoom-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  padding: 2px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+}
+
+.base-board-graph-zoom-button {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  border: 0 !important;
+  border-radius: var(--radius-s);
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.base-board-graph-zoom-button:hover,
+.base-board-graph-zoom-button:focus-visible {
+  background-color: var(--background-modifier-hover) !important;
+  color: var(--text-normal);
+  outline: none;
+}
+
+.base-board-graph-zoom-button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.base-board-graph-zoom-controls + .base-board-graph-version {
+  margin-left: 4px;
+}
+
 .base-board-graph-viewport {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   cursor: grab;
-  scrollbar-width: thin;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.base-board-graph-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 .base-board-graph-viewport--panning {

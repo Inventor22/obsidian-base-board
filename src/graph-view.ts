@@ -204,9 +204,24 @@ interface GraphViewportState {
   scrollLeft: number;
   scrollTop: number;
   zoom: number;
+  centerX?: number;
+  centerY?: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.09.5";
+interface GraphWorldBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+interface GraphCanvasBounds {
+  world: GraphWorldBounds;
+  width: number;
+  height: number;
+}
+
+const GRAPH_BUILD_VERSION = "2026.06.09.12";
 const NODE_WIDTH = 220;
 const NODE_MIN_HEIGHT = 92;
 const X_STEP = 300;
@@ -217,6 +232,7 @@ const NODE_GAP_X = X_STEP - NODE_WIDTH;
 const GRAPH_MIN_ZOOM = 0.35;
 const GRAPH_MAX_ZOOM = 2.25;
 const GRAPH_ZOOM_STEP = 0.0018;
+const GRAPH_ZOOM_BUTTON_FACTOR = 1.2;
 const GRAPH_PAN_THRESHOLD_PX = 4;
 const GRAPH_PAN_MARGIN_X = 720;
 const GRAPH_PAN_MARGIN_Y = 320;
@@ -224,11 +240,23 @@ const GRAPH_POSITION_PROPERTY_X = "graph_x";
 const GRAPH_POSITION_PROPERTY_Y = "graph_y";
 const GRAPH_COLLAPSED_PROPERTY = "graph_collapsed";
 const CONFIG_KEY_GRAPH_VIEWPORT = "graphViewport";
+const CONFIG_KEY_GRAPH_WORLD = "graphWorld";
 const GRAPH_HIDDEN_RETURNS_PROPERTY = "graph_hidden_returns";
 const GRAPH_EDGE_HANDLE_RADIUS = 7;
 const GRAPH_LINK_HANDLE_PROXIMITY_PX = 14;
 const GRAPH_TEMPLATE_CHILD_Y_STEP = 150;
 const GRAPH_TEMPLATE_CHILD_X_STEP = 260;
+const GRAPH_WORLD_CONTENT_PADDING_X = 1600;
+const GRAPH_WORLD_CONTENT_PADDING_Y = 1000;
+const GRAPH_WORLD_MIN_WIDTH = 3200;
+const GRAPH_WORLD_MIN_HEIGHT = 2200;
+const GRAPH_WORLD_EDGE_THRESHOLD_X = 900;
+const GRAPH_WORLD_EDGE_THRESHOLD_Y = 600;
+const GRAPH_WORLD_EXPAND_CHUNK_X = 2200;
+const GRAPH_WORLD_EXPAND_CHUNK_Y = 1600;
+const GRAPH_WORLD_TEMPLATE_PADDING_X = 960;
+const GRAPH_WORLD_TEMPLATE_PADDING_Y = 720;
+const GRAPH_WORLD_SAFETY_LIMIT = 1_000_000;
 const GRAPH_NODE_ANCHOR_SLOTS: GraphNodeAnchorSlot[] = [
   { side: "top", xRatio: 0.2, yRatio: 0 },
   { side: "top", xRatio: 0.4, yRatio: 0 },
@@ -266,6 +294,11 @@ export class GraphView extends BasesView {
     GraphEndpointAnchorOverride
   >();
   private graphViewportState: GraphViewportState | null = null;
+  private graphWorldBounds: GraphWorldBounds | null = null;
+  private graphPanActive = false;
+  private graphPanWorldPersistPending = false;
+  private graphPanViewportPersistPending = false;
+  private graphPanRenderPending = false;
   private graphViewportPersistTimer: ReturnType<typeof setTimeout> | null =
     null;
 
@@ -289,6 +322,14 @@ export class GraphView extends BasesView {
   }
 
   public onDataUpdated(): void {
+    // A full re-render empties containerEl and detaches the live viewport. If
+    // that happens mid-pan, the in-flight pan gesture is orphaned (the camera
+    // freezes or runs away while the button is still held). Defer the render
+    // until the pan finishes, then replay it once.
+    if (this.graphPanActive) {
+      this.graphPanRenderPending = true;
+      return;
+    }
     this.render();
   }
 
@@ -296,6 +337,7 @@ export class GraphView extends BasesView {
     const previousViewportEl = this.containerEl.querySelector<HTMLElement>(
       ".base-board-graph-viewport",
     );
+    const previousWorldBounds = this.graphWorldBounds;
     const viewportState = previousViewportEl
       ? this.getGraphViewportState(previousViewportEl)
       : (this.graphViewportState ?? this.getSavedGraphViewportState());
@@ -317,14 +359,34 @@ export class GraphView extends BasesView {
     const edges = this.layoutGraph(nodes);
     this.renderToolbar(nodes);
     const viewportEl = this.renderCanvas(nodes, edges);
+    const restoredViewportState = this.getViewportStateForWorldChange(
+      viewportState,
+      previousWorldBounds,
+      this.graphWorldBounds,
+    );
 
     window.requestAnimationFrame(() => {
-      viewportEl.scrollLeft = viewportState
-        ? viewportState.scrollLeft
-        : GRAPH_PAN_MARGIN_X - EDGE_MARGIN;
-      viewportEl.scrollTop = viewportState
-        ? viewportState.scrollTop
-        : GRAPH_PAN_MARGIN_Y - EDGE_MARGIN;
+      if (restoredViewportState) {
+        if (
+          restoredViewportState.centerX !== undefined &&
+          restoredViewportState.centerY !== undefined
+        ) {
+          this.scrollViewportToWorldPoint(
+            viewportEl,
+            {
+              x: restoredViewportState.centerX,
+              y: restoredViewportState.centerY,
+            },
+            viewportEl.clientWidth / 2,
+            viewportEl.clientHeight / 2,
+          );
+        } else {
+          viewportEl.scrollLeft = restoredViewportState.scrollLeft;
+          viewportEl.scrollTop = restoredViewportState.scrollTop;
+        }
+      } else {
+        this.centerGraphCameraOnNodes(viewportEl, nodes);
+      }
       this.graphViewportState = this.getGraphViewportState(viewportEl);
     });
   }
@@ -356,6 +418,7 @@ export class GraphView extends BasesView {
     this.renderToolbarStat(toolbarEl, "Active", activeCount, "active");
     this.renderToolbarStat(toolbarEl, "Waiting", waitingCount, "waiting");
     this.renderToolbarStat(toolbarEl, "Completed", completedCount, "completed");
+    this.renderGraphZoomControls(toolbarEl);
     toolbarEl.createSpan({
       cls: "base-board-graph-version",
       text: `v${GRAPH_BUILD_VERSION}`,
@@ -378,8 +441,51 @@ export class GraphView extends BasesView {
     });
   }
 
+  private renderGraphZoomControls(toolbarEl: HTMLElement): void {
+    const controlsEl = toolbarEl.createDiv({
+      cls: "base-board-graph-zoom-controls",
+    });
+    this.renderGraphZoomButton(
+      controlsEl,
+      "lucide-zoom-out",
+      "Zoom out",
+      () => {
+        this.zoomGraphByFactor(1 / GRAPH_ZOOM_BUTTON_FACTOR);
+      },
+    );
+    this.renderGraphZoomButton(controlsEl, "lucide-home", "Zoom home", () => {
+      this.resetGraphCamera();
+    });
+    this.renderGraphZoomButton(controlsEl, "lucide-zoom-in", "Zoom in", () => {
+      this.zoomGraphByFactor(GRAPH_ZOOM_BUTTON_FACTOR);
+    });
+  }
+
+  private renderGraphZoomButton(
+    controlsEl: HTMLElement,
+    icon: string,
+    label: string,
+    onClick: () => void,
+  ): void {
+    const buttonEl = controlsEl.createEl("button", {
+      cls: "base-board-graph-zoom-button",
+      attr: {
+        type: "button",
+        "aria-label": label,
+      },
+    });
+    setIcon(buttonEl, icon);
+    setTooltip(buttonEl, label);
+    buttonEl.addEventListener("click", (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      onClick();
+    });
+  }
+
   private renderCanvas(nodes: GraphNode[], edges: GraphEdge[]): HTMLElement {
     const bounds = this.getGraphBounds(nodes);
+    this.graphWorldBounds = bounds.world;
     const viewportEl = this.containerEl.createDiv({
       cls: "base-board-graph-viewport",
     });
@@ -389,7 +495,7 @@ export class GraphView extends BasesView {
     viewportEl.addEventListener(
       "wheel",
       (event: WheelEvent) => {
-        this.zoomGraph(event, viewportEl, zoomContentEl, canvasEl, bounds);
+        this.zoomGraph(event, viewportEl, zoomContentEl, canvasEl);
       },
       { passive: false },
     );
@@ -739,14 +845,19 @@ export class GraphView extends BasesView {
     canvasEl: HTMLElement,
     bounds: { width: number; height: number },
   ): void {
+    const viewportEl = zoomContentEl.parentElement?.instanceOf(HTMLElement)
+      ? zoomContentEl.parentElement
+      : null;
+    const panMarginX = this.getGraphPanMarginX(viewportEl);
+    const panMarginY = this.getGraphPanMarginY(viewportEl);
     zoomContentEl.style.width = `${
-      GRAPH_PAN_MARGIN_X * 2 + bounds.width * this.graphZoom
+      panMarginX * 2 + bounds.width * this.graphZoom
     }px`;
     zoomContentEl.style.height = `${
-      GRAPH_PAN_MARGIN_Y * 2 + bounds.height * this.graphZoom
+      panMarginY * 2 + bounds.height * this.graphZoom
     }px`;
-    canvasEl.style.left = `${GRAPH_PAN_MARGIN_X}px`;
-    canvasEl.style.top = `${GRAPH_PAN_MARGIN_Y}px`;
+    canvasEl.style.left = `${panMarginX}px`;
+    canvasEl.style.top = `${panMarginY}px`;
     canvasEl.style.transform = `scale(${this.graphZoom})`;
   }
 
@@ -755,7 +866,6 @@ export class GraphView extends BasesView {
     viewportEl: HTMLElement,
     zoomContentEl: HTMLElement,
     canvasEl: HTMLElement,
-    bounds: { width: number; height: number },
   ): void {
     event.preventDefault();
     const previousZoom = this.graphZoom;
@@ -767,17 +877,136 @@ export class GraphView extends BasesView {
     const rect = viewportEl.getBoundingClientRect();
     const pointerX = event.clientX - rect.left;
     const pointerY = event.clientY - rect.top;
-    const graphX =
-      (viewportEl.scrollLeft + pointerX - GRAPH_PAN_MARGIN_X) / previousZoom;
-    const graphY =
-      (viewportEl.scrollTop + pointerY - GRAPH_PAN_MARGIN_Y) / previousZoom;
+    const focusPoint = this.getViewportWorldPoint(
+      viewportEl,
+      pointerX,
+      pointerY,
+      previousZoom,
+    );
 
     this.graphZoom = nextZoom;
-    this.applyGraphZoom(zoomContentEl, canvasEl, bounds);
-    viewportEl.scrollLeft = GRAPH_PAN_MARGIN_X + graphX * nextZoom - pointerX;
-    viewportEl.scrollTop = GRAPH_PAN_MARGIN_Y + graphY * nextZoom - pointerY;
+    this.applyGraphZoom(
+      zoomContentEl,
+      canvasEl,
+      this.getCurrentGraphCanvasBounds(),
+    );
+    this.scrollViewportToWorldPoint(viewportEl, focusPoint, pointerX, pointerY);
     this.graphViewportState = this.getGraphViewportState(viewportEl);
     this.schedulePersistGraphViewportState();
+  }
+
+  private zoomGraphByFactor(factor: number): void {
+    const viewportEl = this.getGraphViewportEl();
+    const zoomContentEl = this.containerEl.querySelector<HTMLElement>(
+      ".base-board-graph-zoom-content",
+    );
+    const canvasEl = this.containerEl.querySelector<HTMLElement>(
+      ".base-board-graph-canvas",
+    );
+    const world = this.graphWorldBounds;
+    if (!viewportEl || !zoomContentEl || !canvasEl || !world) return;
+
+    const previousZoom = this.graphZoom;
+    const nextZoom = this.clampGraphZoom(previousZoom * factor);
+    if (Math.abs(nextZoom - previousZoom) < 0.001) return;
+
+    const focusX = viewportEl.clientWidth / 2;
+    const focusY = viewportEl.clientHeight / 2;
+    const focusPoint = this.getViewportWorldPoint(
+      viewportEl,
+      focusX,
+      focusY,
+      previousZoom,
+    );
+
+    this.graphZoom = nextZoom;
+    this.applyGraphZoom(
+      zoomContentEl,
+      canvasEl,
+      this.getCurrentGraphCanvasBounds(),
+    );
+    this.scrollViewportToWorldPoint(viewportEl, focusPoint, focusX, focusY);
+    this.graphViewportState = this.getGraphViewportState(viewportEl);
+    this.schedulePersistGraphViewportState();
+  }
+
+  private resetGraphCamera(): void {
+    const viewportEl = this.getGraphViewportEl();
+    const zoomContentEl = this.containerEl.querySelector<HTMLElement>(
+      ".base-board-graph-zoom-content",
+    );
+    const canvasEl = this.containerEl.querySelector<HTMLElement>(
+      ".base-board-graph-canvas",
+    );
+    const world = this.graphWorldBounds;
+    if (!viewportEl || !zoomContentEl || !canvasEl || !world) return;
+
+    this.graphZoom = 1;
+    this.applyGraphZoom(
+      zoomContentEl,
+      canvasEl,
+      this.getCurrentGraphCanvasBounds(),
+    );
+    this.centerGraphCameraOnNodes(viewportEl, this.visibleNodes);
+    this.graphViewportState = this.getGraphViewportState(viewportEl);
+    this.persistGraphViewportState(this.graphViewportState);
+  }
+
+  private centerGraphCameraOnNodes(
+    viewportEl: HTMLElement,
+    nodes: GraphNode[],
+  ): void {
+    const bounds = this.getRenderedNodesCanvasBounds(nodes);
+    const centerX = (bounds.minX + bounds.maxX) / 2;
+    const centerY = (bounds.minY + bounds.maxY) / 2;
+    viewportEl.scrollLeft = Math.max(
+      0,
+      this.getGraphPanMarginX(viewportEl) +
+        centerX * this.graphZoom -
+        viewportEl.clientWidth / 2,
+    );
+    viewportEl.scrollTop = Math.max(
+      0,
+      this.getGraphPanMarginY(viewportEl) +
+        centerY * this.graphZoom -
+        viewportEl.clientHeight / 2,
+    );
+  }
+
+  private getRenderedNodesCanvasBounds(nodes: GraphNode[]): GraphWorldBounds {
+    if (nodes.length === 0) {
+      const world = this.graphWorldBounds;
+      if (!world) {
+        return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+      }
+      return {
+        minX: 0,
+        minY: 0,
+        maxX: world.maxX - world.minX,
+        maxY: world.maxY - world.minY,
+      };
+    }
+
+    return {
+      minX: Math.min(
+        ...nodes.map((node) => this.getNodeCanvasPosition(node).x),
+      ),
+      minY: Math.min(
+        ...nodes.map((node) => this.getNodeCanvasPosition(node).y),
+      ),
+      maxX: Math.max(
+        ...nodes.map((node) => {
+          const position = this.getNodeCanvasPosition(node);
+          return position.x + this.getRenderedGraphNodeSize(node).width;
+        }),
+      ),
+      maxY: Math.max(
+        ...nodes.map((node) => {
+          const position = this.getNodeCanvasPosition(node);
+          return position.y + this.getRenderedGraphNodeSize(node).height;
+        }),
+      ),
+    };
   }
 
   private clampGraphZoom(zoom: number): number {
@@ -785,10 +1014,17 @@ export class GraphView extends BasesView {
   }
 
   private getGraphViewportState(viewportEl: HTMLElement): GraphViewportState {
+    const center = this.getViewportWorldPoint(
+      viewportEl,
+      viewportEl.clientWidth / 2,
+      viewportEl.clientHeight / 2,
+    );
     return {
       scrollLeft: Math.max(0, viewportEl.scrollLeft),
       scrollTop: Math.max(0, viewportEl.scrollTop),
       zoom: this.graphZoom,
+      centerX: center.x,
+      centerY: center.y,
     };
   }
 
@@ -810,16 +1046,37 @@ export class GraphView extends BasesView {
       scrollLeft: Math.max(0, state.scrollLeft),
       scrollTop: Math.max(0, state.scrollTop),
       zoom: this.clampGraphZoom(state.zoom),
+      ...(typeof state.centerX === "number" &&
+      typeof state.centerY === "number" &&
+      Number.isFinite(state.centerX) &&
+      Number.isFinite(state.centerY)
+        ? { centerX: state.centerX, centerY: state.centerY }
+        : {}),
     };
   }
 
   private persistGraphViewportState(state: GraphViewportState | null): void {
     if (!state) return;
     this.graphViewportState = state;
+    // Persisting viewport state calls config.set, which can trigger a full
+    // re-render (onDataUpdated) and detach the live viewport. During an active
+    // pan that would orphan the pan handler mid-gesture (the camera freezes
+    // while the button is still held), so defer the write until the pan ends.
+    // finishPan re-invokes this after clearing graphPanActive to flush it.
+    if (this.graphPanActive) {
+      this.graphPanViewportPersistPending = true;
+      return;
+    }
     this.config?.set(CONFIG_KEY_GRAPH_VIEWPORT, {
       scrollLeft: Math.round(state.scrollLeft),
       scrollTop: Math.round(state.scrollTop),
       zoom: state.zoom,
+      ...(state.centerX !== undefined && state.centerY !== undefined
+        ? {
+            centerX: Math.round(state.centerX),
+            centerY: Math.round(state.centerY),
+          }
+        : {}),
     });
   }
 
@@ -854,8 +1111,8 @@ export class GraphView extends BasesView {
 
     const startX = event.clientX;
     const startY = event.clientY;
-    const startScrollLeft = viewportEl.scrollLeft;
-    const startScrollTop = viewportEl.scrollTop;
+    let lastClientX = startX;
+    let lastClientY = startY;
     let didPan = false;
     let isFinished = false;
 
@@ -864,16 +1121,26 @@ export class GraphView extends BasesView {
       clientY: number,
       moveEvent: Event,
     ) => {
+      // If a re-render detached the viewport mid-pan, its clientWidth collapses
+      // to 0 and world expansion would run away. End the pan cleanly instead.
+      if (!viewportEl.isConnected) {
+        finishPan();
+        return;
+      }
       const deltaX = clientX - startX;
       const deltaY = clientY - startY;
       if (!didPan && Math.hypot(deltaX, deltaY) >= GRAPH_PAN_THRESHOLD_PX) {
         didPan = true;
+        this.graphPanActive = true;
         viewportEl.addClass("base-board-graph-viewport--panning");
       }
       if (!didPan) return;
       moveEvent.preventDefault();
-      viewportEl.scrollLeft = startScrollLeft - deltaX;
-      viewportEl.scrollTop = startScrollTop - deltaY;
+      viewportEl.scrollLeft -= clientX - lastClientX;
+      viewportEl.scrollTop -= clientY - lastClientY;
+      lastClientX = clientX;
+      lastClientY = clientY;
+      this.expandGraphWorldForViewport(viewportEl);
     };
 
     const pointerMoveHandler = (moveEvent: PointerEvent) => {
@@ -907,12 +1174,27 @@ export class GraphView extends BasesView {
       }
 
       viewportEl.removeClass("base-board-graph-viewport--panning");
+      this.graphPanActive = false;
       if (didPan) {
         this.suppressNextNodeClick = true;
         window.setTimeout(() => {
           this.suppressNextNodeClick = false;
         }, 0);
-        this.persistGraphViewportState(this.getGraphViewportState(viewportEl));
+        if (this.graphPanWorldPersistPending && this.graphWorldBounds) {
+          this.graphPanWorldPersistPending = false;
+          this.persistGraphWorldBounds(this.graphWorldBounds);
+        }
+        if (viewportEl.isConnected) {
+          this.persistGraphViewportState(
+            this.getGraphViewportState(viewportEl),
+          );
+        }
+      }
+      this.graphPanWorldPersistPending = false;
+      this.graphPanViewportPersistPending = false;
+      if (this.graphPanRenderPending) {
+        this.graphPanRenderPending = false;
+        this.render();
       }
     };
 
@@ -953,8 +1235,7 @@ export class GraphView extends BasesView {
     const nodeEl = parentEl.createDiv({
       cls: `base-board-graph-node base-board-graph-node--${node.state}`,
     });
-    nodeEl.style.left = `${node.x}px`;
-    nodeEl.style.top = `${node.y}px`;
+    this.positionRenderedGraphNodeEl(nodeEl, node);
     nodeEl.style.setProperty(
       "--graph-node-color",
       getColumnColor(this.config, node.status),
@@ -1086,6 +1367,7 @@ export class GraphView extends BasesView {
     const movedNodeEls = Array.from(
       this.containerEl.querySelectorAll<HTMLElement>(".base-board-graph-node"),
     ).filter((nodeEl) => movedPaths.has(nodeEl.dataset.filePath ?? ""));
+    const viewportEl = this.getGraphViewportEl();
     const originalPositions = new Map(
       movedNodes.map((movedNode) => [
         movedNode.file.path,
@@ -1138,9 +1420,12 @@ export class GraphView extends BasesView {
           (candidate) => candidate.file.path === nodeEl.dataset.filePath,
         );
         if (!movedNode) continue;
-        nodeEl.style.left = `${movedNode.x}px`;
-        nodeEl.style.top = `${movedNode.y}px`;
+        this.positionRenderedGraphNodeEl(nodeEl, movedNode);
       }
+      this.expandGraphWorldForRect(
+        this.getNodesWorldBounds(movedNodes),
+        viewportEl,
+      );
       this.syncRenderedGraphEdges();
     };
 
@@ -1395,10 +1680,11 @@ export class GraphView extends BasesView {
     slot: GraphNodeAnchorSlot,
   ): GraphAnchorPoint {
     const size = this.getRenderedGraphNodeSize(node);
+    const position = this.getNodeCanvasPosition(node);
     return {
       side: slot.side,
-      x: node.x + size.width * slot.xRatio,
-      y: node.y + size.height * slot.yRatio,
+      x: position.x + size.width * slot.xRatio,
+      y: position.y + size.height * slot.yRatio,
     };
   }
 
@@ -1552,15 +1838,31 @@ export class GraphView extends BasesView {
   ): { x: number; y: number } {
     let minAllowedX = Number.NEGATIVE_INFINITY;
     let minAllowedY = Number.NEGATIVE_INFINITY;
+    let maxAllowedX = Number.POSITIVE_INFINITY;
+    let maxAllowedY = Number.POSITIVE_INFINITY;
     for (const node of movedNodes) {
       const original = originalPositions.get(node.file.path);
       if (!original) continue;
-      minAllowedX = Math.max(minAllowedX, EDGE_MARGIN - original.x);
-      minAllowedY = Math.max(minAllowedY, EDGE_MARGIN - original.y);
+      minAllowedX = Math.max(
+        minAllowedX,
+        -GRAPH_WORLD_SAFETY_LIMIT - original.x,
+      );
+      minAllowedY = Math.max(
+        minAllowedY,
+        -GRAPH_WORLD_SAFETY_LIMIT - original.y,
+      );
+      maxAllowedX = Math.min(
+        maxAllowedX,
+        GRAPH_WORLD_SAFETY_LIMIT - original.x,
+      );
+      maxAllowedY = Math.min(
+        maxAllowedY,
+        GRAPH_WORLD_SAFETY_LIMIT - original.y,
+      );
     }
     return {
-      x: Math.max(deltaX, minAllowedX),
-      y: Math.max(deltaY, minAllowedY),
+      x: Math.max(minAllowedX, Math.min(maxAllowedX, deltaX)),
+      y: Math.max(minAllowedY, Math.min(maxAllowedY, deltaY)),
     };
   }
 
@@ -1625,7 +1927,7 @@ export class GraphView extends BasesView {
     const nodeEl = activeDocument
       .elementsFromPoint(clientX, clientY)
       .map((element) =>
-        element instanceof Element
+        element.instanceOf(Element)
           ? element.closest<HTMLElement>(".base-board-graph-node")
           : null,
       )
@@ -1650,7 +1952,7 @@ export class GraphView extends BasesView {
   } | null {
     const sourceNode = this.getEdgeEndpointNode(sourceEdge, sourceEndpoint);
     for (const element of activeDocument.elementsFromPoint(clientX, clientY)) {
-      if (!(element instanceof SVGCircleElement)) continue;
+      if (!element.instanceOf(SVGCircleElement)) continue;
       if (element === sourceHandleEl) continue;
       if (!element.hasClass("base-board-graph-edge-handle")) continue;
       const target = this.getRenderedGraphEdgeHandleTarget(element);
@@ -2285,7 +2587,9 @@ export class GraphView extends BasesView {
     event.preventDefault();
     event.stopPropagation();
 
-    const point = this.getGraphPointFromElement(event, canvasEl);
+    const point = this.canvasToWorldPoint(
+      this.getGraphPointFromElement(event, canvasEl),
+    );
     const menu = new Menu();
     this.addGraphCreateMenuItems(menu, null, point);
 
@@ -2299,7 +2603,7 @@ export class GraphView extends BasesView {
   ): void {
     menu.addItem((item) => {
       item
-        .setTitle("Add Node")
+        .setTitle("Add node")
         .setIcon("lucide-plus")
         .onClick(() => {
           this.showAddNodeModal(sourceNode, point);
@@ -2307,7 +2611,7 @@ export class GraphView extends BasesView {
     });
     menu.addItem((item) => {
       item
-        .setTitle("Add Template")
+        .setTitle("Add template")
         .setIcon("lucide-layout-template")
         .onClick(() => {
           this.showAddTemplateModal(sourceNode, point);
@@ -2355,6 +2659,10 @@ export class GraphView extends BasesView {
   ): Promise<void> {
     const safeTitle = title.trim();
     if (!safeTitle) return;
+    this.expandGraphWorldForRect(
+      this.getTemplateInsertionWorldBounds(point),
+      this.getGraphViewportEl(),
+    );
     await this.createTemplateNode({
       title: safeTitle,
       type,
@@ -2423,6 +2731,10 @@ export class GraphView extends BasesView {
   ): Promise<void> {
     const title = rawTitle.trim();
     if (!title) return;
+    this.expandGraphWorldForRect(
+      this.getTemplateInsertionWorldBounds(point),
+      this.getGraphViewportEl(),
+    );
     try {
       if (template === "feature-simple" || template === "feature-detailed") {
         await this.insertFeatureTemplate(null, title, {
@@ -2977,15 +3289,22 @@ export class GraphView extends BasesView {
     sourceNode: GraphNode | null,
     point: { x: number; y: number } | undefined,
   ): { x: number; y: number } {
-    if (point) return point;
-    if (!sourceNode) return { x: EDGE_MARGIN, y: EDGE_MARGIN };
-    return {
-      x: sourceNode.x,
-      y:
-        sourceNode.y +
-        this.getRenderedGraphNodeSize(sourceNode).height +
-        GRAPH_TEMPLATE_CHILD_Y_STEP,
-    };
+    const origin =
+      point ??
+      (!sourceNode
+        ? { x: 0, y: 0 }
+        : {
+            x: sourceNode.x,
+            y:
+              sourceNode.y +
+              this.getRenderedGraphNodeSize(sourceNode).height +
+              GRAPH_TEMPLATE_CHILD_Y_STEP,
+          });
+    this.expandGraphWorldForRect(
+      this.getTemplateInsertionWorldBounds(origin),
+      this.getGraphViewportEl(),
+    );
+    return origin;
   }
 
   private getTemplateChildPosition(
@@ -2994,11 +3313,8 @@ export class GraphView extends BasesView {
     depth: number,
   ): { x: number; y: number } {
     return {
-      x: Math.max(
-        EDGE_MARGIN,
-        origin.x + horizontalSlot * GRAPH_TEMPLATE_CHILD_X_STEP,
-      ),
-      y: Math.max(EDGE_MARGIN, origin.y + depth * GRAPH_TEMPLATE_CHILD_Y_STEP),
+      x: origin.x + horizontalSlot * GRAPH_TEMPLATE_CHILD_X_STEP,
+      y: origin.y + depth * GRAPH_TEMPLATE_CHILD_Y_STEP,
     };
   }
 
@@ -3698,24 +4014,33 @@ export class GraphView extends BasesView {
     ratio: number,
   ): GraphAnchorPoint {
     const nodeSize = this.getRenderedGraphNodeSize(node);
+    const position = this.getNodeCanvasPosition(node);
     const clampedRatio = this.clampRatio(ratio);
     if (side === "top") {
-      return { side, x: node.x + nodeSize.width * clampedRatio, y: node.y };
+      return {
+        side,
+        x: position.x + nodeSize.width * clampedRatio,
+        y: position.y,
+      };
     }
     if (side === "bottom") {
       return {
         side,
-        x: node.x + nodeSize.width * clampedRatio,
-        y: node.y + nodeSize.height,
+        x: position.x + nodeSize.width * clampedRatio,
+        y: position.y + nodeSize.height,
       };
     }
     if (side === "left") {
-      return { side, x: node.x, y: node.y + nodeSize.height * clampedRatio };
+      return {
+        side,
+        x: position.x,
+        y: position.y + nodeSize.height * clampedRatio,
+      };
     }
     return {
       side,
-      x: node.x + nodeSize.width,
-      y: node.y + nodeSize.height * clampedRatio,
+      x: position.x + nodeSize.width,
+      y: position.y + nodeSize.height * clampedRatio,
     };
   }
 
@@ -3733,10 +4058,11 @@ export class GraphView extends BasesView {
     anchor: GraphAnchorPoint,
   ): GraphEndpointAnchorOverride {
     const nodeSize = this.getRenderedGraphNodeSize(node);
+    const position = this.getNodeCanvasPosition(node);
     return {
       side: anchor.side,
-      xRatio: this.clampRatio((anchor.x - node.x) / nodeSize.width),
-      yRatio: this.clampRatio((anchor.y - node.y) / nodeSize.height),
+      xRatio: this.clampRatio((anchor.x - position.x) / nodeSize.width),
+      yRatio: this.clampRatio((anchor.y - position.y) / nodeSize.height),
     };
   }
 
@@ -3745,10 +4071,11 @@ export class GraphView extends BasesView {
     override: GraphEndpointAnchorOverride,
   ): GraphAnchorPoint {
     const nodeSize = this.getRenderedGraphNodeSize(node);
+    const position = this.getNodeCanvasPosition(node);
     return {
       side: override.side,
-      x: node.x + nodeSize.width * override.xRatio,
-      y: node.y + nodeSize.height * override.yRatio,
+      x: position.x + nodeSize.width * override.xRatio,
+      y: position.y + nodeSize.height * override.yRatio,
     };
   }
 
@@ -3843,6 +4170,7 @@ export class GraphView extends BasesView {
   ): GraphAnchorPoint {
     const side = this.getNearestAnchorSide(node, towardNode);
     const nodeSize = this.getRenderedGraphNodeSize(node);
+    const position = this.getNodeCanvasPosition(node);
     const towardCenter = this.getNodeCenter(towardNode);
     const nodeCenter = this.getNodeCenter(node);
     const horizontalBias = this.getHorizontalAnchorLaneBias(
@@ -3859,28 +4187,28 @@ export class GraphView extends BasesView {
     if (side === "top") {
       return {
         side,
-        x: node.x + nodeSize.width * horizontalBias,
-        y: node.y,
+        x: position.x + nodeSize.width * horizontalBias,
+        y: position.y,
       };
     }
     if (side === "bottom") {
       return {
         side,
-        x: node.x + nodeSize.width * horizontalBias,
-        y: node.y + nodeSize.height,
+        x: position.x + nodeSize.width * horizontalBias,
+        y: position.y + nodeSize.height,
       };
     }
     if (side === "right") {
       return {
         side,
-        x: node.x + nodeSize.width,
-        y: node.y + nodeSize.height * verticalBias,
+        x: position.x + nodeSize.width,
+        y: position.y + nodeSize.height * verticalBias,
       };
     }
     return {
       side,
-      x: node.x,
-      y: node.y + nodeSize.height * verticalBias,
+      x: position.x,
+      y: position.y + nodeSize.height * verticalBias,
     };
   }
 
@@ -3964,9 +4292,10 @@ export class GraphView extends BasesView {
 
   private getNodeCenter(node: GraphNode): { x: number; y: number } {
     const nodeSize = this.getRenderedGraphNodeSize(node);
+    const position = this.getNodeCanvasPosition(node);
     return {
-      x: node.x + nodeSize.width / 2,
-      y: node.y + nodeSize.height / 2,
+      x: position.x + nodeSize.width / 2,
+      y: position.y + nodeSize.height / 2,
     };
   }
 
@@ -3981,16 +4310,476 @@ export class GraphView extends BasesView {
     };
   }
 
-  private getGraphBounds(nodes: GraphNode[]): {
-    width: number;
-    height: number;
+  private getNodeCanvasPosition(node: GraphNode): { x: number; y: number } {
+    return this.worldToCanvasPoint({ x: node.x, y: node.y });
+  }
+
+  private positionRenderedGraphNodeEl(
+    nodeEl: HTMLElement,
+    node: GraphNode,
+  ): void {
+    const position = this.getNodeCanvasPosition(node);
+    nodeEl.style.left = `${position.x}px`;
+    nodeEl.style.top = `${position.y}px`;
+  }
+
+  private positionRenderedGraphNodes(): void {
+    for (const node of this.visibleNodes) {
+      const nodeEl = this.getRenderedGraphNodeEl(node);
+      if (!nodeEl) continue;
+      this.positionRenderedGraphNodeEl(nodeEl, node);
+    }
+  }
+
+  private worldToCanvasPoint(point: { x: number; y: number }): {
+    x: number;
+    y: number;
   } {
-    const maxX = Math.max(...nodes.map((node) => node.x + NODE_WIDTH));
-    const maxY = Math.max(...nodes.map((node) => node.y + NODE_MIN_HEIGHT));
+    const world = this.graphWorldBounds;
+    if (!world) return point;
     return {
-      width: Math.max(maxX + 160, 720),
-      height: Math.max(maxY + 160, 420),
+      x: point.x - world.minX,
+      y: point.y - world.minY,
     };
+  }
+
+  private canvasToWorldPoint(point: { x: number; y: number }): {
+    x: number;
+    y: number;
+  } {
+    const world = this.graphWorldBounds;
+    if (!world) return point;
+    return {
+      x: point.x + world.minX,
+      y: point.y + world.minY,
+    };
+  }
+
+  private getViewportWorldPoint(
+    viewportEl: HTMLElement,
+    viewportX: number,
+    viewportY: number,
+    zoom = this.graphZoom,
+  ): { x: number; y: number } {
+    return this.canvasToWorldPoint({
+      x:
+        (viewportEl.scrollLeft +
+          viewportX -
+          this.getGraphPanMarginX(viewportEl)) /
+        zoom,
+      y:
+        (viewportEl.scrollTop +
+          viewportY -
+          this.getGraphPanMarginY(viewportEl)) /
+        zoom,
+    });
+  }
+
+  private scrollViewportToWorldPoint(
+    viewportEl: HTMLElement,
+    worldPoint: { x: number; y: number },
+    viewportX: number,
+    viewportY: number,
+  ): void {
+    const canvasPoint = this.worldToCanvasPoint(worldPoint);
+    viewportEl.scrollLeft = Math.max(
+      0,
+      this.getGraphPanMarginX(viewportEl) +
+        canvasPoint.x * this.graphZoom -
+        viewportX,
+    );
+    viewportEl.scrollTop = Math.max(
+      0,
+      this.getGraphPanMarginY(viewportEl) +
+        canvasPoint.y * this.graphZoom -
+        viewportY,
+    );
+  }
+
+  private getGraphBounds(nodes: GraphNode[]): GraphCanvasBounds {
+    const contentBounds = this.getContentWorldBounds(nodes);
+    const savedBounds = this.getSavedGraphWorldBounds();
+    const baseBounds = savedBounds
+      ? this.mergeGraphWorldBounds(savedBounds, contentBounds)
+      : contentBounds;
+    const world = this.expandGraphWorldBounds(
+      baseBounds,
+      contentBounds,
+      GRAPH_WORLD_CONTENT_PADDING_X,
+      GRAPH_WORLD_CONTENT_PADDING_Y,
+    );
+
+    if (!savedBounds || !this.areGraphWorldBoundsEqual(savedBounds, world)) {
+      this.persistGraphWorldBounds(world);
+    }
+
+    return this.getCanvasBoundsFromWorld(world);
+  }
+
+  private getContentWorldBounds(nodes: GraphNode[]): GraphWorldBounds {
+    if (nodes.length === 0) {
+      return this.normalizeGraphWorldBounds({
+        minX: 0,
+        minY: 0,
+        maxX: NODE_WIDTH,
+        maxY: NODE_MIN_HEIGHT,
+      });
+    }
+
+    return this.normalizeGraphWorldBounds({
+      minX: Math.min(...nodes.map((node) => node.x)),
+      minY: Math.min(...nodes.map((node) => node.y)),
+      maxX: Math.max(...nodes.map((node) => node.x + NODE_WIDTH)),
+      maxY: Math.max(...nodes.map((node) => node.y + NODE_MIN_HEIGHT)),
+    });
+  }
+
+  private getNodesWorldBounds(nodes: GraphNode[]): GraphWorldBounds {
+    if (nodes.length === 0) {
+      return this.getContentWorldBounds(this.visibleNodes);
+    }
+
+    return this.normalizeGraphWorldBounds({
+      minX: Math.min(...nodes.map((node) => node.x)),
+      minY: Math.min(...nodes.map((node) => node.y)),
+      maxX: Math.max(
+        ...nodes.map(
+          (node) => node.x + this.getRenderedGraphNodeSize(node).width,
+        ),
+      ),
+      maxY: Math.max(
+        ...nodes.map(
+          (node) => node.y + this.getRenderedGraphNodeSize(node).height,
+        ),
+      ),
+    });
+  }
+
+  private getTemplateInsertionWorldBounds(origin: {
+    x: number;
+    y: number;
+  }): GraphWorldBounds {
+    return this.normalizeGraphWorldBounds({
+      minX: origin.x - GRAPH_WORLD_TEMPLATE_PADDING_X,
+      minY: origin.y - GRAPH_WORLD_TEMPLATE_PADDING_Y,
+      maxX: origin.x + GRAPH_WORLD_TEMPLATE_PADDING_X,
+      maxY:
+        origin.y +
+        GRAPH_TEMPLATE_CHILD_Y_STEP * 3 +
+        GRAPH_WORLD_TEMPLATE_PADDING_Y,
+    });
+  }
+
+  private getSavedGraphWorldBounds(): GraphWorldBounds | null {
+    const raw = this.config?.get(CONFIG_KEY_GRAPH_WORLD);
+    if (!raw || typeof raw !== "object") return null;
+    const bounds = raw as Partial<GraphWorldBounds>;
+    if (
+      typeof bounds.minX !== "number" ||
+      typeof bounds.minY !== "number" ||
+      typeof bounds.maxX !== "number" ||
+      typeof bounds.maxY !== "number" ||
+      !Number.isFinite(bounds.minX) ||
+      !Number.isFinite(bounds.minY) ||
+      !Number.isFinite(bounds.maxX) ||
+      !Number.isFinite(bounds.maxY) ||
+      bounds.minX >= bounds.maxX ||
+      bounds.minY >= bounds.maxY
+    ) {
+      return null;
+    }
+
+    return this.normalizeGraphWorldBounds(bounds as GraphWorldBounds);
+  }
+
+  private persistGraphWorldBounds(bounds: GraphWorldBounds): void {
+    // Persisting world bounds calls config.set, which can trigger a full
+    // re-render (onDataUpdated) and detach the live viewport. During an active
+    // pan that would orphan the pan handler's viewport reference and send the
+    // camera running off screen, so defer persistence until the pan finishes.
+    if (this.graphPanActive) {
+      this.graphPanWorldPersistPending = true;
+      return;
+    }
+    this.config?.set(CONFIG_KEY_GRAPH_WORLD, {
+      minX: Math.round(bounds.minX),
+      minY: Math.round(bounds.minY),
+      maxX: Math.round(bounds.maxX),
+      maxY: Math.round(bounds.maxY),
+    });
+  }
+
+  private getViewportStateForWorldChange(
+    state: GraphViewportState | null,
+    previousWorld: GraphWorldBounds | null,
+    nextWorld: GraphWorldBounds | null,
+  ): GraphViewportState | null {
+    if (!state || !previousWorld || !nextWorld) return state;
+    return {
+      scrollLeft: Math.max(
+        0,
+        state.scrollLeft + (previousWorld.minX - nextWorld.minX) * state.zoom,
+      ),
+      scrollTop: Math.max(
+        0,
+        state.scrollTop + (previousWorld.minY - nextWorld.minY) * state.zoom,
+      ),
+      zoom: state.zoom,
+      ...(state.centerX !== undefined && state.centerY !== undefined
+        ? { centerX: state.centerX, centerY: state.centerY }
+        : {}),
+    };
+  }
+
+  private expandGraphWorldForViewport(viewportEl: HTMLElement): void {
+    const world = this.graphWorldBounds;
+    if (!world) return;
+    // A detached or zero-size viewport reports clientWidth/Height of 0, which
+    // makes the visible rect collapse and forces unbounded edge expansion.
+    if (!viewportEl.isConnected || viewportEl.clientWidth === 0) return;
+    const panMarginX = this.getGraphPanMarginX(viewportEl);
+    const panMarginY = this.getGraphPanMarginY(viewportEl);
+
+    const visibleLeft = (viewportEl.scrollLeft - panMarginX) / this.graphZoom;
+    const visibleTop = (viewportEl.scrollTop - panMarginY) / this.graphZoom;
+    const visibleRight =
+      (viewportEl.scrollLeft + viewportEl.clientWidth - panMarginX) /
+      this.graphZoom;
+    const visibleBottom =
+      (viewportEl.scrollTop + viewportEl.clientHeight - panMarginY) /
+      this.graphZoom;
+    let nextWorld = world;
+
+    if (visibleLeft < GRAPH_WORLD_EDGE_THRESHOLD_X) {
+      nextWorld = {
+        ...nextWorld,
+        minX: nextWorld.minX - GRAPH_WORLD_EXPAND_CHUNK_X,
+      };
+    }
+    if (
+      nextWorld.maxX - nextWorld.minX - visibleRight <
+      GRAPH_WORLD_EDGE_THRESHOLD_X
+    ) {
+      nextWorld = {
+        ...nextWorld,
+        maxX: nextWorld.maxX + GRAPH_WORLD_EXPAND_CHUNK_X,
+      };
+    }
+    if (visibleTop < GRAPH_WORLD_EDGE_THRESHOLD_Y) {
+      nextWorld = {
+        ...nextWorld,
+        minY: nextWorld.minY - GRAPH_WORLD_EXPAND_CHUNK_Y,
+      };
+    }
+    if (
+      nextWorld.maxY - nextWorld.minY - visibleBottom <
+      GRAPH_WORLD_EDGE_THRESHOLD_Y
+    ) {
+      nextWorld = {
+        ...nextWorld,
+        maxY: nextWorld.maxY + GRAPH_WORLD_EXPAND_CHUNK_Y,
+      };
+    }
+
+    this.applyGraphWorldBounds(nextWorld, viewportEl);
+  }
+
+  private expandGraphWorldForRect(
+    rect: GraphWorldBounds,
+    viewportEl: HTMLElement | null,
+  ): void {
+    const world = this.graphWorldBounds ?? this.getSavedGraphWorldBounds();
+    if (!world) return;
+    const nextWorld = this.expandGraphWorldBounds(
+      world,
+      rect,
+      GRAPH_WORLD_EDGE_THRESHOLD_X,
+      GRAPH_WORLD_EDGE_THRESHOLD_Y,
+    );
+    this.applyGraphWorldBounds(nextWorld, viewportEl);
+  }
+
+  private applyGraphWorldBounds(
+    bounds: GraphWorldBounds,
+    viewportEl: HTMLElement | null,
+  ): void {
+    const previousWorld = this.graphWorldBounds;
+    const viewportCenter = viewportEl
+      ? this.getViewportWorldPoint(
+          viewportEl,
+          viewportEl.clientWidth / 2,
+          viewportEl.clientHeight / 2,
+        )
+      : null;
+    const nextWorld = this.normalizeGraphWorldBounds(bounds);
+    if (
+      previousWorld &&
+      this.areGraphWorldBoundsEqual(previousWorld, nextWorld)
+    ) {
+      return;
+    }
+
+    this.graphWorldBounds = nextWorld;
+    this.persistGraphWorldBounds(nextWorld);
+
+    this.resizeRenderedGraphCanvas();
+    this.positionRenderedGraphNodes();
+    this.syncRenderedGraphEdges();
+
+    if (viewportEl) {
+      if (viewportCenter) {
+        this.scrollViewportToWorldPoint(
+          viewportEl,
+          viewportCenter,
+          viewportEl.clientWidth / 2,
+          viewportEl.clientHeight / 2,
+        );
+      }
+      this.graphViewportState = this.getGraphViewportState(viewportEl);
+      this.schedulePersistGraphViewportState();
+    }
+  }
+
+  private resizeRenderedGraphCanvas(): void {
+    const world = this.graphWorldBounds;
+    if (!world) return;
+    const bounds = this.getCanvasBoundsFromWorld(world);
+    const viewportEl = this.getGraphViewportEl();
+    const zoomContentEl = this.containerEl.querySelector<HTMLElement>(
+      ".base-board-graph-zoom-content",
+    );
+    const canvasEl = this.containerEl.querySelector<HTMLElement>(
+      ".base-board-graph-canvas",
+    );
+    const svgEl = this.containerEl.querySelector<SVGSVGElement>(
+      ".base-board-graph-edges",
+    );
+    if (!viewportEl || !zoomContentEl || !canvasEl || !svgEl) return;
+
+    canvasEl.style.width = `${bounds.width}px`;
+    canvasEl.style.height = `${bounds.height}px`;
+    svgEl.setAttribute("width", String(bounds.width));
+    svgEl.setAttribute("height", String(bounds.height));
+    svgEl.setAttribute("viewBox", `0 0 ${bounds.width} ${bounds.height}`);
+    this.applyGraphZoom(zoomContentEl, canvasEl, bounds);
+  }
+
+  private getGraphViewportEl(): HTMLElement | null {
+    return this.containerEl.querySelector<HTMLElement>(
+      ".base-board-graph-viewport",
+    );
+  }
+
+  private getGraphPanMarginX(viewportEl: HTMLElement | null): number {
+    return Math.max(GRAPH_PAN_MARGIN_X, viewportEl?.clientWidth ?? 0);
+  }
+
+  private getGraphPanMarginY(viewportEl: HTMLElement | null): number {
+    return Math.max(GRAPH_PAN_MARGIN_Y, viewportEl?.clientHeight ?? 0);
+  }
+
+  private getCurrentGraphCanvasBounds(): GraphCanvasBounds {
+    return this.getCanvasBoundsFromWorld(
+      this.graphWorldBounds ?? this.getContentWorldBounds(this.visibleNodes),
+    );
+  }
+
+  private getCanvasBoundsFromWorld(world: GraphWorldBounds): GraphCanvasBounds {
+    const normalizedWorld = this.normalizeGraphWorldBounds(world);
+    return {
+      world: normalizedWorld,
+      width: Math.max(1, normalizedWorld.maxX - normalizedWorld.minX),
+      height: Math.max(1, normalizedWorld.maxY - normalizedWorld.minY),
+    };
+  }
+
+  private expandGraphWorldBounds(
+    bounds: GraphWorldBounds,
+    target: GraphWorldBounds,
+    paddingX: number,
+    paddingY: number,
+  ): GraphWorldBounds {
+    return this.normalizeGraphWorldBounds({
+      minX: Math.min(bounds.minX, target.minX - paddingX),
+      minY: Math.min(bounds.minY, target.minY - paddingY),
+      maxX: Math.max(bounds.maxX, target.maxX + paddingX),
+      maxY: Math.max(bounds.maxY, target.maxY + paddingY),
+    });
+  }
+
+  private mergeGraphWorldBounds(
+    first: GraphWorldBounds,
+    second: GraphWorldBounds,
+  ): GraphWorldBounds {
+    return this.normalizeGraphWorldBounds({
+      minX: Math.min(first.minX, second.minX),
+      minY: Math.min(first.minY, second.minY),
+      maxX: Math.max(first.maxX, second.maxX),
+      maxY: Math.max(first.maxY, second.maxY),
+    });
+  }
+
+  private normalizeGraphWorldBounds(
+    bounds: GraphWorldBounds,
+  ): GraphWorldBounds {
+    let minX = Math.max(
+      -GRAPH_WORLD_SAFETY_LIMIT,
+      Math.floor(Math.min(bounds.minX, bounds.maxX)),
+    );
+    let maxX = Math.min(
+      GRAPH_WORLD_SAFETY_LIMIT,
+      Math.ceil(Math.max(bounds.minX, bounds.maxX)),
+    );
+    let minY = Math.max(
+      -GRAPH_WORLD_SAFETY_LIMIT,
+      Math.floor(Math.min(bounds.minY, bounds.maxY)),
+    );
+    let maxY = Math.min(
+      GRAPH_WORLD_SAFETY_LIMIT,
+      Math.ceil(Math.max(bounds.minY, bounds.maxY)),
+    );
+
+    if (maxX - minX < GRAPH_WORLD_MIN_WIDTH) {
+      const centerX = (minX + maxX) / 2;
+      minX = Math.floor(centerX - GRAPH_WORLD_MIN_WIDTH / 2);
+      maxX = Math.ceil(centerX + GRAPH_WORLD_MIN_WIDTH / 2);
+    }
+    if (maxY - minY < GRAPH_WORLD_MIN_HEIGHT) {
+      const centerY = (minY + maxY) / 2;
+      minY = Math.floor(centerY - GRAPH_WORLD_MIN_HEIGHT / 2);
+      maxY = Math.ceil(centerY + GRAPH_WORLD_MIN_HEIGHT / 2);
+    }
+
+    if (minX < -GRAPH_WORLD_SAFETY_LIMIT) {
+      maxX += -GRAPH_WORLD_SAFETY_LIMIT - minX;
+      minX = -GRAPH_WORLD_SAFETY_LIMIT;
+    }
+    if (maxX > GRAPH_WORLD_SAFETY_LIMIT) {
+      minX -= maxX - GRAPH_WORLD_SAFETY_LIMIT;
+      maxX = GRAPH_WORLD_SAFETY_LIMIT;
+    }
+    if (minY < -GRAPH_WORLD_SAFETY_LIMIT) {
+      maxY += -GRAPH_WORLD_SAFETY_LIMIT - minY;
+      minY = -GRAPH_WORLD_SAFETY_LIMIT;
+    }
+    if (maxY > GRAPH_WORLD_SAFETY_LIMIT) {
+      minY -= maxY - GRAPH_WORLD_SAFETY_LIMIT;
+      maxY = GRAPH_WORLD_SAFETY_LIMIT;
+    }
+
+    return { minX, minY, maxX, maxY };
+  }
+
+  private areGraphWorldBoundsEqual(
+    first: GraphWorldBounds,
+    second: GraphWorldBounds,
+  ): boolean {
+    return (
+      Math.round(first.minX) === Math.round(second.minX) &&
+      Math.round(first.minY) === Math.round(second.minY) &&
+      Math.round(first.maxX) === Math.round(second.maxX) &&
+      Math.round(first.maxY) === Math.round(second.maxY)
+    );
   }
 
   private getTitle(entry: BasesEntry, file: TFile): string {
@@ -4404,7 +5193,7 @@ class GraphTemplateModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("base-board-graph-template-modal");
-    contentEl.createEl("h3", { text: "Add Template" });
+    contentEl.createEl("h3", { text: "Add template" });
 
     const bodyEl = contentEl.createDiv({
       cls: "base-board-graph-template-modal-body",
