@@ -17,6 +17,13 @@ This repository is an Obsidian plugin named Base Board. It adds Kanban and Timel
 - Deploy with `npm run deploy -- "<path-to-obsidian-vault>"` after identifying the local vault path.
 - `npm run lint` may report repo-wide CRLF/Prettier noise in untouched files on Windows. For focused timeline work, verify the edited file with `npx eslint "src/timeline-view.ts"` plus `npm run build`.
 
+## Deploy After Every Code Change (standing request)
+
+- The user has asked that, after any response that modifies plugin code, the agent **deploys automatically without being asked**.
+- At the end of each turn that changed `src/` (or other build inputs), run `npm run deploy -- "<vault path>"` and then remind the user to reload/toggle the Base Board plugin in Obsidian.
+- The current local work vault is `C:\Users\Dustin\Documents\Github\Obsidian\obsidian-msft`. Verify it exists (look for the `.obsidian` folder) before deploying; if it is missing or ambiguous, ask for the vault path instead of guessing.
+- `npm run deploy` runs the build first, so it also serves as build verification.
+
 ## Working Guidelines
 
 - Preserve user edits and synced changes. If the workspace reports that a file changed externally, reread it before editing.

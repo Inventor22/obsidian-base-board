@@ -2374,6 +2374,14 @@
   stroke-dasharray: 5 5;
 }
 
+.base-board-graph-edge--break-dormant {
+  stroke: color-mix(
+    in srgb,
+    var(--text-success) 42%,
+    var(--background-modifier-border)
+  );
+}
+
 .base-board-graph-edge--restart {
   stroke: color-mix(
     in srgb,
@@ -2412,6 +2420,14 @@
   fill: color-mix(
     in srgb,
     var(--text-error) 78%,
+    var(--background-modifier-border)
+  );
+}
+
+.base-board-graph-arrow-marker--break-dormant path {
+  fill: color-mix(
+    in srgb,
+    var(--text-success) 42%,
     var(--background-modifier-border)
   );
 }
@@ -2648,11 +2664,16 @@
 .base-board-graph-node--active {
   border-color: color-mix(
     in srgb,
-    var(--interactive-accent) 70%,
+    var(--graph-node-color, var(--interactive-accent)) 70%,
     var(--background-modifier-border)
   );
   box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--interactive-accent) 32%, transparent),
+    0 0 0 1px
+      color-mix(
+        in srgb,
+        var(--graph-node-color, var(--interactive-accent)) 32%,
+        transparent
+      ),
     0 4px 16px rgba(0, 0, 0, 0.16);
 }
 
@@ -2676,7 +2697,7 @@
 }
 
 .base-board-graph-node-state--active {
-  color: var(--interactive-accent);
+  color: var(--graph-node-color, var(--interactive-accent));
 }
 
 .base-board-graph-node-state--completed {

@@ -221,7 +221,12 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.09.12";
+const GRAPH_BUILD_VERSION = "2026.06.10.5";
+const GRAPH_STATUS_ACTIVE = "In Progress";
+const GRAPH_STATUS_COMPLETED = "Completed";
+const GRAPH_STATUS_PLANNED = "Planned";
+const GRAPH_STATUS_FAILED = "Failed";
+const GRAPH_STATUS_INVALIDATED = "Invalidated";
 const NODE_WIDTH = 220;
 const NODE_MIN_HEIGHT = 92;
 const X_STEP = 300;
@@ -289,6 +294,8 @@ export class GraphView extends BasesView {
     to: SVGCircleElement;
   }[] = [];
   private pendingGraphPositions = new Map<string, { x: number; y: number }>();
+  private breakEscalationSourcePaths = new Set<string>();
+  private graphParentByPath = new Map<string, GraphNode>();
   private graphEndpointAnchorOverrides = new Map<
     string,
     GraphEndpointAnchorOverride
@@ -550,6 +557,7 @@ export class GraphView extends BasesView {
       "requirement-return",
       "gating",
       "break",
+      "break-dormant",
       "restart",
     ] as const) {
       const markerEl = activeDocument.createElementNS(
@@ -581,6 +589,7 @@ export class GraphView extends BasesView {
     this.renderedGraphEdgeEls = [];
     this.renderedGraphEdgeHitEls = [];
     this.renderedGraphEdgeHandleEls = [];
+    this.recomputeBreakEscalation();
     for (const edge of edges) {
       const pathEl = activeDocument.createElementNS(
         "http://www.w3.org/2000/svg",
@@ -588,11 +597,15 @@ export class GraphView extends BasesView {
       );
       pathEl.addClass("base-board-graph-edge");
       pathEl.addClass(`base-board-graph-edge--${edge.kind}`);
+      const markerKind = this.getEdgeMarkerKind(edge);
+      if (markerKind !== edge.kind) {
+        pathEl.addClass(`base-board-graph-edge--${markerKind}`);
+      }
       pathEl.setAttribute("fill", "none");
       pathEl.setAttribute("d", this.getEdgePath(edge));
       pathEl.setAttribute(
         "marker-end",
-        `url(#base-board-graph-arrow-${edge.kind})`,
+        `url(#base-board-graph-arrow-${markerKind})`,
       );
       svgEl.appendChild(pathEl);
       this.renderedGraphEdgeEls.push(pathEl);
@@ -2215,6 +2228,387 @@ export class GraphView extends BasesView {
     );
   }
 
+  private getUpstreamDependencyNodes(node: GraphNode): GraphNode[] {
+    const result: GraphNode[] = [];
+    const visitedPaths = new Set<string>([node.file.path]);
+    const queue = [...node.predecessors];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || visitedPaths.has(current.file.path)) continue;
+      visitedPaths.add(current.file.path);
+      result.push(current);
+      queue.push(...current.predecessors);
+    }
+
+    return result;
+  }
+
+  /**
+   * Returns true when a `break` edge represents a failure that actually
+   * happened, i.e. its source node is in a genuinely-failed state
+   * (`interrupted`/`failed` or `blocked`). An `invalidated`/`skipped` source is
+   * NOT triggered: an invalidated node never ran, so its own break links stay
+   * dormant (muted green) rather than cascading red down the invalidated chain.
+   */
+  private isBreakEdgeTriggered(edge: GraphEdge): boolean {
+    const status = edge.from.status;
+    return this.isInterruptedStatus(status) || this.isBlockedStatus(status);
+  }
+
+  private isGenuinelyFailedStatus(status: string | null): boolean {
+    return this.isInterruptedStatus(status) || this.isBlockedStatus(status);
+  }
+
+  /**
+   * Recomputes which nodes sit on a failure escalation path. A break that
+   * climbs the parent chain (source's `breaks_to` points at its parent) renders
+   * red when a genuinely-failed node exists at or below it on that chain, so a
+   * single failure escalates red all the way up to the feature root.
+   */
+  private recomputeBreakEscalation(): void {
+    this.graphParentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const escalation = new Set<string>();
+    for (const candidate of this.visibleNodes) {
+      if (!this.isGenuinelyFailedStatus(candidate.status)) continue;
+      const visited = new Set<string>();
+      let current: GraphNode | null = candidate;
+      while (current && !visited.has(current.file.path)) {
+        visited.add(current.file.path);
+        escalation.add(current.file.path);
+        current = this.graphParentByPath.get(current.file.path) ?? null;
+      }
+    }
+    this.breakEscalationSourcePaths = escalation;
+  }
+
+  private isBreakEdgeEscalated(edge: GraphEdge): boolean {
+    if (!this.breakEscalationSourcePaths.has(edge.from.file.path)) return false;
+    const parent = this.graphParentByPath.get(edge.from.file.path);
+    return parent?.file.path === edge.to.file.path;
+  }
+
+  private getEdgeMarkerKind(edge: GraphEdge): string {
+    if (edge.kind !== "break") return edge.kind;
+    if (this.isBreakEdgeTriggered(edge) || this.isBreakEdgeEscalated(edge)) {
+      return "break";
+    }
+    return "break-dormant";
+  }
+
+  /**
+   * Marks a node as the active frontier (where work is currently happening) and
+   * propagates statuses across the graph:
+   * - the node itself becomes "In Progress" (blue active state),
+   * - upstream dependency-chain nodes become "Completed" (green),
+   * - downstream nodes (descendants + gated successors) become "Planned" (gray,
+   *   excluded from the kanban active-frontier so this node stays THE frontier).
+   *   Downstream failed/invalidated ripple effects are reset too, because once
+   *   an upstream node is the active frontier those nodes could not have run
+   *   yet (so any red "break" links sourced from them become dormant/muted).
+   * - ancestors are only marked "Completed" when every one of their branches is
+   *   already complete; an ancestor still containing the in-progress branch is
+   *   left unchanged.
+   * Upstream and ancestor nodes in a failed/terminal state (blocked,
+   *   interrupted, invalidated) are preserved and never overwritten.
+   */
+  private async makeNodeActive(node: GraphNode): Promise<void> {
+    const newStatusByPath = new Map<string, string>();
+    const isPreserved = (candidate: GraphNode): boolean =>
+      this.isInterruptedStatus(candidate.status) ||
+      this.isInvalidatedStatus(candidate.status) ||
+      this.isBlockedStatus(candidate.status);
+
+    for (const downstream of this.getDownstreamGraphNodes(node)) {
+      if (downstream.file.path === node.file.path) continue;
+      newStatusByPath.set(downstream.file.path, GRAPH_STATUS_PLANNED);
+    }
+
+    for (const upstream of this.getUpstreamDependencyNodes(node)) {
+      if (isPreserved(upstream)) continue;
+      newStatusByPath.set(upstream.file.path, GRAPH_STATUS_COMPLETED);
+    }
+
+    newStatusByPath.set(node.file.path, GRAPH_STATUS_ACTIVE);
+
+    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const effectiveStatus = (candidate: GraphNode): string | null =>
+      newStatusByPath.get(candidate.file.path) ?? candidate.status;
+    const visitedAncestors = new Set<string>([node.file.path]);
+    let ancestor = parentByPath.get(node.file.path);
+    while (ancestor && !visitedAncestors.has(ancestor.file.path)) {
+      visitedAncestors.add(ancestor.file.path);
+      const allChildrenComplete =
+        ancestor.children.length > 0 &&
+        ancestor.children.every((child) =>
+          this.isTerminalDependencyStatus(effectiveStatus(child)),
+        );
+      if (allChildrenComplete && !isPreserved(ancestor)) {
+        newStatusByPath.set(ancestor.file.path, GRAPH_STATUS_COMPLETED);
+      }
+      ancestor = parentByPath.get(ancestor.file.path);
+    }
+
+    const nodesByPath = new Map(
+      this.visibleNodes.map((candidate) => [candidate.file.path, candidate]),
+    );
+    let relatedUpdates = 0;
+    for (const [path, status] of newStatusByPath) {
+      const targetNode = nodesByPath.get(path);
+      if (!targetNode) continue;
+      if (
+        (targetNode.status ?? "").trim().toLowerCase() === status.toLowerCase()
+      ) {
+        continue;
+      }
+      await this.setGraphNodeStatus(targetNode, status);
+      if (path !== node.file.path) relatedUpdates += 1;
+    }
+
+    const restoredBreak = await this.restoreBreakPointToCanonical(
+      node,
+      parentByPath,
+    );
+
+    const parts = [`Set "${node.title}" as active work`];
+    if (relatedUpdates > 0) {
+      parts.push(
+        `updated ${relatedUpdates} related node${relatedUpdates === 1 ? "" : "s"}`,
+      );
+    }
+    if (restoredBreak) parts.push("restored the break point");
+    new Notice(parts.join(", "));
+    this.render();
+  }
+
+  /**
+   * Reverses the break re-homing that `markNodeFailed` performs. When a node is
+   * made active again, any `breaks_to: <parent>` link it picked up while it was
+   * the failure point is moved back to the canonical break point of its sibling
+   * group: the terminal node of the gated chain (the child with no gated
+   * successor inside the group). Returns true when a link was moved.
+   */
+  private async restoreBreakPointToCanonical(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+  ): Promise<boolean> {
+    const parentNode = parentByPath.get(node.file.path);
+    if (!parentNode) return false;
+    if (
+      !node.breakTargets.some(
+        (target) => target.file.path === parentNode.file.path,
+      )
+    ) {
+      return false;
+    }
+
+    const group = this.visibleNodes.filter(
+      (candidate) =>
+        parentByPath.get(candidate.file.path)?.file.path ===
+        parentNode.file.path,
+    );
+    const groupPaths = new Set(group.map((candidate) => candidate.file.path));
+    const canonical = group.find(
+      (candidate) =>
+        !this.getGatedSuccessors(candidate).some((successor) =>
+          groupPaths.has(successor.file.path),
+        ),
+    );
+    if (!canonical || canonical.file.path === node.file.path) return false;
+
+    await this.removeGraphReference(node, "breaks_to", parentNode);
+    if (
+      !canonical.breakTargets.some(
+        (target) => target.file.path === parentNode.file.path,
+      )
+    ) {
+      await this.addGraphReference(canonical, "breaks_to", parentNode);
+    }
+    return true;
+  }
+
+  private async setGraphNodeStatus(
+    node: GraphNode,
+    status: string,
+  ): Promise<void> {
+    const propertyName = this.getGroupByProperty() ?? "status";
+    await this.app.fileManager.processFrontMatter(
+      node.file,
+      (frontmatter: Record<string, unknown>) => {
+        frontmatter[propertyName] = status;
+      },
+    );
+  }
+
+  /**
+   * Marks a node as failed and escalates the failure across the graph.
+   *
+   * On an escalation-style subprocess (the failed node's parent itself
+   * participates in a `breaks_to` chain), this:
+   * - sets the node's status to "Failed" (red `interrupted` state),
+   * - re-homes the break point of the node's parent group onto the failed node
+   *   (removes any sibling's `breaks_to:<parent>` and adds it to the failed
+   *   node), so the red break originates from the node that actually failed,
+   * - escalates up the parent chain to the root, ensuring a `breaks_to:<parent>`
+   *   link exists at every level so the whole chain renders red (the red color
+   *   itself is computed at render time via the escalation path, so no node
+   *   status above the failed node is changed),
+   * - invalidates the gated-successor closure of the break point (the rollout
+   *   rings that can no longer run this attempt),
+   * - ensures the iteration on the chain has a `restarts_to` next iteration,
+   *   creating one to the right if none exists.
+   *
+   * On a flat (non-escalation) graph it just marks the node failed and
+   * invalidates its own gated-successor closure.
+   *
+   * Nodes already in a genuine failed state are preserved.
+   */
+  private async markNodeFailed(node: GraphNode): Promise<void> {
+    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const parentNode = parentByPath.get(node.file.path) ?? null;
+    const isEscalation =
+      parentNode !== null && parentNode.breakTargets.length > 0;
+
+    await this.setGraphNodeStatus(node, GRAPH_STATUS_FAILED);
+    let structuralChanges = 0;
+    let createdIteration = false;
+
+    if (isEscalation && parentNode) {
+      // Re-home the break point of the parent group onto the failed node.
+      const siblings = this.visibleNodes.filter(
+        (candidate) =>
+          candidate.file.path !== node.file.path &&
+          parentByPath.get(candidate.file.path)?.file.path ===
+            parentNode.file.path,
+      );
+      for (const sibling of siblings) {
+        if (
+          sibling.breakTargets.some(
+            (target) => target.file.path === parentNode.file.path,
+          )
+        ) {
+          await this.removeGraphReference(sibling, "breaks_to", parentNode);
+          structuralChanges += 1;
+        }
+      }
+      if (
+        !node.breakTargets.some(
+          (target) => target.file.path === parentNode.file.path,
+        )
+      ) {
+        await this.addGraphReference(node, "breaks_to", parentNode);
+        structuralChanges += 1;
+      }
+
+      // Escalate up the parent chain to the root, ensuring a break link exists
+      // at each level and creating the next iteration where appropriate.
+      const visited = new Set<string>([node.file.path]);
+      let current: GraphNode | null = parentNode;
+      while (current && !visited.has(current.file.path)) {
+        visited.add(current.file.path);
+        const ancestor: GraphNode | null =
+          parentByPath.get(current.file.path) ?? null;
+        if (!ancestor) break;
+        if (
+          !current.breakTargets.some(
+            (target) => target.file.path === ancestor.file.path,
+          )
+        ) {
+          await this.addGraphReference(current, "breaks_to", ancestor);
+          structuralChanges += 1;
+        }
+        if ((current.nodeType ?? "").toLowerCase() === "iteration") {
+          if (await this.ensureNextIteration(current, ancestor)) {
+            createdIteration = true;
+          }
+        }
+        current = ancestor;
+      }
+    }
+
+    // Invalidate the gated-successor closure of the break point (the steps that
+    // could not run this attempt). On flat graphs use the failed node itself.
+    const invalidationRoots = parentNode
+      ? this.getGatedSuccessors(parentNode)
+      : this.getGatedSuccessors(node);
+    const isPreserved = (candidate: GraphNode): boolean =>
+      this.isInterruptedStatus(candidate.status) ||
+      this.isBlockedStatus(candidate.status);
+    const invalidatedPaths = new Set<string>();
+    const queue: GraphNode[] = [...invalidationRoots];
+    let invalidatedUpdates = 0;
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || invalidatedPaths.has(current.file.path)) continue;
+      invalidatedPaths.add(current.file.path);
+      if (current.file.path === node.file.path) continue;
+      if (
+        !isPreserved(current) &&
+        (current.status ?? "").trim().toLowerCase() !==
+          GRAPH_STATUS_INVALIDATED.toLowerCase()
+      ) {
+        await this.setGraphNodeStatus(current, GRAPH_STATUS_INVALIDATED);
+        invalidatedUpdates += 1;
+      }
+      queue.push(...current.children, ...this.getGatedSuccessors(current));
+    }
+
+    const parts = [`Marked "${node.title}" as failed`];
+    if (invalidatedUpdates > 0) {
+      parts.push(
+        `invalidated ${invalidatedUpdates} downstream node${invalidatedUpdates === 1 ? "" : "s"}`,
+      );
+    }
+    if (structuralChanges > 0) parts.push("escalated the break upstream");
+    if (createdIteration) parts.push("started a new iteration");
+    new Notice(parts.join(", "));
+    this.render();
+  }
+
+  /**
+   * Ensures an iteration node has a `restarts_to` successor, creating a fresh
+   * iteration to its right (under the same feature parent) when none exists.
+   * Returns true when a new iteration was created.
+   */
+  private async ensureNextIteration(
+    iterationNode: GraphNode,
+    featureNode: GraphNode,
+  ): Promise<boolean> {
+    if (iterationNode.restartTargets.length > 0) return false;
+    const nextNumber = (this.getIterationNumber(iterationNode) ?? 1) + 1;
+    const base = iterationNode.title
+      .replace(/\s*iteration\s+\d+\s*$/i, "")
+      .trim();
+    const title = base
+      ? `${base} Iteration ${nextNumber}`
+      : `Iteration ${nextNumber}`;
+    const newFile = await this.createTemplateNode({
+      title,
+      displayTitle: title,
+      type: "iteration",
+      status: GRAPH_STATUS_ACTIVE,
+      parent: this.getWikiLink(featureNode.file),
+      tags: this.getTags(iterationNode.file),
+      x: iterationNode.x + NODE_WIDTH + 136,
+      y: iterationNode.y,
+    });
+    await this.app.fileManager.processFrontMatter(
+      iterationNode.file,
+      (frontmatter: Record<string, unknown>) => {
+        const propertyName = this.getGraphReferenceListPropertyName(
+          frontmatter,
+          "restarts_to",
+        );
+        const references = this.getFrontmatterReferenceList(
+          frontmatter[propertyName],
+        );
+        references.push(this.getWikiLink(newFile));
+        this.setFrontmatterReferenceList(frontmatter, propertyName, references);
+      },
+    );
+    return true;
+  }
+
   private async cleanupReferencesToGraphNodes(
     nodes: GraphNode[],
   ): Promise<number> {
@@ -2766,6 +3160,23 @@ export class GraphView extends BasesView {
 
     const menu = new Menu();
     this.addGraphCreateMenuItems(menu, sourceNode);
+    menu.addSeparator();
+    menu.addItem((item) => {
+      item
+        .setTitle("Set as active work")
+        .setIcon("lucide-play")
+        .onClick(() => {
+          void this.makeNodeActive(sourceNode);
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Mark as failed")
+        .setIcon("lucide-ban")
+        .onClick(() => {
+          void this.markNodeFailed(sourceNode);
+        });
+    });
     menu.addSeparator();
     const subtreeCount = 1 + this.getDownstreamGraphNodes(sourceNode).length;
     menu.addItem((item) => {
@@ -3841,6 +4252,8 @@ export class GraphView extends BasesView {
         node.state = "invalidated";
       } else if (this.isInterruptedStatus(node.status)) {
         node.state = "interrupted";
+      } else if (this.isActiveStatus(node.status)) {
+        node.state = "active";
       } else if (this.isCompletedStatus(node.status)) {
         node.state = "completed";
       } else if (this.isBlockedStatus(node.status)) {
@@ -5022,6 +5435,15 @@ export class GraphView extends BasesView {
 
   private isBlockedStatus(status: string | null): boolean {
     return status?.trim().toLowerCase() === "blocked";
+  }
+
+  private isActiveStatus(status: string | null): boolean {
+    const normalizedStatus = status?.trim().toLowerCase();
+    return (
+      normalizedStatus === "in progress" ||
+      normalizedStatus === "doing" ||
+      normalizedStatus === "active"
+    );
   }
 
   private getStateIcon(state: GraphNodeState): string {
