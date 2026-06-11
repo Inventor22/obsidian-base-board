@@ -2767,6 +2767,23 @@
     0 4px 16px rgba(0, 0, 0, 0.16);
 }
 
+/* Derived "In Progress" group state: this container spans the active frontier.
+   Faint purple tint + border (NOT a glow) so it stays visually subordinate to
+   the blue Active leaf. See GRAPH_SEMANTICS_SPEC.md Layer A. */
+.base-board-graph-node--in-progress {
+  border-color: color-mix(
+    in srgb,
+    var(--color-purple, #a371f7) 55%,
+    var(--background-modifier-border)
+  );
+  border-left-color: var(--color-purple, #a371f7);
+  background-color: color-mix(
+    in srgb,
+    var(--color-purple, #a371f7) 7%,
+    var(--background-secondary)
+  );
+}
+
 .base-board-graph-node-state {
   position: absolute;
   top: 8px;
@@ -2810,11 +2827,15 @@
   color: var(--color-orange, var(--text-warning));
 }
 
+.base-board-graph-node-state--in-progress {
+  color: var(--color-purple, #a371f7);
+}
+
 .base-board-graph-collapse {
   appearance: none;
   position: absolute;
-  top: 8px;
-  right: 32px;
+  bottom: 8px;
+  right: 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;

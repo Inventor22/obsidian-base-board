@@ -28,40 +28,74 @@ Each node is one Obsidian note. A node has **two independent visual dimensions**
 - This is the **same color as that status's Kanban column**.
 - Accent color is **not** derived from node type.
 
-### 1.2 Node state (computed)
+### 1.2 Node state (computed / derived)
 
-Assigned by `assignNodeStates()` in strict priority order. The first matching
-rule wins:
+> **Milestone 3 (GRAPH_SEMANTICS_SPEC.md) — derived model.** `assignNodeStates()`
+> is now a **pure recompute**, not imperative status mutation. The only stored
+> truth is the set of **leaf (work-node) statuses**. **Leaf** nodes (no children)
+> take their state from their own status; **group** nodes (with children) have
+> their state **derived bottom-up from their children** and their own stored
+> status is ignored. Run on every render via `deriveNodeState`.
 
-| Priority | State | Trigger | Visual style | Badge icon |
-|----------|-------|---------|--------------|------------|
-| 1 | `invalidated` | status is `invalidated` or `skipped` | 45% opacity, grayscale, dashed border; faint badge | `lucide-circle-off` |
-| 2 | `cancelled` | status is `cancelled`/`canceled` | 55% opacity, grayscale, dashed orange border | `lucide-x-circle` |
-| 3 | `interrupted` | status is `interrupted` or `failed` | error/red border + red tint | `lucide-ban` |
-| 4 | `active` (explicit) | status is `in progress`, `doing`, or `active` | accent border + glow; status color (`In Progress` = blue `#2f81f7`) | `lucide-play` |
-| 5 | `completed` | status is `completed` or `done` | success/green border + green tint | `lucide-check` |
-| 6 | `blocked` | status is `blocked` | error/red border | `lucide-octagon-alert` |
-| 7 | `waiting` | own `depends_on` deps OR any ancestor's deps are not all completed | muted, dashed border, 72% opacity | `lucide-lock` |
-| 8 | `completed` | node has children (a container/sub-process) with satisfied dependencies | success/green | `lucide-check` |
-| 9 | `active` (computed) | ready **leaf** (no children): deps done | accent border + glow | `lucide-play` |
-| — | `idle` | default for new/unprocessed nodes | neutral | `lucide-circle` |
+**Leaf (work-node) state** — first matching rule wins:
+
+| Priority | State | Trigger | Badge icon |
+|----------|-------|---------|------------|
+| 1 | `invalidated` | status is `invalidated` or `skipped` | `lucide-circle-off` |
+| 2 | `cancelled` | status is `cancelled`/`canceled` | `lucide-x-circle` |
+| 3 | `interrupted` | status is `interrupted` or `failed` | `lucide-ban` |
+| 4 | `active` | status is `in progress`, `doing`, or `active` | `lucide-play` |
+| 5 | `completed` | status is `completed` or `done` | `lucide-check` |
+| 6 | `blocked` | status is `blocked` | `lucide-octagon-alert` |
+| 7 | `waiting` | own `depends_on` deps OR any ancestor's deps are not all terminal (by DERIVED state) | `lucide-lock` |
+| 8 | `active` (computed) | ready leaf: gating prerequisites satisfied | `lucide-play` |
+
+**Group (container) state** — derived fold over children's derived states
+(`deriveGroupState`), precedence `In Progress > Completed > Cancelled/Invalidated > Planned`:
+
+| Children condition | Group state | Visual |
+|--------------------|-------------|--------|
+| any child `active`/`in-progress`/`interrupted`/`blocked` | `in-progress` | **purple** tint + border (`--color-purple` `#a371f7`), NO glow |
+| all children `completed` | `completed` | green |
+| all children `cancelled` | `cancelled` | dim orange dashed |
+| all children `invalidated` | `invalidated` | dim grayscale dashed |
+| all terminal-abandoned (mixed cancelled/invalidated) | `invalidated` if any invalidated else `cancelled` | — |
+| otherwise (mixed planned/completed, no live work) | `waiting` | muted dashed |
 
 Notes:
-- **Explicit `active` (priority 4) overrides the container rule**, so a node
-  marked as active work (status `In Progress`) stays blue even when it has
-  incomplete children. This is what the "Set as active work" action relies on.
-- **`invalidated` vs `cancelled`:** `invalidated` is a step in the *failed
-  chain* that was queued but never ran (the rings after the break point);
-  `cancelled` is in-flight work in a *parallel* branch, abandoned mid-flight
-  because the iteration is restarting. Both are terminal for dependency/state
-  computation (`isTerminalDependencyStatus`).
-- A **container (any node with children) with satisfied dependencies renders
-  `completed` (green)** — whether it is still delegating to incomplete children
-  or all its children are now terminal. Only a childless **leaf** falls through
-  to the ready/`active` state. (A container explicitly marked `In Progress`
-  stays blue via the explicit-active rule above.)
-- `waiting` considers both the node's own dependencies and its ancestors'
-  dependencies (`areDependenciesCompleted` + `areAncestorDependenciesCompleted`).
+- **`in-progress` (purple)** is the derived "this container spans the active
+  frontier" state — distinct from the blue `active` leaf and from `completed`.
+  It stays visually subordinate to the blue frontier (`lucide-circle-dot` badge).
+- **No explicit-active override for containers.** Groups are never read from
+  their own stored status, so a stale `In Progress` on a container has no effect
+  — its state derives purely from its children.
+- **`invalidated` vs `cancelled`:** `invalidated` is work sequenced *after* a
+  failed/pruned point that can no longer run; `cancelled` is a deliberately
+  pruned sub-graph (`reason: pruned-manual` in the event log).
+- Dependency/ancestor-dependency satisfaction (`areGatingPrerequisitesTerminal`)
+  is evaluated against **derived** states (memoized), so group prerequisites
+  resolve correctly even though groups carry no live stored status.
+
+### 1.2.1 Work-node operations (execution-order partition)
+
+Group nodes are **not directly actionable**. The right-click menu offers the
+three work-node operations only on **leaf** nodes, and **Prune** only on groups.
+Each operation partitions the graph by **execution order** relative to the
+acted-on leaf `X` — `before(X)` = its dependency closure (incl. ancestor deps),
+`after(X)` = its downstream closure (incl. work sequenced after its ancestors) —
+and writes **only leaf statuses**; group states and link colors derive on render.
+
+| Action | Target | Effect on leaves |
+|--------|--------|------------------|
+| **Set as active work** | leaf | before → `Completed`, `X` → `In Progress` (Active), after → `Planned` |
+| **Mark as complete** | leaf | before → `Completed`, `X` → `Completed` (after untouched) |
+| **Mark as failed** | leaf | before → `Completed`, `X` → `Failed`, after → `Invalidated` |
+| **Prune (cancel sub-graph)** | group | subtree leaves → `Cancelled` (`reason: pruned-manual`), after-group leaves → `Invalidated` |
+
+Failure does **not** spawn an iteration, re-home `breaks_to`, or cancel parallel
+branches (those imperative behaviors were removed). The red break link is
+derived (see §2.1).
+
 
 ### 1.3 Node types
 
@@ -94,31 +128,41 @@ different frontmatter and renders as a differently colored edge.
 - **Requirement-start** (muted gray, going down): structural containment from
   parent to child (a subprocess step).
 - **Requirement-return** (going up): completion flowing back up from child to
-  parent. State-driven (mirror of break edges): green **only when the child
-  (`edge.from`) is genuinely `Completed`**; otherwise (in-progress, planned,
-  waiting, cancelled, failed, …) it renders **dormant muted gray** — a
-  not-yet-fulfilled return is not a lie about completion. Reverses for free:
-  when the child later completes it goes green again. See `getEdgeMarkerKind`.
-  Example: when `Flight RTPv4 in AzAllocator` is `Cancelled`, its return link to
-  `Flight RTPv4` goes gray (NOT red — red is reserved for the break/escalation
-  causal chain, which AzAllocator is not on).
+  parent. State-driven: green **only when the child (`edge.from`) is genuinely
+  `Completed`**; otherwise it renders **dormant muted gray**. It is also
+  **suppressed entirely** for a group on the active failure path (a derived red
+  break replaces the canonical return while a descendant is failed —
+  `brokenParentPaths` in `layoutGraph`). Reverses for free when the failure
+  clears. See `getEdgeMarkerKind`.
 - **Break** (red dashed when triggered, muted green when dormant): represents a
-  failure path. A break is only red when its **source node is genuinely failed**
-  (`interrupted`/`failed` or `blocked`) — i.e. the failure really happened and
-  broke/invalidated the downstream. An `invalidated`/`skipped` source is NOT
-  triggered (an invalidated node never ran, so its own break links stay
-  dormant). When the source is not failed, the break renders as a dormant
-  muted-green path. See `isBreakEdgeTriggered` / `getEdgeMarkerKind`.
+  failure path. There are two sources:
+  1. **Derived (Milestone 3):** a genuinely failed **leaf** synthesizes a red
+     break link to its parent group that **escalates red up the containment
+     chain** (`layoutGraph` walks the parent chain from each failed leaf). These
+     are not stored as `breaks_to` — they appear/disappear as the failure is
+     set/cleared.
+  2. **Authored:** an explicit `breaks_to` link renders **only when its source
+     is genuinely failed** (`interrupted`/`failed` or `blocked`) — a real
+     triggered break, deduped against derived edges. A **dormant** authored
+     break (source not failed) is **not drawn at all** in the derived model: an
+     inactive break is not a real link and must not compete with the canonical
+     return. (Stale `breaks_to` left by older builds therefore stays invisible
+     until its source actually fails.)
+  See `isBreakEdgeTriggered` / `isBreakEdgeEscalated` / `recomputeBreakEscalation`.
 - **Restart** (green dashed): loops back to re-run a prior node.
 
 ### 2.2 Editing / deleting edges
 
 `deleteGraphEdge` reverses whatever the edge represents:
 - `requirement-start`: clears the child's `parent`.
-- `requirement-return`: adds to `graph_hidden_returns` (hides the return line
-  rather than deleting structure). Menu label is **"Hide return line"**.
 - `gating`: removes `depends_on`.
 - `break` / `restart`: removes `breaks_to` / `restarts_to`.
+
+`requirement-return` edges are **derived from containment** and have no
+structural edit/delete action — right-clicking one shows no menu. (The former
+"Hide return line" action and its `graph_hidden_returns` frontmatter were
+removed: link visibility is being handled by an upcoming header by-type filter,
+and per-edge persisted hides are no longer a concept.)
 
 Edge endpoints can be re-anchored by dragging the endpoint handle to a different
 node; this rewrites the corresponding frontmatter reference.

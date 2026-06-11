@@ -23,6 +23,7 @@ type GraphRelationKind = "requirement" | "successor";
 type GraphLinkCreationKind = GraphRelationKind | "break" | "restart";
 type GraphNodeState =
   | "active"
+  | "in-progress"
   | "waiting"
   | "completed"
   | "blocked"
@@ -42,11 +43,7 @@ type GraphWorkflowTemplate =
   | "ring-basic";
 type GraphAnchorSide = "top" | "right" | "bottom" | "left";
 type GraphEdgeEndpoint = "from" | "to";
-type GraphReferenceListKind =
-  | "depends_on"
-  | "breaks_to"
-  | "restarts_to"
-  | "graph_hidden_returns";
+type GraphReferenceListKind = "depends_on" | "breaks_to" | "restarts_to";
 
 interface GraphEndpointAnchorOverride {
   side: GraphAnchorSide;
@@ -178,7 +175,6 @@ interface GraphNode {
   dependsOnKeys: string[];
   breaksToKeys: string[];
   restartsToKeys: string[];
-  hiddenReturnKeys: string[];
   nodeType: string | null;
   workflow: string | null;
   collapsed: boolean;
@@ -248,7 +244,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.11.7";
+const GRAPH_BUILD_VERSION = "2026.06.11.10";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -275,7 +271,6 @@ const GRAPH_POSITION_PROPERTY_Y = "graph_y";
 const GRAPH_COLLAPSED_PROPERTY = "graph_collapsed";
 const CONFIG_KEY_GRAPH_VIEWPORT = "graphViewport";
 const CONFIG_KEY_GRAPH_WORLD = "graphWorld";
-const GRAPH_HIDDEN_RETURNS_PROPERTY = "graph_hidden_returns";
 const GRAPH_EDGE_HANDLE_RADIUS = 7;
 const GRAPH_LINK_HANDLE_PROXIMITY_PX = 14;
 const GRAPH_TEMPLATE_CHILD_Y_STEP = 150;
@@ -2216,14 +2211,14 @@ export class GraphView extends BasesView {
     event.preventDefault();
     event.stopPropagation();
 
+    // Requirement-return edges are derived from containment and have no
+    // structural edit action, so they expose no context menu.
+    if (edge.kind === "requirement-return") return;
+
     const menu = new Menu();
     menu.addItem((item) => {
       item
-        .setTitle(
-          edge.kind === "requirement-return"
-            ? "Hide return line"
-            : "Delete line",
-        )
+        .setTitle("Delete line")
         .setIcon("lucide-unlink")
         .onClick(() => {
           void this.deleteGraphEdge(edge);
@@ -2233,11 +2228,12 @@ export class GraphView extends BasesView {
   }
 
   private async deleteGraphEdge(edge: GraphEdge): Promise<void> {
+    // Requirement-return edges are derived from containment; there is nothing
+    // to delete on them.
+    if (edge.kind === "requirement-return") return;
     this.beginGraphHistory("Delete link");
     if (edge.kind === "requirement-start") {
       await this.updateGraphParent(edge.to, null, edge.from);
-    } else if (edge.kind === "requirement-return") {
-      await this.addGraphReference(edge.from, "graph_hidden_returns", edge.to);
     } else if (edge.kind === "gating") {
       await this.removeGraphReference(edge.to, "depends_on", edge.from);
     } else {
@@ -2255,9 +2251,7 @@ export class GraphView extends BasesView {
       this.getEdgeEndpointOverrideKey(edge, "to"),
     );
 
-    new Notice(
-      edge.kind === "requirement-return" ? "Hid return line" : "Deleted line",
-    );
+    new Notice("Deleted line");
     await this.commitGraphHistory();
     this.render();
   }
@@ -2490,205 +2484,198 @@ export class GraphView extends BasesView {
   }
 
   /**
-   * Marks a node as the active frontier (where work is currently happening) and
-   * propagates statuses across the graph:
-   * - the node itself becomes "In Progress" (blue active state),
-   * - upstream dependency-chain nodes become "Completed" (green),
-   * - downstream nodes (descendants + gated successors) become "Planned" (gray,
-   *   excluded from the kanban active-frontier so this node stays THE frontier).
-   *   Downstream failed/invalidated ripple effects are reset too, because once
-   *   an upstream node is the active frontier those nodes could not have run
-   *   yet (so any red "break" links sourced from them become dormant/muted).
-   * - ancestors are only marked "Completed" when every one of their branches is
-   *   already complete; an ancestor still containing the in-progress branch is
-   *   left unchanged.
-   * Upstream dependency nodes are always set Completed (even if previously
-   *   Failed/Invalidated/Cancelled): marking a downstream node active overrides
-   *   them and asserts their work is done. Ancestor (parent-chain) nodes in a
-   *   failed/terminal state are still preserved.
+   * Work-node operation: Set Active (GRAPH_SEMANTICS_SPEC.md). The node becomes
+   * the `Active` (blue) frontier; everything *before* it in execution order
+   * becomes `Completed`; everything *after* becomes `Planned`. Only leaf
+   * (work-node) statuses are written — group states and link colors are
+   * derived on render (Layers A/B). Group nodes are not directly actionable.
    */
   private async makeNodeActive(node: GraphNode): Promise<void> {
+    if (node.children.length > 0) {
+      new Notice(
+        `"${node.title}" is a group — its state derives from its children. Set a work node inside it active instead.`,
+      );
+      return;
+    }
     this.beginGraphHistory("Set as active work");
-    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
-    const newStatusByPath = new Map<string, string>();
-    const isPreserved = (candidate: GraphNode): boolean =>
-      this.isInterruptedStatus(candidate.status) ||
-      this.isInvalidatedStatus(candidate.status) ||
-      this.isBlockedStatus(candidate.status);
-
-    // Downstream of the active node AND the work sequenced after each ancestor
-    // (e.g. later rollout rings) reset to Planned — being active inside a
-    // container means that container's successors have not run yet.
-    for (const downstream of this.getDownstreamResetNodes(node, parentByPath)) {
-      newStatusByPath.set(downstream.file.path, GRAPH_STATUS_PLANNED);
-    }
-
-    const upstreamNodes = this.getUpstreamDependencyNodes(node);
-    for (const upstream of upstreamNodes) {
-      // Upstream dependencies are always marked Completed, even if they were
-      // Failed/Invalidated/Cancelled. Explicitly setting a downstream node
-      // active asserts its prerequisites are satisfied, so a manual override of
-      // a downstream node propagates completion back up its dependency chain.
-      newStatusByPath.set(upstream.file.path, GRAPH_STATUS_COMPLETED);
-    }
-
-    newStatusByPath.set(node.file.path, GRAPH_STATUS_ACTIVE);
-
-    const effectiveStatus = (candidate: GraphNode): string | null =>
-      newStatusByPath.get(candidate.file.path) ?? candidate.status;
-    const visitedAncestors = new Set<string>([node.file.path]);
-    let ancestor = parentByPath.get(node.file.path);
-    while (ancestor && !visitedAncestors.has(ancestor.file.path)) {
-      visitedAncestors.add(ancestor.file.path);
-      const allChildrenComplete =
-        ancestor.children.length > 0 &&
-        ancestor.children.every((child) =>
-          this.isTerminalDependencyStatus(effectiveStatus(child)),
-        );
-      if (allChildrenComplete && !isPreserved(ancestor)) {
-        newStatusByPath.set(ancestor.file.path, GRAPH_STATUS_COMPLETED);
-      }
-      ancestor = parentByPath.get(ancestor.file.path);
-    }
-
-    const nodesByPath = new Map(
-      this.visibleNodes.map((candidate) => [candidate.file.path, candidate]),
+    const target = this.buildExecutionPartitionTargets(node, {
+      before: GRAPH_STATUS_COMPLETED,
+      self: GRAPH_STATUS_ACTIVE,
+      after: GRAPH_STATUS_PLANNED,
+    });
+    const updated = await this.applyLeafStatuses(target, node.file.path);
+    new Notice(
+      this.describeWorkNodeOp(`Set "${node.title}" as active work`, updated),
     );
-    let relatedUpdates = 0;
-    for (const [path, status] of newStatusByPath) {
-      const targetNode = nodesByPath.get(path);
-      if (!targetNode) continue;
-      if (
-        (targetNode.status ?? "").trim().toLowerCase() === status.toLowerCase()
-      ) {
-        continue;
-      }
-      await this.setGraphNodeStatus(targetNode, status);
-      if (path !== node.file.path) relatedUpdates += 1;
-    }
-
-    // Restore canonical break points for every group affected by the
-    // activation: the activated node's own group plus the group of every
-    // upstream-completed node. A break that was re-homed onto a now-completed
-    // node in any of those rings (e.g. `enable feature flag`) returns to that
-    // ring's terminal node (e.g. `verify`).
-    const affectedParents = new Map<string, GraphNode>();
-    const addParentGroup = (member: GraphNode): void => {
-      const parent = parentByPath.get(member.file.path);
-      if (parent) affectedParents.set(parent.file.path, parent);
-    };
-    addParentGroup(node);
-    for (const upstream of upstreamNodes) addParentGroup(upstream);
-    let restoredBreak = false;
-    for (const parent of affectedParents.values()) {
-      if (await this.restoreGroupBreakPoint(parent, parentByPath)) {
-        restoredBreak = true;
-      }
-    }
-
-    // Reverse parallel-branch cancellation: resuming work in an iteration
-    // un-cancels the concurrent branches that were abandoned by a prior
-    // failure. Reset `Cancelled` nodes within this iteration's subtree to
-    // `Planned` (skipping any just set above).
-    const iterationRoot = this.getIterationAncestor(node, parentByPath);
-    let resumedUpdates = 0;
-    for (const candidate of [
-      iterationRoot,
-      ...this.getDownstreamGraphNodes(iterationRoot),
-    ]) {
-      if (newStatusByPath.has(candidate.file.path)) continue;
-      if (!this.isCancelledStatus(candidate.status)) continue;
-      await this.setGraphNodeStatus(candidate, GRAPH_STATUS_PLANNED);
-      resumedUpdates += 1;
-    }
-
-    const parts = [`Set "${node.title}" as active work`];
-    if (relatedUpdates > 0) {
-      parts.push(
-        `updated ${relatedUpdates} related node${relatedUpdates === 1 ? "" : "s"}`,
-      );
-    }
-    if (resumedUpdates > 0) {
-      parts.push(
-        `resumed ${resumedUpdates} parallel node${resumedUpdates === 1 ? "" : "s"}`,
-      );
-    }
-    if (restoredBreak) parts.push("restored the break point");
-    new Notice(parts.join(", "));
     await this.commitGraphHistory();
     this.render();
   }
 
+  // --- Pure recompute work-node operations (GRAPH_SEMANTICS_SPEC.md) ----------
+  // The only stored truth is the set of work-node (leaf) statuses. Each work
+  // operation partitions the graph by EXECUTION ORDER relative to the acted-on
+  // leaf X — "before X" (its dependency closure incl. ancestor deps) and
+  // "after X" (its downstream closure incl. the work sequenced after its
+  // ancestors) — and writes a status to each leaf in those partitions. Group
+  // states (Layer A) and link colors (Layer B) are derived on render, never
+  // written. This replaces the old imperative status mutation + break re-homing
+  // + parallel cancellation + iteration spawning.
+
+  /** Leaf (work) nodes among a set; group nodes derive and are never written. */
+  private getLeafNodes(nodes: GraphNode[]): GraphNode[] {
+    return nodes.filter((candidate) => candidate.children.length === 0);
+  }
+
   /**
-   * Marks a single node as complete (`Completed`, green). Unlike "Set as active
-   * work" this does not reshuffle the rest of the graph — it just records the
-   * node's own completion (an explicit user override that also works on a
-   * previously failed node). An already-complete node is a no-op. Undoable.
+   * Builds the target leaf statuses for a work operation from the execution
+   * order partition of `node`: `before` leaves, `node` itself, and `after`
+   * leaves. Later assignments win, so the acted-on node always takes `self`.
+   */
+  private buildExecutionPartitionTargets(
+    node: GraphNode,
+    statuses: { before: string; self: string; after: string },
+  ): Map<string, { node: GraphNode; status: string; reason?: string }> {
+    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const beforeLeaves = this.getLeafNodes(
+      this.getUpstreamDependencyNodes(node),
+    );
+    const afterLeaves = this.getLeafNodes(
+      this.getDownstreamResetNodes(node, parentByPath),
+    );
+    const target = new Map<
+      string,
+      { node: GraphNode; status: string; reason?: string }
+    >();
+    for (const leaf of beforeLeaves) {
+      target.set(leaf.file.path, { node: leaf, status: statuses.before });
+    }
+    for (const leaf of afterLeaves) {
+      target.set(leaf.file.path, { node: leaf, status: statuses.after });
+    }
+    target.set(node.file.path, { node, status: statuses.self });
+    return target;
+  }
+
+  /**
+   * Writes computed target statuses to leaf nodes (only when the value
+   * actually changes) and returns the count of *related* leaves updated
+   * (excluding `primaryPath`). Group nodes in the map are skipped — their state
+   * derives from their children and is never persisted.
+   */
+  private async applyLeafStatuses(
+    target: Map<string, { node: GraphNode; status: string; reason?: string }>,
+    primaryPath: string,
+  ): Promise<number> {
+    let related = 0;
+    for (const { node, status, reason } of target.values()) {
+      if (node.children.length > 0) continue;
+      if ((node.status ?? "").trim().toLowerCase() === status.toLowerCase()) {
+        continue;
+      }
+      await this.setGraphNodeStatus(node, status, reason);
+      if (node.file.path !== primaryPath) related += 1;
+    }
+    return related;
+  }
+
+  private describeWorkNodeOp(headline: string, related: number): string {
+    if (related <= 0) return headline;
+    return `${headline}, updated ${related} related node${related === 1 ? "" : "s"}`;
+  }
+
+  /**
+   * Work-node operation: Set Completed (GRAPH_SEMANTICS_SPEC.md). The node and
+   * everything before it in execution order become `Completed`; nodes after it
+   * are left untouched. An already-complete node is a no-op. Undoable.
    */
   private async markNodeComplete(node: GraphNode): Promise<void> {
+    if (node.children.length > 0) {
+      new Notice(
+        `"${node.title}" is a group — its completion derives from its children.`,
+      );
+      return;
+    }
     if (this.isCompletedStatus(node.status)) {
       new Notice(`"${node.title}" is already complete`);
       return;
     }
     this.beginGraphHistory("Mark as complete");
-    await this.setGraphNodeStatus(node, GRAPH_STATUS_COMPLETED);
-    new Notice(`Marked "${node.title}" as complete`);
+    const beforeLeaves = this.getLeafNodes(
+      this.getUpstreamDependencyNodes(node),
+    );
+    const target = new Map<
+      string,
+      { node: GraphNode; status: string; reason?: string }
+    >();
+    for (const leaf of beforeLeaves) {
+      target.set(leaf.file.path, {
+        node: leaf,
+        status: GRAPH_STATUS_COMPLETED,
+      });
+    }
+    target.set(node.file.path, { node, status: GRAPH_STATUS_COMPLETED });
+    const updated = await this.applyLeafStatuses(target, node.file.path);
+    new Notice(
+      this.describeWorkNodeOp(`Marked "${node.title}" as complete`, updated),
+    );
     await this.commitGraphHistory();
     this.render();
   }
 
   /**
-   * Reverses the break re-homing that `markNodeFailed` performs for a single
-   * sibling group. Any `breaks_to: <parent>` link that was re-homed onto a
-   * non-canonical node (e.g. the previously-failed node) is moved back to the
-   * canonical break point: the terminal node of the gated chain (the child with
-   * no gated successor inside the group). Returns true when a link was moved.
+   * Group operation: Prune / Cancel sub-graph (GRAPH_SEMANTICS_SPEC.md). The one
+   * allowed group-level action. Every leaf in the group's containment subtree
+   * becomes `Cancelled` (the group then *derives* `Cancelled`), and everything
+   * sequenced *after* the group in execution order becomes `Invalidated`. This
+   * is NOT a failure: no red break escalation, no retry. The `Cancelled` status
+   * is reused; each cancelled leaf records `reason: "pruned-manual"` in its
+   * event log so history/replay can distinguish a deliberate prune from
+   * automatic parallel-branch cancellation.
    */
-  private async restoreGroupBreakPoint(
-    parentNode: GraphNode,
-    parentByPath: Map<string, GraphNode>,
-  ): Promise<boolean> {
-    const group = this.visibleNodes.filter(
-      (candidate) =>
-        parentByPath.get(candidate.file.path)?.file.path ===
-        parentNode.file.path,
-    );
-    const groupPaths = new Set(group.map((candidate) => candidate.file.path));
-    const canonical = group.find(
-      (candidate) =>
-        !this.getGatedSuccessors(candidate).some((successor) =>
-          groupPaths.has(successor.file.path),
-        ),
-    );
-    if (!canonical) return false;
-
-    // Any group member other than the canonical break point that currently
-    // carries `breaks_to: <parent>` is a re-homed (misplaced) break link.
-    const misplaced = group.filter(
-      (candidate) =>
-        candidate.file.path !== canonical.file.path &&
-        candidate.breakTargets.some(
-          (target) => target.file.path === parentNode.file.path,
-        ),
-    );
-    if (misplaced.length === 0) return false;
-
-    for (const candidate of misplaced) {
-      await this.removeGraphReference(candidate, "breaks_to", parentNode);
+  private async pruneGroup(node: GraphNode): Promise<void> {
+    if (node.children.length === 0) {
+      new Notice(`"${node.title}" is a work node, not a group to prune.`);
+      return;
     }
-    if (
-      !canonical.breakTargets.some(
-        (target) => target.file.path === parentNode.file.path,
-      )
-    ) {
-      await this.addGraphReference(canonical, "breaks_to", parentNode);
+    this.beginGraphHistory("Prune group");
+    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const subtreeLeaves = this.getLeafNodes(
+      this.getContainmentDescendants(node),
+    );
+    const subtreePaths = new Set(subtreeLeaves.map((leaf) => leaf.file.path));
+    const afterLeaves = this.getLeafNodes(
+      this.getDownstreamResetNodes(node, parentByPath),
+    );
+
+    const target = new Map<
+      string,
+      { node: GraphNode; status: string; reason?: string }
+    >();
+    for (const leaf of subtreeLeaves) {
+      target.set(leaf.file.path, {
+        node: leaf,
+        status: GRAPH_STATUS_CANCELLED,
+        reason: "pruned-manual",
+      });
     }
-    return true;
+    for (const leaf of afterLeaves) {
+      if (subtreePaths.has(leaf.file.path)) continue;
+      target.set(leaf.file.path, {
+        node: leaf,
+        status: GRAPH_STATUS_INVALIDATED,
+      });
+    }
+
+    const updated = await this.applyLeafStatuses(target, node.file.path);
+    new Notice(this.describeWorkNodeOp(`Pruned "${node.title}"`, updated));
+    await this.commitGraphHistory();
+    this.render();
   }
 
   private async setGraphNodeStatus(
     node: GraphNode,
     status: string,
+    reason?: string,
   ): Promise<void> {
     await this.snapshotForUndo(node.file.path);
     const propertyName = this.getGroupByProperty() ?? "status";
@@ -2704,6 +2691,7 @@ export class GraphView extends BasesView {
           nodeId,
           from,
           status,
+          reason,
         );
       },
     );
@@ -2741,6 +2729,7 @@ export class GraphView extends BasesView {
     nodeId: string,
     from: string | null,
     to: string,
+    reason?: string,
   ): void {
     const settings = this.plugin.data_.transitionHistory;
     if (!settings.enabled) return;
@@ -2755,7 +2744,7 @@ export class GraphView extends BasesView {
       history.push(existing);
     }
 
-    const event = {
+    const event: Record<string, unknown> = {
       id: this.getGeneratedEventId(),
       node: nodeId,
       kind: this.getGraphEventKind(to),
@@ -2766,6 +2755,7 @@ export class GraphView extends BasesView {
       causedBy: "human",
       source: "baseboard-graph",
     };
+    if (reason) event.reason = reason;
 
     frontmatter[historyProperty] = [...history, event];
   }
@@ -2788,7 +2778,6 @@ export class GraphView extends BasesView {
     const rand = Math.random().toString(36).slice(2, 8);
     return `evt-${time}-${rand}`;
   }
-
 
   // --- Undo / redo -----------------------------------------------------------
   // Mutating graph actions (set active, mark failed, create/delete/rewire
@@ -2879,327 +2868,50 @@ export class GraphView extends BasesView {
     if (this.graphUndoButtonEl) {
       const top = this.graphUndoStack[this.graphUndoStack.length - 1];
       this.graphUndoButtonEl.disabled = !top;
-      setTooltip(this.graphUndoButtonEl, top ? `Undo: ${top.label}` : "Nothing to undo");
+      setTooltip(
+        this.graphUndoButtonEl,
+        top ? `Undo: ${top.label}` : "Nothing to undo",
+      );
     }
     if (this.graphRedoButtonEl) {
       const top = this.graphRedoStack[this.graphRedoStack.length - 1];
       this.graphRedoButtonEl.disabled = !top;
-      setTooltip(this.graphRedoButtonEl, top ? `Redo: ${top.label}` : "Nothing to redo");
+      setTooltip(
+        this.graphRedoButtonEl,
+        top ? `Redo: ${top.label}` : "Nothing to redo",
+      );
     }
   }
 
   /**
-   * Marks a node as failed and escalates the failure across the graph.
-   *
-   * When the failed node has a parent it is treated as a step inside a
-   * subprocess, so failing it breaks that subprocess. This:
-   * - sets the node's status to "Failed" (red `interrupted` state),
-   * - makes the failed node the break point of its parent group: re-homes any
-   *   sibling's `breaks_to:<parent>` onto it, or **creates** the link if the
-   *   group had none, so a red break originates from the node that failed,
-   * - escalates up the parent chain to the root, ensuring a `breaks_to:<parent>`
-   *   link exists at every level so the whole chain renders red (the red color
-   *   itself is computed at render time via the escalation path, so no node
-   *   status above the failed node is changed),
-   * - invalidates the gated-successor closure of the break point (the rollout
-   *   rings that can no longer run this attempt),
-   * - cancels in-flight work in parallel sibling branches up to the iteration,
-   * - ensures the iteration on the chain has a `restarts_to` next iteration,
-   *   creating one to the right if none exists.
-   *
-   * Only a truly top-level node (no parent) uses the flat path: mark failed and
-   * invalidate its own gated-successor closure.
-   *
-   * Nodes already in a genuine failed state are preserved.
+   * Work-node operation: Set Failed (GRAPH_SEMANTICS_SPEC.md). The node becomes
+   * `Failed` (red); everything *before* it in execution order becomes
+   * `Completed` (it ran); everything *after* becomes `Invalidated` (the rest of
+   * its ring and all subsequent rings are now unreachable). Only leaf statuses
+   * are written. The red break link from the failed leaf up its containment
+   * chain, and group states, are *derived* on render (Layers A/B) — no
+   * `breaks_to` is written and no iteration is spawned (iteration creation is a
+   * deliberate policy action, not a side-effect of failure).
    */
   private async markNodeFailed(node: GraphNode): Promise<void> {
+    if (node.children.length > 0) {
+      new Notice(
+        `"${node.title}" is a group and cannot be failed directly. Fail a work node inside it, or prune the group.`,
+      );
+      return;
+    }
     this.beginGraphHistory("Mark as failed");
-    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
-    const parentNode = parentByPath.get(node.file.path) ?? null;
-    // A node with a parent is a step inside a containing subprocess; failing it
-    // breaks that subprocess and escalates up the containment chain. The break
-    // point is created here even when the group/template authored none.
-    const isEscalation = parentNode !== null;
-
-    await this.setGraphNodeStatus(node, GRAPH_STATUS_FAILED);
-    let structuralChanges = 0;
-    let createdIteration = false;
-    let cancelledUpdates = 0;
-
-    // The failed node's upstream dependency closure ran successfully (you can't
-    // fail at a step without reaching it), so it stays Completed and is never
-    // cancelled/invalidated. The red break links convey that the failure is
-    // downstream of these nodes. Genuinely failed/blocked upstream nodes are
-    // left as-is.
-    const upstreamNodes = this.getUpstreamDependencyNodes(node);
-    const upstreamPaths = new Set(upstreamNodes.map((candidate) => candidate.file.path));
-    let completedUpstream = 0;
-    for (const upstream of upstreamNodes) {
-      if (
-        this.isCompletedStatus(upstream.status) ||
-        this.isInterruptedStatus(upstream.status) ||
-        this.isBlockedStatus(upstream.status)
-      ) {
-        continue;
-      }
-      await this.setGraphNodeStatus(upstream, GRAPH_STATUS_COMPLETED);
-      completedUpstream += 1;
-    }
-
-    // Containment ancestors are escalation-path containers, never parallel
-    // work: they must not be cancelled or invalidated. Collect them up front to
-    // exclude them, and heal any that were left in a stale Cancelled state.
-    const ancestorPaths = new Set<string>();
-    {
-      const seen = new Set<string>([node.file.path]);
-      let ancestorCursor: GraphNode | null = parentNode;
-      while (ancestorCursor && !seen.has(ancestorCursor.file.path)) {
-        seen.add(ancestorCursor.file.path);
-        ancestorPaths.add(ancestorCursor.file.path);
-        if (this.isCancelledStatus(ancestorCursor.status)) {
-          await this.setGraphNodeStatus(
-            ancestorCursor,
-            this.getDefaultNewNodeStatus(),
-          );
-        }
-        ancestorCursor = parentByPath.get(ancestorCursor.file.path) ?? null;
-      }
-    }
-
-    if (isEscalation && parentNode) {
-      // Re-home the break point of the parent group onto the failed node.
-      const siblings = this.visibleNodes.filter(
-        (candidate) =>
-          candidate.file.path !== node.file.path &&
-          parentByPath.get(candidate.file.path)?.file.path ===
-            parentNode.file.path,
-      );
-      for (const sibling of siblings) {
-        if (
-          sibling.breakTargets.some(
-            (target) => target.file.path === parentNode.file.path,
-          )
-        ) {
-          await this.removeGraphReference(sibling, "breaks_to", parentNode);
-          structuralChanges += 1;
-        }
-      }
-      if (
-        !node.breakTargets.some(
-          (target) => target.file.path === parentNode.file.path,
-        )
-      ) {
-        await this.addGraphReference(node, "breaks_to", parentNode);
-        structuralChanges += 1;
-      }
-
-      // Escalate up the parent chain to the root, ensuring a break link exists
-      // at each level and creating the next iteration where appropriate. While
-      // still inside the failed iteration, cancel in-flight work in parallel
-      // sibling branches (the concurrent work abandoned by the restart).
-      const visited = new Set<string>([node.file.path]);
-      const cancelHandled = new Set<string>([
-        node.file.path,
-        ...upstreamPaths,
-        ...ancestorPaths,
-      ]);
-      let escalationChild: GraphNode = node;
-      let withinIteration = true;
-      let current: GraphNode | null = parentNode;
-      while (current && !visited.has(current.file.path)) {
-        visited.add(current.file.path);
-
-        if (withinIteration) {
-          for (const sibling of current.children) {
-            if (sibling.file.path === escalationChild.file.path) continue;
-            cancelledUpdates += await this.cancelInFlightSubtree(
-              sibling,
-              cancelHandled,
-            );
-          }
-        }
-
-        const ancestor: GraphNode | null =
-          parentByPath.get(current.file.path) ?? null;
-        if (!ancestor) break;
-        if (
-          !current.breakTargets.some(
-            (target) => target.file.path === ancestor.file.path,
-          )
-        ) {
-          await this.addGraphReference(current, "breaks_to", ancestor);
-          structuralChanges += 1;
-        }
-        if ((current.nodeType ?? "").toLowerCase() === "iteration") {
-          if (await this.ensureNextIteration(current, ancestor)) {
-            createdIteration = true;
-          }
-          // Above the iteration is the feature family (including the restart
-          // iteration); stop cancelling parallel branches there.
-          withinIteration = false;
-        }
-        escalationChild = current;
-        current = ancestor;
-      }
-    }
-
-    // Invalidate the sequential downstream that can no longer run: the failed
-    // node's own gated-successor closure (the rest of its ring after it, e.g.
-    // `await feature flag rollout` → `verify`) AND the break point's gated
-    // successors (the subsequent rings, e.g. Canary → Pilot → Broad). This
-    // overrides a stale Completed status (if the chain broke early, those later
-    // steps are retroactively unreachable).
-    const invalidationRoots = [
-      ...this.getGatedSuccessors(node),
-      ...(parentNode ? this.getGatedSuccessors(parentNode) : []),
-    ];
-    const isPreserved = (candidate: GraphNode): boolean =>
-      this.isInterruptedStatus(candidate.status) ||
-      this.isBlockedStatus(candidate.status);
-    const invalidatedPaths = new Set<string>([
-      ...upstreamPaths,
-      ...ancestorPaths,
-    ]);
-    const queue: GraphNode[] = [...invalidationRoots];
-    let invalidatedUpdates = 0;
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (!current || invalidatedPaths.has(current.file.path)) continue;
-      invalidatedPaths.add(current.file.path);
-      if (current.file.path === node.file.path) continue;
-      if (
-        !isPreserved(current) &&
-        (current.status ?? "").trim().toLowerCase() !==
-          GRAPH_STATUS_INVALIDATED.toLowerCase()
-      ) {
-        await this.setGraphNodeStatus(current, GRAPH_STATUS_INVALIDATED);
-        invalidatedUpdates += 1;
-      }
-      queue.push(...current.children, ...this.getGatedSuccessors(current));
-    }
-
-    const parts = [`Marked "${node.title}" as failed`];
-    if (invalidatedUpdates > 0) {
-      parts.push(
-        `invalidated ${invalidatedUpdates} downstream node${invalidatedUpdates === 1 ? "" : "s"}`,
-      );
-    }
-    if (cancelledUpdates > 0) {
-      parts.push(
-        `cancelled ${cancelledUpdates} parallel node${cancelledUpdates === 1 ? "" : "s"}`,
-      );
-    }
-    if (completedUpstream > 0) {
-      parts.push(
-        `completed ${completedUpstream} upstream node${completedUpstream === 1 ? "" : "s"}`,
-      );
-    }
-    if (structuralChanges > 0) parts.push("escalated the break upstream");
-    if (createdIteration) parts.push("started a new iteration");
-    new Notice(parts.join(", "));
+    const target = this.buildExecutionPartitionTargets(node, {
+      before: GRAPH_STATUS_COMPLETED,
+      self: GRAPH_STATUS_FAILED,
+      after: GRAPH_STATUS_INVALIDATED,
+    });
+    const updated = await this.applyLeafStatuses(target, node.file.path);
+    new Notice(
+      this.describeWorkNodeOp(`Marked "${node.title}" as failed`, updated),
+    );
     await this.commitGraphHistory();
     this.render();
-  }
-
-  /**
-   * Cancels in-flight/pending work within a node's subtree closure (the node
-   * plus its children + gated successors, transitively). Completed, failed,
-   * invalidated, blocked, and already-cancelled nodes are left untouched.
-   * `handled` dedupes across overlapping sibling subtrees. Returns the count.
-   */
-  private async cancelInFlightSubtree(
-    root: GraphNode,
-    handled: Set<string>,
-  ): Promise<number> {
-    let count = 0;
-    for (const candidate of [root, ...this.getDownstreamGraphNodes(root)]) {
-      if (handled.has(candidate.file.path)) continue;
-      handled.add(candidate.file.path);
-      if (!this.isCancellableInFlight(candidate.status)) continue;
-      await this.setGraphNodeStatus(candidate, GRAPH_STATUS_CANCELLED);
-      count += 1;
-    }
-    return count;
-  }
-
-  private isCancellableInFlight(status: string | null): boolean {
-    return (
-      !this.isCompletedStatus(status) &&
-      !this.isInterruptedStatus(status) &&
-      !this.isInvalidatedStatus(status) &&
-      !this.isBlockedStatus(status) &&
-      !this.isCancelledStatus(status)
-    );
-  }
-
-  /**
-   * Walks up the parent chain from a node to the iteration it belongs to (a
-   * node with `type: iteration` or a `restarts_to` link). Falls back to the
-   * topmost ancestor when there is no explicit iteration node.
-   */
-  private getIterationAncestor(
-    node: GraphNode,
-    parentByPath: Map<string, GraphNode>,
-  ): GraphNode {
-    const visited = new Set<string>([node.file.path]);
-    let current = node;
-    while (true) {
-      if (
-        (current.nodeType ?? "").toLowerCase() === "iteration" ||
-        current.restartTargets.length > 0
-      ) {
-        return current;
-      }
-      const parent = parentByPath.get(current.file.path);
-      if (!parent || visited.has(parent.file.path)) return current;
-      visited.add(parent.file.path);
-      current = parent;
-    }
-  }
-
-  /**
-   * Ensures an iteration node has a `restarts_to` successor, creating a fresh
-   * iteration to its right (under the same feature parent) when none exists.
-   * Returns true when a new iteration was created.
-   */
-  private async ensureNextIteration(
-    iterationNode: GraphNode,
-    featureNode: GraphNode,
-  ): Promise<boolean> {
-    if (iterationNode.restartTargets.length > 0) return false;
-    const nextNumber = (this.getIterationNumber(iterationNode) ?? 1) + 1;
-    const base = iterationNode.title
-      .replace(/\s*iteration\s+\d+\s*$/i, "")
-      .trim();
-    const title = base
-      ? `${base} Iteration ${nextNumber}`
-      : `Iteration ${nextNumber}`;
-    const newFile = await this.createTemplateNode({
-      title,
-      displayTitle: title,
-      type: "iteration",
-      status: GRAPH_STATUS_ACTIVE,
-      parent: this.getWikiLink(featureNode.file),
-      tags: this.getTags(iterationNode.file),
-      x: iterationNode.x + NODE_WIDTH + 136,
-      y: iterationNode.y,
-    });
-    await this.snapshotForUndo(iterationNode.file.path);
-    await this.app.fileManager.processFrontMatter(
-      iterationNode.file,
-      (frontmatter: Record<string, unknown>) => {
-        const propertyName = this.getGraphReferenceListPropertyName(
-          frontmatter,
-          "restarts_to",
-        );
-        const references = this.getFrontmatterReferenceList(
-          frontmatter[propertyName],
-        );
-        references.push(this.getWikiLink(newFile));
-        this.setFrontmatterReferenceList(frontmatter, propertyName, references);
-      },
-    );
-    return true;
   }
 
   private async cleanupReferencesToGraphNodes(
@@ -3252,7 +2964,6 @@ export class GraphView extends BasesView {
       "depends_on",
       "breaks_to",
       "restarts_to",
-      "graph_hidden_returns",
     ] as const) {
       const propertyName = this.getGraphReferenceListPropertyName(
         frontmatter,
@@ -3482,9 +3193,7 @@ export class GraphView extends BasesView {
     frontmatter: Record<string, unknown>,
     relationKind: GraphReferenceListKind,
   ): string {
-    return relationKind === "graph_hidden_returns"
-      ? GRAPH_HIDDEN_RETURNS_PROPERTY
-      : relationKind;
+    return relationKind;
   }
 
   private getFrontmatterReferenceList(value: unknown): string[] {
@@ -3760,30 +3469,44 @@ export class GraphView extends BasesView {
     const menu = new Menu();
     this.addGraphCreateMenuItems(menu, sourceNode);
     menu.addSeparator();
-    menu.addItem((item) => {
-      item
-        .setTitle("Set as active work")
-        .setIcon("lucide-play")
-        .onClick(() => {
-          void this.makeNodeActive(sourceNode);
-        });
-    });
-    menu.addItem((item) => {
-      item
-        .setTitle("Mark as complete")
-        .setIcon("lucide-check")
-        .onClick(() => {
-          void this.markNodeComplete(sourceNode);
-        });
-    });
-    menu.addItem((item) => {
-      item
-        .setTitle("Mark as failed")
-        .setIcon("lucide-ban")
-        .onClick(() => {
-          void this.markNodeFailed(sourceNode);
-        });
-    });
+    // Work-node operations are only valid on leaf (work) nodes. Group nodes
+    // derive their state from their children (GRAPH_SEMANTICS_SPEC.md); their
+    // one allowed action is Prune (Cancel sub-graph).
+    if (sourceNode.children.length === 0) {
+      menu.addItem((item) => {
+        item
+          .setTitle("Set as active work")
+          .setIcon("lucide-play")
+          .onClick(() => {
+            void this.makeNodeActive(sourceNode);
+          });
+      });
+      menu.addItem((item) => {
+        item
+          .setTitle("Mark as complete")
+          .setIcon("lucide-check")
+          .onClick(() => {
+            void this.markNodeComplete(sourceNode);
+          });
+      });
+      menu.addItem((item) => {
+        item
+          .setTitle("Mark as failed")
+          .setIcon("lucide-ban")
+          .onClick(() => {
+            void this.markNodeFailed(sourceNode);
+          });
+      });
+    } else {
+      menu.addItem((item) => {
+        item
+          .setTitle("Prune (cancel sub-graph)")
+          .setIcon("lucide-scissors")
+          .onClick(() => {
+            void this.pruneGroup(sourceNode);
+          });
+      });
+    }
     menu.addSeparator();
     menu.addItem((item) => {
       item
@@ -4289,7 +4012,6 @@ export class GraphView extends BasesView {
       dependsOnKeys: [],
       breaksToKeys: [],
       restartsToKeys: [],
-      hiddenReturnKeys: [],
       nodeType,
       workflow,
       collapsed: false,
@@ -4511,7 +4233,6 @@ export class GraphView extends BasesView {
         dependsOnKeys: this.getDependsOnKeys(file),
         breaksToKeys: this.getBreaksToKeys(file),
         restartsToKeys: this.getRestartsToKeys(file),
-        hiddenReturnKeys: this.getHiddenReturnKeys(file),
         nodeType: this.getNodeType(file),
         workflow: this.getWorkflow(file),
         collapsed: this.isGraphCollapsed(file),
@@ -4681,6 +4402,34 @@ export class GraphView extends BasesView {
 
     this.applySavedGraphPositions(nodes);
 
+    // Break edges are DERIVED (GRAPH_SEMANTICS_SPEC.md Layer B): a genuinely
+    // failed leaf draws a red break link to its parent group that escalates up
+    // the containment chain. These are synthesized from the failed state rather
+    // than stored as `breaks_to`, so they appear/disappear as the failure is
+    // set/cleared. `brokenParentPaths` are the groups whose canonical return
+    // link the active break replaces, so their return link is suppressed.
+    const parentByPath = this.getResolvedParentsByPath(nodes);
+    const breakEdgeKeys = new Set<string>();
+    const derivedBreakEdges: GraphEdge[] = [];
+    const brokenParentPaths = new Set<string>();
+    for (const node of nodes) {
+      if (!this.isGenuinelyFailedStatus(node.status)) continue;
+      let child: GraphNode = node;
+      let parent = parentByPath.get(child.file.path) ?? null;
+      const seen = new Set<string>([child.file.path]);
+      while (parent && !seen.has(parent.file.path)) {
+        seen.add(parent.file.path);
+        brokenParentPaths.add(parent.file.path);
+        const key = `${child.file.path}->${parent.file.path}`;
+        if (!breakEdgeKeys.has(key)) {
+          breakEdgeKeys.add(key);
+          derivedBreakEdges.push({ from: child, to: parent, kind: "break" });
+        }
+        child = parent;
+        parent = parentByPath.get(child.file.path) ?? null;
+      }
+    }
+
     const edges: GraphEdge[] = [];
     for (const node of nodes) {
       const childChains = this.getSiblingChains(node.children);
@@ -4690,11 +4439,7 @@ export class GraphView extends BasesView {
         if (firstChild) {
           edges.push({ from: node, to: firstChild, kind: "requirement-start" });
         }
-        if (
-          lastChild &&
-          !this.chainHasBreakReturnToParent(node, chain) &&
-          !this.isRequirementReturnHidden(lastChild, node)
-        ) {
+        if (lastChild && !brokenParentPaths.has(node.file.path)) {
           edges.push({
             from: lastChild,
             to: node,
@@ -4712,46 +4457,22 @@ export class GraphView extends BasesView {
           kind: isRestart ? "restart" : "gating",
         });
       }
-      for (const breakTarget of node.breakTargets) {
-        edges.push({ from: node, to: breakTarget, kind: "break" });
+      // Authored `breaks_to` links only render when the source is genuinely
+      // failed (a real triggered break). Dormant authored breaks are not drawn —
+      // in the derived model an inactive break is not a real link and must not
+      // compete with the canonical return (GRAPH_SEMANTICS_SPEC.md Layer B).
+      // Containment escalation is covered by the derived break edges above.
+      if (this.isGenuinelyFailedStatus(node.status)) {
+        for (const breakTarget of node.breakTargets) {
+          const key = `${node.file.path}->${breakTarget.file.path}`;
+          if (breakEdgeKeys.has(key)) continue;
+          breakEdgeKeys.add(key);
+          edges.push({ from: node, to: breakTarget, kind: "break" });
+        }
       }
     }
+    edges.push(...derivedBreakEdges);
     return edges;
-  }
-
-  private chainHasBreakReturnToParent(
-    parent: GraphNode,
-    chain: GraphNode[],
-  ): boolean {
-    const visitedPaths = new Set<string>();
-    const queue = [...chain];
-
-    while (queue.length > 0) {
-      const node = queue.shift();
-      if (!node || visitedPaths.has(node.file.path)) continue;
-      visitedPaths.add(node.file.path);
-
-      if (
-        node.breakTargets.some(
-          (breakTarget) => breakTarget.file.path === parent.file.path,
-        )
-      ) {
-        return true;
-      }
-
-      queue.push(...node.children);
-      queue.push(...node.successors);
-    }
-
-    return false;
-  }
-
-  private isRequirementReturnHidden(
-    returnNode: GraphNode,
-    parentNode: GraphNode,
-  ): boolean {
-    const parentIdentities = new Set(this.getNodeIdentities(parentNode));
-    return returnNode.hiddenReturnKeys.some((key) => parentIdentities.has(key));
   }
 
   private layoutNodeTree(
@@ -4862,36 +4583,139 @@ export class GraphView extends BasesView {
     return chains;
   }
 
+  /**
+   * Derives every node's visual state (GRAPH_SEMANTICS_SPEC.md Layer A). Leaf
+   * (work) nodes take their state from their own stored status — the only
+   * source of truth. Group (container) nodes derive their state bottom-up from
+   * their children and never read their own stored status. Pure recompute, run
+   * on every render; no status is mutated here.
+   */
   private assignNodeStates(nodes: GraphNode[]): void {
     const parentByPath = this.getResolvedParentsByPath(nodes);
+    const memo = new Map<string, GraphNodeState>();
+    const inProgress = new Set<string>();
     for (const node of nodes) {
-      if (this.isInvalidatedStatus(node.status)) {
-        node.state = "invalidated";
-      } else if (this.isCancelledStatus(node.status)) {
-        node.state = "cancelled";
-      } else if (this.isInterruptedStatus(node.status)) {
-        node.state = "interrupted";
-      } else if (this.isActiveStatus(node.status)) {
-        node.state = "active";
-      } else if (this.isCompletedStatus(node.status)) {
-        node.state = "completed";
-      } else if (this.isBlockedStatus(node.status)) {
-        node.state = "blocked";
-      } else if (
-        !this.areDependenciesCompleted(node) ||
-        !this.areAncestorDependenciesCompleted(node, parentByPath)
-      ) {
-        node.state = "waiting";
-      } else if (node.children.length > 0) {
-        // A container (sub-process) with satisfied dependencies renders
-        // complete — whether it is still delegating to incomplete children or
-        // all of its children are now terminal. Only childless leaves fall
-        // through to the ready/active state.
-        node.state = "completed";
-      } else {
-        node.state = "active";
-      }
+      node.state = this.deriveNodeState(node, parentByPath, memo, inProgress);
     }
+  }
+
+  private deriveNodeState(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+    memo: Map<string, GraphNodeState>,
+    inProgress: Set<string>,
+  ): GraphNodeState {
+    const cached = memo.get(node.file.path);
+    if (cached) return cached;
+    // Cycle guard: a node referenced while it is still being computed resolves
+    // to a neutral state so derivation terminates on malformed graphs.
+    if (inProgress.has(node.file.path)) return "idle";
+    inProgress.add(node.file.path);
+
+    const state =
+      node.children.length > 0
+        ? this.deriveGroupState(
+            node.children.map((child) =>
+              this.deriveNodeState(child, parentByPath, memo, inProgress),
+            ),
+          )
+        : this.deriveLeafState(node, parentByPath, memo, inProgress);
+
+    inProgress.delete(node.file.path);
+    memo.set(node.file.path, state);
+    return state;
+  }
+
+  /**
+   * Leaf (work-node) state read from its stored status. A ready leaf with no
+   * explicit lifecycle status falls through to the computed active frontier
+   * (gating prerequisites satisfied) or `waiting` (prerequisites pending).
+   */
+  private deriveLeafState(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+    memo: Map<string, GraphNodeState>,
+    inProgress: Set<string>,
+  ): GraphNodeState {
+    if (this.isInvalidatedStatus(node.status)) return "invalidated";
+    if (this.isCancelledStatus(node.status)) return "cancelled";
+    if (this.isInterruptedStatus(node.status)) return "interrupted";
+    if (this.isActiveStatus(node.status)) return "active";
+    if (this.isCompletedStatus(node.status)) return "completed";
+    if (this.isBlockedStatus(node.status)) return "blocked";
+    if (
+      !this.areGatingPrerequisitesTerminal(node, parentByPath, memo, inProgress)
+    ) {
+      return "waiting";
+    }
+    return "active";
+  }
+
+  /**
+   * Group-state fold (GRAPH_SEMANTICS_SPEC.md Layer A) over the children's
+   * derived states. Precedence (decreasing):
+   * In Progress > Completed > Cancelled/Invalidated > Planned.
+   */
+  private deriveGroupState(childStates: GraphNodeState[]): GraphNodeState {
+    if (childStates.length === 0) return "idle";
+    const isLive = (state: GraphNodeState): boolean =>
+      state === "active" ||
+      state === "in-progress" ||
+      state === "interrupted" ||
+      state === "blocked";
+    if (childStates.some(isLive)) return "in-progress";
+    if (childStates.every((state) => state === "completed")) return "completed";
+    if (childStates.every((state) => state === "cancelled")) return "cancelled";
+    if (childStates.every((state) => state === "invalidated")) {
+      return "invalidated";
+    }
+    if (
+      childStates.every(
+        (state) => state === "cancelled" || state === "invalidated",
+      )
+    ) {
+      return childStates.some((state) => state === "invalidated")
+        ? "invalidated"
+        : "cancelled";
+    }
+    // Mixed completed/planned with no live work: not finished, no active
+    // frontier — render as waiting (Planned).
+    return "waiting";
+  }
+
+  /**
+   * True when every gating prerequisite of a node — its own `depends_on`
+   * predecessors plus the predecessors of each containment ancestor — is in a
+   * terminal DERIVED state. Uses derived states (not stored status) so group
+   * prerequisites resolve correctly under the derived model.
+   */
+  private areGatingPrerequisitesTerminal(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+    memo: Map<string, GraphNodeState>,
+    inProgress: Set<string>,
+  ): boolean {
+    const isTerminal = (state: GraphNodeState): boolean =>
+      state === "completed" ||
+      state === "interrupted" ||
+      state === "invalidated" ||
+      state === "cancelled";
+    const seen = new Set<string>();
+    let current: GraphNode | null = node;
+    while (current && !seen.has(current.file.path)) {
+      seen.add(current.file.path);
+      for (const predecessor of current.predecessors) {
+        const state = this.deriveNodeState(
+          predecessor,
+          parentByPath,
+          memo,
+          inProgress,
+        );
+        if (!isTerminal(state)) return false;
+      }
+      current = parentByPath.get(current.file.path) ?? null;
+    }
+    return true;
   }
 
   private getResolvedParentsByPath(nodes: GraphNode[]): Map<string, GraphNode> {
@@ -4912,28 +4736,6 @@ export class GraphView extends BasesView {
     return parentByPath;
   }
 
-  private areAncestorDependenciesCompleted(
-    node: GraphNode,
-    parentByPath: Map<string, GraphNode>,
-  ): boolean {
-    const visitedPaths = new Set<string>();
-    let parent = parentByPath.get(node.file.path);
-    while (parent) {
-      if (visitedPaths.has(parent.file.path)) return false;
-      visitedPaths.add(parent.file.path);
-      if (
-        this.isBlockedStatus(parent.status) ||
-        this.isInterruptedStatus(parent.status) ||
-        this.isInvalidatedStatus(parent.status) ||
-        !this.areDependenciesCompleted(parent)
-      ) {
-        return false;
-      }
-      parent = parentByPath.get(parent.file.path);
-    }
-    return true;
-  }
-
   private getResolvedParent(
     node: GraphNode,
     nodes: GraphNode[],
@@ -4946,21 +4748,6 @@ export class GraphView extends BasesView {
       }
     }
     return nodesByIdentity.get(node.parentKey) ?? null;
-  }
-
-  private areDependenciesCompleted(node: GraphNode): boolean {
-    return node.predecessors.every((dependency) =>
-      this.isTerminalDependencyStatus(dependency.status),
-    );
-  }
-
-  private isTerminalDependencyStatus(status: string | null): boolean {
-    return (
-      this.isCompletedStatus(status) ||
-      this.isInterruptedStatus(status) ||
-      this.isInvalidatedStatus(status) ||
-      this.isCancelledStatus(status)
-    );
   }
 
   private getEdgePath(edge: GraphEdge): string {
@@ -5915,13 +5702,6 @@ export class GraphView extends BasesView {
     return this.normalizeReferences(frontmatter?.restarts_to);
   }
 
-  private getHiddenReturnKeys(file: TFile): string[] {
-    const frontmatter = this.getFrontmatter(file);
-    return this.normalizeReferences(
-      frontmatter?.[GRAPH_HIDDEN_RETURNS_PROPERTY],
-    );
-  }
-
   private getTags(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
     const rawTags = frontmatter?.tags;
@@ -6077,6 +5857,7 @@ export class GraphView extends BasesView {
     if (state === "waiting") return "lucide-lock";
     if (state === "blocked") return "lucide-octagon-alert";
     if (state === "active") return "lucide-play";
+    if (state === "in-progress") return "lucide-circle-dot";
     return "lucide-circle";
   }
 
@@ -6433,9 +6214,7 @@ class GraphHistoryModal extends Modal {
       const itemEl = listEl.createEl("li", {
         cls: "base-board-graph-history-item",
       });
-      const when = event.at
-        ? event.at.toLocaleString()
-        : "(unknown time)";
+      const when = event.at ? event.at.toLocaleString() : "(unknown time)";
       const from = event.from ?? "(none)";
       const to = event.to ?? "(none)";
       itemEl.createSpan({

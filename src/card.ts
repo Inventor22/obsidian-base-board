@@ -74,7 +74,6 @@ const RELATION_LIST_PROPS = [
   ["depends_on"],
   ["breaks_to"],
   ["restarts_to"],
-  ["graph_hidden_returns"],
 ] as const;
 const HIERARCHY_COLOR_PROPS = new Set(["project_color"]);
 const DEFAULT_TASK_TAG = "task";
@@ -1198,7 +1197,7 @@ export class CardManager {
       .filter((entry) => entry.file.path !== file.path)
       .filter((entry) =>
         this.frontmatterReferencesDeletedCard(
-          this.getFrontmatter(entry.file as TFile),
+          this.getFrontmatter(entry.file),
           deletedIdentities,
         ),
       );
@@ -1207,7 +1206,7 @@ export class CardManager {
     await Promise.all(
       entries.map((entry) =>
         this.view.app.fileManager.processFrontMatter(
-          entry.file as TFile,
+          entry.file,
           (frontmatter: Record<string, unknown>) => {
             const result = this.removeReferencesFromFrontmatter(
               frontmatter,
