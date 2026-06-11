@@ -171,7 +171,7 @@ Each = one focused commit/PR with its own test pass and (per repo convention) a
 | # | Milestone | Depends on | Behavior change? | How to test |
 |---|-----------|-----------|------------------|-------------|
 | 1 | **Event log (write-only)** ✅ *done (build 2026.06.10.10)* — emit a `GraphEvent` on every graph status transition via `setGraphNodeStatus`; stored in the configured `status_history` array (Timeline-compatible) with `id`/`node`/`kind`/`causedBy` added; `id` backfilled. `status` still the live value. | — | None (additive) | Mark nodes active/failed/complete; confirm events recorded with correct from/to/at; existing flows unchanged. |
-| 2 | **History read + projection** — derive current status from the log; expose a per-node history view. | 1 | None (same status, new source) | Status matches pre-refactor for all RTPv4 nodes; history shows the sequence. |
+| 2 | **History read + projection** ✅ *done (build 2026.06.11.1)* — `getNodeTransitionEvents` reads/parses the log; `getProjectedStatus` folds it to a derived status; right-click **"Show state history"** opens a per-node timeline modal (with a projected-vs-current match check); node tooltip shows the sequence. `status` is still the live value (projection is read-only/diagnostic). | 1 | None (same status, new source) | Status matches pre-refactor for all RTPv4 nodes; history shows the sequence. |
 | 3 | **Scheduler + handlers (no-op refactor)** — move `markNodeFailed`/`makeNodeActive`/escalation/cancellation into per-type handlers behind a deterministic scheduler. | 1 | **None — verified identical** | Re-run the full RTPv4 scenario set (fail Validate → escalate+cancel; set active → reset+restore; mark complete) and confirm byte-identical frontmatter outcomes. |
 | 4 | **`Awaiting` state** — status + node-state + CSS (mirror `Cancelled`). | 3 | New state only | Set a node Awaiting; verify color/badge; frontier treats it distinctly. |
 | 5 | **`agent:` capability block + autonomy field** — frontmatter schema + parsing; no agent yet. | 3 | None (data only) | Add `agent:` to a node; confirm parsed/exposed; dry-run lifecycle manually. |
@@ -185,9 +185,21 @@ Sections 1–7 are this document's substrate; 8–10 hand off to
 `GRAPH_AGENT_MCP_PLAN.md`. Milestones 1–3 are the high-value, low-risk core and
 should be done first and in order.
 
+> **Milestone 3 behavior contract:** `GRAPH_SEMANTICS_SPEC.md` is the
+> authoritative model + acceptance cases for Milestone 3. It reframes M3 from a
+> pure no-op refactor into a **model-correcting** one: implement node behavior
+> as a **pure recompute** — leaf (work-node) statuses are the only stored truth;
+> group-node states and link colors are *derived*; the three work-node
+> operations (Active / Failed / Completed) partition the graph by **execution
+> order**. Needs a small new derived `In Progress` group state first. Build to
+> the spec, not to the accumulated per-bug fixes.
+
 ## Cross-references
 
-- `GRAPH_VIEW_RULES.md` — current behavior; the regression oracle for the no-op
-  refactor (milestone 3). Update it as states/handlers change.
+- `GRAPH_SEMANTICS_SPEC.md` — the authoritative intended behavior model and
+  worked acceptance cases (Milestone 3 contract). Supersedes ad-hoc per-bug
+  fixes where they differ.
+- `GRAPH_VIEW_RULES.md` — current (as-built) behavior; describes the imperative
+  status mutation that Milestone 3 replaces with the derived model.
 - `GRAPH_AGENT_MCP_PLAN.md` — the agent bridge that consumes this substrate
   (milestones 8–10).

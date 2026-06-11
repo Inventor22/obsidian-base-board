@@ -212,6 +212,21 @@ interface GraphHistoryEntry {
   files: GraphHistoryFileChange[];
 }
 
+// A parsed transition event read back from a note's history array (Milestone 2:
+// history read + projection). Compatible with both the graph-emitted events and
+// the legacy kanban/rollout `{ from, to, at, property, source }` records.
+interface GraphTransitionEvent {
+  id: string | null;
+  node: string | null;
+  kind: string | null;
+  from: string | null;
+  to: string | null;
+  at: Date | null;
+  property: string | null;
+  causedBy: string | null;
+  source: string | null;
+}
+
 interface GraphViewportState {
   scrollLeft: number;
   scrollTop: number;
@@ -233,7 +248,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.10.12";
+const GRAPH_BUILD_VERSION = "2026.06.11.7";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -2301,17 +2316,112 @@ export class GraphView extends BasesView {
     );
   }
 
+  /**
+   * Collects every node that must be Completed for `node` to be the active
+   * work. This is the dependency closure across BOTH:
+   * - `depends_on` predecessors of the node, and
+   * - the predecessors of every **ancestor** (to work inside a container, that
+   *   container's own dependencies must be done — e.g. activating a leaf inside
+   *   `rollout` requires `rollout`'s dependency `dev` to be complete), and
+   * - the full **containment subtree** of each prerequisite (a prerequisite
+   *   container like `dev` is only "done" when its children are done too),
+   * applied transitively. Ancestors themselves are NOT included (they are
+   *   in-progress containers, rendered complete by the container rule once their
+   *   dependencies are satisfied), and gated successors are NOT followed (that
+   *   would sweep the active node's own branch back in via `dev → rollout`).
+   */
   private getUpstreamDependencyNodes(node: GraphNode): GraphNode[] {
+    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
     const result: GraphNode[] = [];
-    const visitedPaths = new Set<string>([node.file.path]);
-    const queue = [...node.predecessors];
+    const resultPaths = new Set<string>([node.file.path]);
+    const queue: GraphNode[] = [];
+
+    // Enqueue a node's direct predecessors plus the predecessors of all its
+    // ancestors (containment implies the container's dependencies are needed).
+    const enqueueWithAncestorDeps = (target: GraphNode): void => {
+      const seen = new Set<string>();
+      let current: GraphNode | null = target;
+      while (current && !seen.has(current.file.path)) {
+        seen.add(current.file.path);
+        for (const predecessor of current.predecessors) queue.push(predecessor);
+        current = parentByPath.get(current.file.path) ?? null;
+      }
+    };
+
+    enqueueWithAncestorDeps(node);
 
     while (queue.length > 0) {
+      const prerequisite = queue.shift();
+      if (!prerequisite || resultPaths.has(prerequisite.file.path)) continue;
+      resultPaths.add(prerequisite.file.path);
+      result.push(prerequisite);
+      // A prerequisite container is only complete when its children are too.
+      for (const descendant of this.getContainmentDescendants(prerequisite)) {
+        if (resultPaths.has(descendant.file.path)) continue;
+        resultPaths.add(descendant.file.path);
+        result.push(descendant);
+      }
+      // Recurse into the prerequisite's own dependency closure.
+      enqueueWithAncestorDeps(prerequisite);
+    }
+
+    return result;
+  }
+
+  /** Descendants reached by following `children` only (containment, not gating). */
+  private getContainmentDescendants(node: GraphNode): GraphNode[] {
+    const result: GraphNode[] = [];
+    const visited = new Set<string>([node.file.path]);
+    const queue: GraphNode[] = [...node.children];
+    while (queue.length > 0) {
       const current = queue.shift();
-      if (!current || visitedPaths.has(current.file.path)) continue;
-      visitedPaths.add(current.file.path);
+      if (!current || visited.has(current.file.path)) continue;
+      visited.add(current.file.path);
       result.push(current);
-      queue.push(...current.predecessors);
+      queue.push(...current.children);
+    }
+    return result;
+  }
+
+  /**
+   * Collects everything sequenced AFTER the active node that must reset to
+   * Planned: the node's own downstream closure (children + gated successors)
+   * PLUS the downstream closure of every ANCESTOR's gated successors (e.g. the
+   * later rollout rings after the containing `stage`). Being active inside a
+   * container means that container's successors have not run yet. Mirror of
+   * `getUpstreamDependencyNodes`. Excludes the active node itself.
+   */
+  private getDownstreamResetNodes(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+  ): GraphNode[] {
+    const result: GraphNode[] = [];
+    const seen = new Set<string>([node.file.path]);
+    const include = (candidate: GraphNode): void => {
+      for (const downstream of [
+        candidate,
+        ...this.getDownstreamGraphNodes(candidate),
+      ]) {
+        if (seen.has(downstream.file.path)) continue;
+        seen.add(downstream.file.path);
+        result.push(downstream);
+      }
+    };
+
+    for (const downstream of this.getDownstreamGraphNodes(node)) {
+      if (seen.has(downstream.file.path)) continue;
+      seen.add(downstream.file.path);
+      result.push(downstream);
+    }
+
+    const ancestorSeen = new Set<string>([node.file.path]);
+    let ancestor: GraphNode | null = parentByPath.get(node.file.path) ?? null;
+    while (ancestor && !ancestorSeen.has(ancestor.file.path)) {
+      ancestorSeen.add(ancestor.file.path);
+      for (const successor of this.getGatedSuccessors(ancestor)) {
+        include(successor);
+      }
+      ancestor = parentByPath.get(ancestor.file.path) ?? null;
     }
 
     return result;
@@ -2399,18 +2509,22 @@ export class GraphView extends BasesView {
    */
   private async makeNodeActive(node: GraphNode): Promise<void> {
     this.beginGraphHistory("Set as active work");
+    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
     const newStatusByPath = new Map<string, string>();
     const isPreserved = (candidate: GraphNode): boolean =>
       this.isInterruptedStatus(candidate.status) ||
       this.isInvalidatedStatus(candidate.status) ||
       this.isBlockedStatus(candidate.status);
 
-    for (const downstream of this.getDownstreamGraphNodes(node)) {
-      if (downstream.file.path === node.file.path) continue;
+    // Downstream of the active node AND the work sequenced after each ancestor
+    // (e.g. later rollout rings) reset to Planned — being active inside a
+    // container means that container's successors have not run yet.
+    for (const downstream of this.getDownstreamResetNodes(node, parentByPath)) {
       newStatusByPath.set(downstream.file.path, GRAPH_STATUS_PLANNED);
     }
 
-    for (const upstream of this.getUpstreamDependencyNodes(node)) {
+    const upstreamNodes = this.getUpstreamDependencyNodes(node);
+    for (const upstream of upstreamNodes) {
       // Upstream dependencies are always marked Completed, even if they were
       // Failed/Invalidated/Cancelled. Explicitly setting a downstream node
       // active asserts its prerequisites are satisfied, so a manual override of
@@ -2420,7 +2534,6 @@ export class GraphView extends BasesView {
 
     newStatusByPath.set(node.file.path, GRAPH_STATUS_ACTIVE);
 
-    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
     const effectiveStatus = (candidate: GraphNode): string | null =>
       newStatusByPath.get(candidate.file.path) ?? candidate.status;
     const visitedAncestors = new Set<string>([node.file.path]);
@@ -2454,10 +2567,24 @@ export class GraphView extends BasesView {
       if (path !== node.file.path) relatedUpdates += 1;
     }
 
-    const restoredBreak = await this.restoreBreakPointToCanonical(
-      node,
-      parentByPath,
-    );
+    // Restore canonical break points for every group affected by the
+    // activation: the activated node's own group plus the group of every
+    // upstream-completed node. A break that was re-homed onto a now-completed
+    // node in any of those rings (e.g. `enable feature flag`) returns to that
+    // ring's terminal node (e.g. `verify`).
+    const affectedParents = new Map<string, GraphNode>();
+    const addParentGroup = (member: GraphNode): void => {
+      const parent = parentByPath.get(member.file.path);
+      if (parent) affectedParents.set(parent.file.path, parent);
+    };
+    addParentGroup(node);
+    for (const upstream of upstreamNodes) addParentGroup(upstream);
+    let restoredBreak = false;
+    for (const parent of affectedParents.values()) {
+      if (await this.restoreGroupBreakPoint(parent, parentByPath)) {
+        restoredBreak = true;
+      }
+    }
 
     // Reverse parallel-branch cancellation: resuming work in an iteration
     // un-cancels the concurrent branches that were abandoned by a prior
@@ -2511,21 +2638,16 @@ export class GraphView extends BasesView {
   }
 
   /**
-   * Reverses the break re-homing that `markNodeFailed` performs. When work
-   * resumes in a sibling group (any node in the group is made active), any
-   * `breaks_to: <parent>` link that was re-homed onto a non-canonical node
-   * (e.g. the previously-failed node) is moved back to the canonical break
-   * point: the terminal node of the gated chain (the child with no gated
-   * successor inside the group). Works whether you activate the failed node OR
-   * the canonical node itself. Returns true when a link was moved.
+   * Reverses the break re-homing that `markNodeFailed` performs for a single
+   * sibling group. Any `breaks_to: <parent>` link that was re-homed onto a
+   * non-canonical node (e.g. the previously-failed node) is moved back to the
+   * canonical break point: the terminal node of the gated chain (the child with
+   * no gated successor inside the group). Returns true when a link was moved.
    */
-  private async restoreBreakPointToCanonical(
-    node: GraphNode,
+  private async restoreGroupBreakPoint(
+    parentNode: GraphNode,
     parentByPath: Map<string, GraphNode>,
   ): Promise<boolean> {
-    const parentNode = parentByPath.get(node.file.path);
-    if (!parentNode) return false;
-
     const group = this.visibleNodes.filter(
       (candidate) =>
         parentByPath.get(candidate.file.path)?.file.path ===
@@ -2769,23 +2891,24 @@ export class GraphView extends BasesView {
   /**
    * Marks a node as failed and escalates the failure across the graph.
    *
-   * On an escalation-style subprocess (the failed node's parent itself
-   * participates in a `breaks_to` chain), this:
+   * When the failed node has a parent it is treated as a step inside a
+   * subprocess, so failing it breaks that subprocess. This:
    * - sets the node's status to "Failed" (red `interrupted` state),
-   * - re-homes the break point of the node's parent group onto the failed node
-   *   (removes any sibling's `breaks_to:<parent>` and adds it to the failed
-   *   node), so the red break originates from the node that actually failed,
+   * - makes the failed node the break point of its parent group: re-homes any
+   *   sibling's `breaks_to:<parent>` onto it, or **creates** the link if the
+   *   group had none, so a red break originates from the node that failed,
    * - escalates up the parent chain to the root, ensuring a `breaks_to:<parent>`
    *   link exists at every level so the whole chain renders red (the red color
    *   itself is computed at render time via the escalation path, so no node
    *   status above the failed node is changed),
    * - invalidates the gated-successor closure of the break point (the rollout
    *   rings that can no longer run this attempt),
+   * - cancels in-flight work in parallel sibling branches up to the iteration,
    * - ensures the iteration on the chain has a `restarts_to` next iteration,
    *   creating one to the right if none exists.
    *
-   * On a flat (non-escalation) graph it just marks the node failed and
-   * invalidates its own gated-successor closure.
+   * Only a truly top-level node (no parent) uses the flat path: mark failed and
+   * invalidate its own gated-successor closure.
    *
    * Nodes already in a genuine failed state are preserved.
    */
@@ -2793,13 +2916,55 @@ export class GraphView extends BasesView {
     this.beginGraphHistory("Mark as failed");
     const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
     const parentNode = parentByPath.get(node.file.path) ?? null;
-    const isEscalation =
-      parentNode !== null && parentNode.breakTargets.length > 0;
+    // A node with a parent is a step inside a containing subprocess; failing it
+    // breaks that subprocess and escalates up the containment chain. The break
+    // point is created here even when the group/template authored none.
+    const isEscalation = parentNode !== null;
 
     await this.setGraphNodeStatus(node, GRAPH_STATUS_FAILED);
     let structuralChanges = 0;
     let createdIteration = false;
     let cancelledUpdates = 0;
+
+    // The failed node's upstream dependency closure ran successfully (you can't
+    // fail at a step without reaching it), so it stays Completed and is never
+    // cancelled/invalidated. The red break links convey that the failure is
+    // downstream of these nodes. Genuinely failed/blocked upstream nodes are
+    // left as-is.
+    const upstreamNodes = this.getUpstreamDependencyNodes(node);
+    const upstreamPaths = new Set(upstreamNodes.map((candidate) => candidate.file.path));
+    let completedUpstream = 0;
+    for (const upstream of upstreamNodes) {
+      if (
+        this.isCompletedStatus(upstream.status) ||
+        this.isInterruptedStatus(upstream.status) ||
+        this.isBlockedStatus(upstream.status)
+      ) {
+        continue;
+      }
+      await this.setGraphNodeStatus(upstream, GRAPH_STATUS_COMPLETED);
+      completedUpstream += 1;
+    }
+
+    // Containment ancestors are escalation-path containers, never parallel
+    // work: they must not be cancelled or invalidated. Collect them up front to
+    // exclude them, and heal any that were left in a stale Cancelled state.
+    const ancestorPaths = new Set<string>();
+    {
+      const seen = new Set<string>([node.file.path]);
+      let ancestorCursor: GraphNode | null = parentNode;
+      while (ancestorCursor && !seen.has(ancestorCursor.file.path)) {
+        seen.add(ancestorCursor.file.path);
+        ancestorPaths.add(ancestorCursor.file.path);
+        if (this.isCancelledStatus(ancestorCursor.status)) {
+          await this.setGraphNodeStatus(
+            ancestorCursor,
+            this.getDefaultNewNodeStatus(),
+          );
+        }
+        ancestorCursor = parentByPath.get(ancestorCursor.file.path) ?? null;
+      }
+    }
 
     if (isEscalation && parentNode) {
       // Re-home the break point of the parent group onto the failed node.
@@ -2833,7 +2998,11 @@ export class GraphView extends BasesView {
       // still inside the failed iteration, cancel in-flight work in parallel
       // sibling branches (the concurrent work abandoned by the restart).
       const visited = new Set<string>([node.file.path]);
-      const cancelHandled = new Set<string>([node.file.path]);
+      const cancelHandled = new Set<string>([
+        node.file.path,
+        ...upstreamPaths,
+        ...ancestorPaths,
+      ]);
       let escalationChild: GraphNode = node;
       let withinIteration = true;
       let current: GraphNode | null = parentNode;
@@ -2874,15 +3043,23 @@ export class GraphView extends BasesView {
       }
     }
 
-    // Invalidate the gated-successor closure of the break point (the steps that
-    // could not run this attempt). On flat graphs use the failed node itself.
-    const invalidationRoots = parentNode
-      ? this.getGatedSuccessors(parentNode)
-      : this.getGatedSuccessors(node);
+    // Invalidate the sequential downstream that can no longer run: the failed
+    // node's own gated-successor closure (the rest of its ring after it, e.g.
+    // `await feature flag rollout` → `verify`) AND the break point's gated
+    // successors (the subsequent rings, e.g. Canary → Pilot → Broad). This
+    // overrides a stale Completed status (if the chain broke early, those later
+    // steps are retroactively unreachable).
+    const invalidationRoots = [
+      ...this.getGatedSuccessors(node),
+      ...(parentNode ? this.getGatedSuccessors(parentNode) : []),
+    ];
     const isPreserved = (candidate: GraphNode): boolean =>
       this.isInterruptedStatus(candidate.status) ||
       this.isBlockedStatus(candidate.status);
-    const invalidatedPaths = new Set<string>();
+    const invalidatedPaths = new Set<string>([
+      ...upstreamPaths,
+      ...ancestorPaths,
+    ]);
     const queue: GraphNode[] = [...invalidationRoots];
     let invalidatedUpdates = 0;
     while (queue.length > 0) {
@@ -2910,6 +3087,11 @@ export class GraphView extends BasesView {
     if (cancelledUpdates > 0) {
       parts.push(
         `cancelled ${cancelledUpdates} parallel node${cancelledUpdates === 1 ? "" : "s"}`,
+      );
+    }
+    if (completedUpstream > 0) {
+      parts.push(
+        `completed ${completedUpstream} upstream node${completedUpstream === 1 ? "" : "s"}`,
       );
     }
     if (structuralChanges > 0) parts.push("escalated the break upstream");
@@ -3600,6 +3782,15 @@ export class GraphView extends BasesView {
         .setIcon("lucide-ban")
         .onClick(() => {
           void this.markNodeFailed(sourceNode);
+        });
+    });
+    menu.addSeparator();
+    menu.addItem((item) => {
+      item
+        .setTitle("Show state history")
+        .setIcon("lucide-history")
+        .onClick(() => {
+          this.showNodeHistory(sourceNode);
         });
     });
     menu.addSeparator();
@@ -4691,7 +4882,11 @@ export class GraphView extends BasesView {
         !this.areAncestorDependenciesCompleted(node, parentByPath)
       ) {
         node.state = "waiting";
-      } else if (this.hasIncompleteChildren(node)) {
+      } else if (node.children.length > 0) {
+        // A container (sub-process) with satisfied dependencies renders
+        // complete — whether it is still delegating to incomplete children or
+        // all of its children are now terminal. Only childless leaves fall
+        // through to the ready/active state.
         node.state = "completed";
       } else {
         node.state = "active";
@@ -4751,12 +4946,6 @@ export class GraphView extends BasesView {
       }
     }
     return nodesByIdentity.get(node.parentKey) ?? null;
-  }
-
-  private hasIncompleteChildren(node: GraphNode): boolean {
-    return node.children.some(
-      (child) => !this.isTerminalDependencyStatus(child.status),
-    );
   }
 
   private areDependenciesCompleted(node: GraphNode): boolean {
@@ -5898,7 +6087,96 @@ export class GraphView extends BasesView {
       lines.push(`Depends on: ${node.dependsOnKeys.join(", ")}`);
     }
     lines.push(`State: ${node.state}`);
+    const events = this.getNodeTransitionEvents(node.file);
+    if (events.length > 0) {
+      const sequence = this.getTransitionSequenceLabel(events);
+      lines.push(`History (${events.length}): ${sequence}`);
+    }
     return lines.join("\n");
+  }
+
+  // --- Transition history: read + projection (Milestone 2) -------------------
+  // The transition event log (written in Milestone 1) is read back here so the
+  // current status can be *derived* from it (a fold) and the per-node history
+  // can be displayed. The status value itself is unchanged — this is a new
+  // read source, not a new source of truth.
+
+  /**
+   * Reads and parses a note's transition events from the configured history
+   * array (default `status_history`), ascending by time. Only events for the
+   * groupBy (status) property are included, matching how Timeline/Kanban read
+   * history; legacy records without a `property` field are included too.
+   */
+  private getNodeTransitionEvents(file: TFile): GraphTransitionEvent[] {
+    const propertyName =
+      this.plugin.data_.transitionHistory.propertyName.trim() ||
+      "status_history";
+    const raw = this.getFrontmatter(file)?.[propertyName];
+    if (!Array.isArray(raw)) return [];
+
+    const groupByProp = this.getGroupByProperty() ?? "status";
+    const events: GraphTransitionEvent[] = [];
+    for (const record of raw as unknown[]) {
+      if (!record || typeof record !== "object") continue;
+      const entry = record as Record<string, unknown>;
+      const property =
+        typeof entry.property === "string" ? entry.property : null;
+      if (property !== null && property !== groupByProp) continue;
+      const atText = typeof entry.at === "string" ? entry.at : null;
+      const at = atText ? new Date(atText) : null;
+      events.push({
+        id: typeof entry.id === "string" ? entry.id : null,
+        node: typeof entry.node === "string" ? entry.node : null,
+        kind: typeof entry.kind === "string" ? entry.kind : null,
+        from: this.normalizeText(entry.from),
+        to: this.normalizeText(entry.to),
+        at: at && !Number.isNaN(at.getTime()) ? at : null,
+        property,
+        causedBy: typeof entry.causedBy === "string" ? entry.causedBy : null,
+        source: typeof entry.source === "string" ? entry.source : null,
+      });
+    }
+    return events.sort((first, second) => {
+      const firstTime = first.at?.getTime() ?? 0;
+      const secondTime = second.at?.getTime() ?? 0;
+      return firstTime - secondTime;
+    });
+  }
+
+  /**
+   * Projects the current status from the event log (the `to` of the latest
+   * transition). Returns null when there is no history. This is the fold that
+   * later milestones can promote to the source of truth.
+   */
+  private getProjectedStatus(events: GraphTransitionEvent[]): string | null {
+    for (let index = events.length - 1; index >= 0; index--) {
+      const event = events[index];
+      if (event && event.to !== null) return event.to;
+    }
+    return null;
+  }
+
+  /** Compact "A → B → C" label of the transition sequence (last ~5 steps). */
+  private getTransitionSequenceLabel(events: GraphTransitionEvent[]): string {
+    const stops: string[] = [];
+    const first = events[0];
+    if (first) stops.push(first.from ?? "(none)");
+    for (const event of events) stops.push(event.to ?? "(none)");
+    const trimmed = stops.length > 6 ? ["…", ...stops.slice(-5)] : stops;
+    return trimmed.join(" → ");
+  }
+
+  /** Opens the per-node state-history view (Milestone 2). */
+  private showNodeHistory(node: GraphNode): void {
+    const events = this.getNodeTransitionEvents(node.file);
+    const projected = this.getProjectedStatus(events);
+    new GraphHistoryModal(
+      this.app,
+      node.title,
+      node.status,
+      projected,
+      events,
+    ).open();
   }
 
   private getDefaultNewNodeStatus(): string {
@@ -6096,6 +6374,83 @@ class GraphTemplateModal extends Modal {
       text: template.preview.join("\n"),
     });
     treeEl.setAttr("aria-label", `${template.name} preview`);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+class GraphHistoryModal extends Modal {
+  constructor(
+    app: App,
+    private nodeTitle: string,
+    private currentStatus: string | null,
+    private projectedStatus: string | null,
+    private events: GraphTransitionEvent[],
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("base-board-graph-history-modal");
+    contentEl.createEl("h3", { text: `State history — ${this.nodeTitle}` });
+
+    const current = this.currentStatus ?? "(No value)";
+    const projected = this.projectedStatus ?? "(No value)";
+    const matches =
+      (this.currentStatus ?? "").trim().toLowerCase() ===
+      (this.projectedStatus ?? "").trim().toLowerCase();
+
+    const summaryEl = contentEl.createDiv({
+      cls: "base-board-graph-history-summary",
+    });
+    summaryEl.createEl("p", { text: `Current status: ${current}` });
+    summaryEl.createEl("p", {
+      text: `Projected from log: ${projected}${
+        this.events.length === 0
+          ? " (no history yet)"
+          : matches
+            ? " ✓ matches"
+            : " ⚠ differs (log is partial)"
+      }`,
+    });
+
+    if (this.events.length === 0) {
+      contentEl.createEl("p", {
+        cls: "base-board-graph-history-empty",
+        text: "No transition events recorded for this node yet.",
+      });
+      return;
+    }
+
+    const listEl = contentEl.createEl("ol", {
+      cls: "base-board-graph-history-list",
+    });
+    for (const event of this.events) {
+      const itemEl = listEl.createEl("li", {
+        cls: "base-board-graph-history-item",
+      });
+      const when = event.at
+        ? event.at.toLocaleString()
+        : "(unknown time)";
+      const from = event.from ?? "(none)";
+      const to = event.to ?? "(none)";
+      itemEl.createSpan({
+        cls: "base-board-graph-history-transition",
+        text: `${from} → ${to}`,
+      });
+      const metaParts = [when];
+      if (event.kind) metaParts.push(event.kind);
+      if (event.causedBy) metaParts.push(event.causedBy);
+      if (event.source) metaParts.push(event.source);
+      itemEl.createSpan({
+        cls: "base-board-graph-history-meta",
+        text: metaParts.join(" · "),
+      });
+    }
   }
 
   onClose(): void {

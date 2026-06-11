@@ -2646,6 +2646,44 @@
   white-space: pre-wrap;
 }
 
+.base-board-graph-history-summary {
+  margin-bottom: 12px;
+}
+
+.base-board-graph-history-summary p {
+  margin: 2px 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.base-board-graph-history-empty {
+  color: var(--text-muted);
+}
+
+.base-board-graph-history-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.base-board-graph-history-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.base-board-graph-history-transition {
+  color: var(--text-normal);
+}
+
+.base-board-graph-history-meta {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
 .base-board-graph-node--completed {
   border-color: color-mix(
     in srgb,
@@ -2711,11 +2749,6 @@
     var(--color-orange, var(--text-warning)) 60%,
     var(--background-modifier-border)
   );
-}
-
-.base-board-graph-node--cancelled .base-board-graph-node-title {
-  text-decoration: line-through;
-  text-decoration-thickness: 1px;
 }
 
 .base-board-graph-node--active {

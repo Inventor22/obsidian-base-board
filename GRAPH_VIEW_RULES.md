@@ -36,14 +36,14 @@ rule wins:
 | Priority | State | Trigger | Visual style | Badge icon |
 |----------|-------|---------|--------------|------------|
 | 1 | `invalidated` | status is `invalidated` or `skipped` | 45% opacity, grayscale, dashed border; faint badge | `lucide-circle-off` |
-| 2 | `cancelled` | status is `cancelled`/`canceled` | 55% opacity, grayscale, dashed orange border, strikethrough title | `lucide-x-circle` |
+| 2 | `cancelled` | status is `cancelled`/`canceled` | 55% opacity, grayscale, dashed orange border | `lucide-x-circle` |
 | 3 | `interrupted` | status is `interrupted` or `failed` | error/red border + red tint | `lucide-ban` |
 | 4 | `active` (explicit) | status is `in progress`, `doing`, or `active` | accent border + glow; status color (`In Progress` = blue `#2f81f7`) | `lucide-play` |
 | 5 | `completed` | status is `completed` or `done` | success/green border + green tint | `lucide-check` |
 | 6 | `blocked` | status is `blocked` | error/red border | `lucide-octagon-alert` |
 | 7 | `waiting` | own `depends_on` deps OR any ancestor's deps are not all completed | muted, dashed border, 72% opacity | `lucide-lock` |
-| 8 | `completed` | node has incomplete children (container delegating work) | success/green | `lucide-check` |
-| 9 | `active` (computed) | ready: deps done and no incomplete children | accent border + glow | `lucide-play` |
+| 8 | `completed` | node has children (a container/sub-process) with satisfied dependencies | success/green | `lucide-check` |
+| 9 | `active` (computed) | ready **leaf** (no children): deps done | accent border + glow | `lucide-play` |
 | — | `idle` | default for new/unprocessed nodes | neutral | `lucide-circle` |
 
 Notes:
@@ -55,8 +55,11 @@ Notes:
   `cancelled` is in-flight work in a *parallel* branch, abandoned mid-flight
   because the iteration is restarting. Both are terminal for dependency/state
   computation (`isTerminalDependencyStatus`).
-- A **parent with incomplete children renders as `completed`** because its own
-  work is delegated to the subprocess; the children carry the real state.
+- A **container (any node with children) with satisfied dependencies renders
+  `completed` (green)** — whether it is still delegating to incomplete children
+  or all its children are now terminal. Only a childless **leaf** falls through
+  to the ready/`active` state. (A container explicitly marked `In Progress`
+  stays blue via the explicit-active rule above.)
 - `waiting` considers both the node's own dependencies and its ancestors'
   dependencies (`areDependenciesCompleted` + `areAncestorDependenciesCompleted`).
 
@@ -179,8 +182,8 @@ graph state, and kanban columns/projection:
 | Target | New status | Result |
 |--------|-----------|--------|
 | The node itself | `In Progress` | blue, explicit `active` state, actionable kanban frontier |
-| Upstream dependency chain (transitive `predecessors`) | `Completed` | green; set even if previously `Failed`/`Invalidated`/`Cancelled` (manual override implies prerequisites are done) |
-| Downstream (descendants + gated successors) | `Planned` | gray; excluded from kanban frontier so the node stays THE frontier. Reset even if currently failed/invalidated. |
+| Upstream dependency chain (transitive `predecessors`) | `Completed` | green; set even if previously `Failed`/`Invalidated`/`Cancelled` (manual override implies prerequisites are done). Includes the dependencies of **every ancestor** (to work inside a container, the container's deps must be done) and the full **containment subtree** of each prerequisite. |
+| Downstream (descendants + gated successors) | `Planned` | gray; excluded from kanban frontier so the node stays THE frontier. Reset even if currently failed/invalidated. Includes the work sequenced **after every ancestor** (e.g. later rollout rings like `canary`/`pilot`/`broad` after the containing `stage`) — being active inside a container means that container's successors have not run yet. See `getDownstreamResetNodes`. |
 | Ancestors (parent chain) | `Completed` **only if every branch is complete** | otherwise left unchanged (still contains the in-progress branch) |
 | Re-homed break link on the node | moved back to the canonical break point | reverses `markNodeFailed`'s break re-homing (see below) |
 
@@ -201,6 +204,15 @@ Rules / guarantees:
   `Cancelled`. Explicitly setting a downstream node active asserts its
   prerequisites are satisfied, so completion propagates back up the dependency
   chain (e.g. activating `Validate …` clears a `Failed` `Wait …` to `Completed`).
+- **Ancestor dependencies are completed too.** Upstream completion walks the
+  dependencies of the activated node AND of every **ancestor** (containment
+  implies the container's deps must be done), and completes each prerequisite's
+  full **containment subtree**. Example: activating a leaf inside `rollout`
+  completes `rollout`'s dependency `dev` (and `dev`'s children), which unblocks
+  the `rollout`/`repo`/`stage` containers so they render complete (green)
+  instead of `waiting`. Gated successors are deliberately NOT followed when
+  completing a prerequisite (that would sweep the active branch back in via
+  `dev → rollout`). See `getUpstreamDependencyNodes` / `getContainmentDescendants`.
 - **Ancestor (parent-chain) failed nodes are preserved.** A failed/terminal node
   on the activated node's *parent* chain is not overwritten (only the dependency
   chain is). Ancestors still only become `Completed` when all their branches are
@@ -209,34 +221,32 @@ Rules / guarantees:
   dependencies would, in the kanban active-frontier projection, hide its parent
   (the active node). `Planned` is non-actionable, so the active node stays the
   visible frontier card.
-- **Break re-homing is reversed.** When work resumes in a sibling group (you set
-  **any** node in the group active), any `breaks_to: <parent>` link that was
-  re-homed onto a non-canonical node (e.g. the previously-failed node) is moved
-  back to the **canonical break point**: the terminal node of the gated chain
-  (the child with no gated successor inside the group). This fires whether you
-  activate the failed node OR the canonical node itself. Example: after `Wait …`
-  was failed (link re-homed onto it), activating either `Wait …` or `Validate …`
-  moves the break link back onto `Validate …` (the chain terminal); since nothing
-  is failed it renders dormant muted green. See `restoreBreakPointToCanonical`.
+- **Break re-homing is reversed across affected groups.** When you set a node
+  active, every group affected by the activation — the activated node's own
+  group **and the group of every upstream-completed node** — has its break point
+  restored to that group's **canonical terminal** (the child with no gated
+  successor inside the group). So activating `pilot` (which completes the whole
+  `stage` ring upstream) moves a break that was re-homed onto `enable feature
+  flag` back onto `verify`. See `restoreGroupBreakPoint`.
 
 ### 5.1 Mark as failed (`markNodeFailed`)
 
 Right-click a node > **"Mark as failed"** is the inverse of "Set as active work"
-for failure handling. Its behavior depends on whether the failed node sits in an
-**escalation-style subprocess** — i.e. the failed node's parent itself
-participates in a `breaks_to` chain (each level has `breaks_to: <its parent>`,
-so breaks climb the parent hierarchy).
+for failure handling. Its behavior depends on whether the failed node **has a
+parent** — i.e. it is a step inside a containing subprocess. If so, failing it
+**breaks that subprocess** and escalates up the containment chain (the break
+point is created even when the template/group authored no break links).
 
-**Escalation graphs** (e.g. rollout iterations where `breaks_to` points up to
-the parent):
+**Subprocess steps** (any node with a parent — e.g. rollout rings, ring steps):
 
 | Step | Effect |
 |------|--------|
 | Status | The failed node becomes `Failed` (red `interrupted` state). |
-| Re-home the break point | Any same-parent sibling's `breaks_to: <parent>` is removed and re-added to the failed node, so the red break originates from the node that **actually** failed (not the originally-authored break point). |
-| Escalate up the parent chain | Walking from the failed node's parent to the root, a `breaks_to: <parent>` link is ensured at every level (created if missing), so the whole chain renders red. |
-| Invalidate | The gated-successor closure of the **break point** (the rollout rings after it, e.g. Canary → Pilot → Broad) becomes `Invalidated`. |
-| Cancel parallel branches | At each level **up to and including the iteration node**, the escalation child's *sibling* subtrees are parallel branches that were running concurrently. Their in-flight/pending work is set to `Cancelled`. Cancellation stops at the iteration boundary so it never touches the feature root's other children (the restart iteration). |
+| Keep upstream completed | The failed node's upstream dependency closure (predecessors + ancestor deps + their subtrees) stays `Completed` (it ran; the failure is downstream of it) and is excluded from cancellation/invalidation. In-flight upstream nodes are set `Completed`; genuinely failed/blocked ones are left as-is. The red break links convey that the failure is downstream of these nodes. |
+| Become the break point | The failed node gets `breaks_to: <parent>`: any same-parent sibling that held it is re-homed onto the failed node, or the link is **created** if the group had none. The red break originates from the node that **actually** failed. |
+| Escalate up the parent chain | Walking from the failed node's parent to the root, a `breaks_to: <parent>` link is ensured at every level (created if missing), so the whole containment chain renders red. |
+| Invalidate | The sequential downstream that can no longer run becomes `Invalidated` (gray, unreachable): the failed node's **own gated-successor closure** (the rest of its ring after it, e.g. `await feature flag rollout` → `verify`) AND the break point's gated successors (the subsequent rings, e.g. Canary → Pilot → Broad). This overrides a stale `Completed` (if the chain broke early, later steps are retroactively unreachable). |
+| Cancel parallel branches | At each level **up to and including the iteration node**, the escalation child's *sibling* subtrees are parallel branches that were running concurrently. Their in-flight/pending work is set to `Cancelled`. The failed node's **upstream dependency closure** and its **containment ancestors** are excluded (ancestors are escalation-path containers, not parallel work; a stale `Cancelled` ancestor is healed). Cancellation stops at the iteration boundary so it never touches the feature root's other children (the restart iteration). |
 | Next iteration | The iteration node on the chain gets a `restarts_to` next iteration, created to its right if none exists. |
 
 Worked example: failing `Validate RTPv4 Fabricator Stage automation` escalates
@@ -251,8 +261,9 @@ up to (and including) the iteration node — `getIterationAncestor` plus the
 cancelled (`isCancellableInFlight`); `Completed`, `Failed`, `Invalidated`,
 `Blocked`, and already-`Cancelled` nodes are preserved.
 
-**Flat graphs** (no escalation chain on the parent): just set the node `Failed`
-and `Invalidate` its own gated-successor closure.
+**Top-level nodes** (no parent): just set the node `Failed` and `Invalidate` its
+own gated-successor closure (no break point / escalation, since there is no
+containing subprocess to break).
 
 **Reversal:** "Set as active work" resumes the iteration — it resets `Cancelled`
 nodes within the activated node's iteration subtree back to `Planned` (alongside
@@ -357,6 +368,22 @@ Record shape (backward-compatible with the Timeline view, which reads
   **undo** reverses the event along with the status.
 - `causedBy` is always `human` today; the agent bridge
   (`GRAPH_AGENT_MCP_PLAN.md`) will set `agent`.
+
+### 8.2 History read + projection (Milestone 2 of `GRAPH_ARCHITECTURE_PLAN.md`)
+
+The event log is read back and can derive ("project") a node's current status:
+
+- `getNodeTransitionEvents(file)` parses the configured history array into
+  sorted `GraphTransitionEvent`s (status-property records only; legacy
+  kanban/rollout records are included).
+- `getProjectedStatus(events)` folds them to the latest `to` — the derived
+  current status. This is **read-only/diagnostic** for now; the live `status`
+  frontmatter is still the source of truth (the log only captures graph
+  transitions since Milestone 1, so the projection can legitimately differ for
+  nodes changed elsewhere).
+- Right-click a node > **"Show state history"** opens a per-node modal listing
+  every transition (time · kind · causedBy · source) with a projected-vs-current
+  match check. The node tooltip also shows a compact `A → B → C` sequence.
 
 ---
 
