@@ -179,7 +179,7 @@ graph state, and kanban columns/projection:
 | Target | New status | Result |
 |--------|-----------|--------|
 | The node itself | `In Progress` | blue, explicit `active` state, actionable kanban frontier |
-| Upstream dependency chain (transitive `predecessors`) | `Completed` | green |
+| Upstream dependency chain (transitive `predecessors`) | `Completed` | green; set even if previously `Failed`/`Invalidated`/`Cancelled` (manual override implies prerequisites are done) |
 | Downstream (descendants + gated successors) | `Planned` | gray; excluded from kanban frontier so the node stays THE frontier. Reset even if currently failed/invalidated. |
 | Ancestors (parent chain) | `Completed` **only if every branch is complete** | otherwise left unchanged (still contains the in-progress branch) |
 | Re-homed break link on the node | moved back to the canonical break point | reverses `markNodeFailed`'s break re-homing (see below) |
@@ -196,22 +196,28 @@ Rules / guarantees:
   failure, so any red `break` link sourced from a reset node becomes a dormant
   muted-green link (see §2.1). The red break links update everywhere in the
   affected subgraph automatically because break color is source-state-driven.
-- **Upstream/ancestor failed nodes are preserved.** Nodes whose status is
-  `blocked`, `interrupted`/`failed`, or `invalidated`/`skipped` that are
-  upstream of (or an ancestor of) the active node are never overwritten — those
-  ran before the active node, so their failure is real.
+- **Upstream dependencies override failed states.** A transitive `predecessor`
+  of the activated node is set `Completed` even if it was `Failed`/`Invalidated`/
+  `Cancelled`. Explicitly setting a downstream node active asserts its
+  prerequisites are satisfied, so completion propagates back up the dependency
+  chain (e.g. activating `Validate …` clears a `Failed` `Wait …` to `Completed`).
+- **Ancestor (parent-chain) failed nodes are preserved.** A failed/terminal node
+  on the activated node's *parent* chain is not overwritten (only the dependency
+  chain is). Ancestors still only become `Completed` when all their branches are
+  terminal-complete.
 - `Planned` (not `To Do`) is used downstream on purpose: a `To Do` child with no
   dependencies would, in the kanban active-frontier projection, hide its parent
   (the active node). `Planned` is non-actionable, so the active node stays the
   visible frontier card.
-- **Break re-homing is reversed.** If the node being made active is carrying a
-  `breaks_to: <parent>` link it picked up while it was the failure point, that
-  link is moved back to the **canonical break point** of its sibling group: the
-  terminal node of the gated chain (the child with no gated successor inside the
-  group). Example: after `Wait …` was failed and is now made active again, the
-  break link moves off `Wait …` back onto `Validate …` (the chain terminal), and
-  since nothing is failed it renders dormant muted green. See
-  `restoreBreakPointToCanonical`.
+- **Break re-homing is reversed.** When work resumes in a sibling group (you set
+  **any** node in the group active), any `breaks_to: <parent>` link that was
+  re-homed onto a non-canonical node (e.g. the previously-failed node) is moved
+  back to the **canonical break point**: the terminal node of the gated chain
+  (the child with no gated successor inside the group). This fires whether you
+  activate the failed node OR the canonical node itself. Example: after `Wait …`
+  was failed (link re-homed onto it), activating either `Wait …` or `Validate …`
+  moves the break link back onto `Validate …` (the chain terminal); since nothing
+  is failed it renders dormant muted green. See `restoreBreakPointToCanonical`.
 
 ### 5.1 Mark as failed (`markNodeFailed`)
 
@@ -315,9 +321,42 @@ canvas the full set is offered.
 | `breaks_to` | Break targets |
 | `restarts_to` | Restart targets |
 | `status` | Drives accent color and computed state |
+| `id` | Stable node identity; backfilled on first graph status change (join key for the transition event log) |
+| `status_history` (configurable) | Append-only transition event log (see below) |
 
 View-config keys (Bases view config, not frontmatter): `graphViewport`,
 `graphWorld`.
+
+### 8.1 Transition event log (Milestone 1 of `GRAPH_ARCHITECTURE_PLAN.md`)
+
+Every graph status change (via `setGraphNodeStatus` — used by Set active, Mark
+complete, Mark failed, and the escalation/invalidation/cancellation passes)
+appends an event to the configured transition-history array (default
+`status_history`, see plugin settings). Events are **append-only** and are the
+first step toward event sourcing (history, replay, timeline, agent trust
+record).
+
+Record shape (backward-compatible with the Timeline view, which reads
+`from`/`to`/`at`/`property`):
+
+```yaml
+- id: evt-<base36 time>-<rand>   # unique event id
+  node: <frontmatter id>          # stable node identity
+  kind: activated|completed|failed|invalidated|cancelled|awaiting|planned|transition
+  from: <prior status | null>
+  to: <new status>
+  at: <ISO-8601>
+  property: status                # the groupBy property
+  causedBy: human                 # agent layer (later) sets "agent"
+  source: baseboard-graph
+```
+
+- Honors the existing **Transition history** plugin setting (disabled → no
+  events written).
+- Writes happen inside the same frontmatter write as the status change, so
+  **undo** reverses the event along with the status.
+- `causedBy` is always `human` today; the agent bridge
+  (`GRAPH_AGENT_MCP_PLAN.md`) will set `agent`.
 
 ---
 

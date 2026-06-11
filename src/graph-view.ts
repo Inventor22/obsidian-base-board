@@ -233,7 +233,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.10.9";
+const GRAPH_BUILD_VERSION = "2026.06.10.12";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -2392,8 +2392,10 @@ export class GraphView extends BasesView {
    * - ancestors are only marked "Completed" when every one of their branches is
    *   already complete; an ancestor still containing the in-progress branch is
    *   left unchanged.
-   * Upstream and ancestor nodes in a failed/terminal state (blocked,
-   *   interrupted, invalidated) are preserved and never overwritten.
+   * Upstream dependency nodes are always set Completed (even if previously
+   *   Failed/Invalidated/Cancelled): marking a downstream node active overrides
+   *   them and asserts their work is done. Ancestor (parent-chain) nodes in a
+   *   failed/terminal state are still preserved.
    */
   private async makeNodeActive(node: GraphNode): Promise<void> {
     this.beginGraphHistory("Set as active work");
@@ -2409,7 +2411,10 @@ export class GraphView extends BasesView {
     }
 
     for (const upstream of this.getUpstreamDependencyNodes(node)) {
-      if (isPreserved(upstream)) continue;
+      // Upstream dependencies are always marked Completed, even if they were
+      // Failed/Invalidated/Cancelled. Explicitly setting a downstream node
+      // active asserts its prerequisites are satisfied, so a manual override of
+      // a downstream node propagates completion back up its dependency chain.
       newStatusByPath.set(upstream.file.path, GRAPH_STATUS_COMPLETED);
     }
 
@@ -2506,11 +2511,13 @@ export class GraphView extends BasesView {
   }
 
   /**
-   * Reverses the break re-homing that `markNodeFailed` performs. When a node is
-   * made active again, any `breaks_to: <parent>` link it picked up while it was
-   * the failure point is moved back to the canonical break point of its sibling
-   * group: the terminal node of the gated chain (the child with no gated
-   * successor inside the group). Returns true when a link was moved.
+   * Reverses the break re-homing that `markNodeFailed` performs. When work
+   * resumes in a sibling group (any node in the group is made active), any
+   * `breaks_to: <parent>` link that was re-homed onto a non-canonical node
+   * (e.g. the previously-failed node) is moved back to the canonical break
+   * point: the terminal node of the gated chain (the child with no gated
+   * successor inside the group). Works whether you activate the failed node OR
+   * the canonical node itself. Returns true when a link was moved.
    */
   private async restoreBreakPointToCanonical(
     node: GraphNode,
@@ -2518,13 +2525,6 @@ export class GraphView extends BasesView {
   ): Promise<boolean> {
     const parentNode = parentByPath.get(node.file.path);
     if (!parentNode) return false;
-    if (
-      !node.breakTargets.some(
-        (target) => target.file.path === parentNode.file.path,
-      )
-    ) {
-      return false;
-    }
 
     const group = this.visibleNodes.filter(
       (candidate) =>
@@ -2538,9 +2538,22 @@ export class GraphView extends BasesView {
           groupPaths.has(successor.file.path),
         ),
     );
-    if (!canonical || canonical.file.path === node.file.path) return false;
+    if (!canonical) return false;
 
-    await this.removeGraphReference(node, "breaks_to", parentNode);
+    // Any group member other than the canonical break point that currently
+    // carries `breaks_to: <parent>` is a re-homed (misplaced) break link.
+    const misplaced = group.filter(
+      (candidate) =>
+        candidate.file.path !== canonical.file.path &&
+        candidate.breakTargets.some(
+          (target) => target.file.path === parentNode.file.path,
+        ),
+    );
+    if (misplaced.length === 0) return false;
+
+    for (const candidate of misplaced) {
+      await this.removeGraphReference(candidate, "breaks_to", parentNode);
+    }
     if (
       !canonical.breakTargets.some(
         (target) => target.file.path === parentNode.file.path,
@@ -2560,10 +2573,100 @@ export class GraphView extends BasesView {
     await this.app.fileManager.processFrontMatter(
       node.file,
       (frontmatter: Record<string, unknown>) => {
+        const from = this.normalizeText(frontmatter[propertyName]);
         frontmatter[propertyName] = status;
+        const nodeId = this.ensureNodeId(frontmatter, node);
+        this.appendGraphTransitionEvent(
+          frontmatter,
+          propertyName,
+          nodeId,
+          from,
+          status,
+        );
       },
     );
   }
+
+  /**
+   * Ensures the note carries a stable frontmatter `id` (backfilling one from the
+   * title when missing) and returns it. Stable ids are the join key for the
+   * transition event log (Milestone 1 of GRAPH_ARCHITECTURE_PLAN.md).
+   */
+  private ensureNodeId(
+    frontmatter: Record<string, unknown>,
+    node: GraphNode,
+  ): string {
+    const existing = frontmatter.id;
+    if (typeof existing === "string" && existing.trim().length > 0) {
+      return existing.trim();
+    }
+    const generated = this.getGeneratedId(node.title);
+    frontmatter.id = generated;
+    return generated;
+  }
+
+  /**
+   * Appends an append-only transition event to the note's history array
+   * (Milestone 1: event sourcing, write-only). The record keeps the existing
+   * `{ from, to, at, property, source }` shape so the Timeline view stays
+   * compatible, and adds event-sourcing fields (`id`, `node`, `kind`,
+   * `causedBy`) that future milestones (history projection, replay, agent trust
+   * record) consume. No-op when transition history is disabled.
+   */
+  private appendGraphTransitionEvent(
+    frontmatter: Record<string, unknown>,
+    propertyName: string,
+    nodeId: string,
+    from: string | null,
+    to: string,
+  ): void {
+    const settings = this.plugin.data_.transitionHistory;
+    if (!settings.enabled) return;
+    const historyProperty = settings.propertyName.trim();
+    if (!historyProperty) return;
+
+    const existing = frontmatter[historyProperty];
+    const history: unknown[] = [];
+    if (Array.isArray(existing)) {
+      for (const item of existing as unknown[]) history.push(item);
+    } else if (existing !== undefined && existing !== null) {
+      history.push(existing);
+    }
+
+    const event = {
+      id: this.getGeneratedEventId(),
+      node: nodeId,
+      kind: this.getGraphEventKind(to),
+      from,
+      to,
+      at: new Date().toISOString(),
+      property: propertyName,
+      causedBy: "human",
+      source: "baseboard-graph",
+    };
+
+    frontmatter[historyProperty] = [...history, event];
+  }
+
+  /** Maps a target status string to a GraphEvent `kind` (see GRAPH_ARCHITECTURE_PLAN.md). */
+  private getGraphEventKind(status: string): string {
+    if (this.isActiveStatus(status)) return "activated";
+    if (this.isCompletedStatus(status)) return "completed";
+    if (this.isInterruptedStatus(status)) return "failed";
+    if (this.isInvalidatedStatus(status)) return "invalidated";
+    if (this.isCancelledStatus(status)) return "cancelled";
+    const normalized = status.trim().toLowerCase();
+    if (normalized === "awaiting") return "awaiting";
+    if (normalized === "planned") return "planned";
+    return "transition";
+  }
+
+  private getGeneratedEventId(): string {
+    const time = Date.now().toString(36);
+    const rand = Math.random().toString(36).slice(2, 8);
+    return `evt-${time}-${rand}`;
+  }
+
 
   // --- Undo / redo -----------------------------------------------------------
   // Mutating graph actions (set active, mark failed, create/delete/rewire

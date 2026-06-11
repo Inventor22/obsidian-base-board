@@ -170,7 +170,7 @@ Each = one focused commit/PR with its own test pass and (per repo convention) a
 
 | # | Milestone | Depends on | Behavior change? | How to test |
 |---|-----------|-----------|------------------|-------------|
-| 1 | **Event log (write-only)** — emit a `GraphEvent` on every existing transition; keep `status` as-is. Add `id` backfill. | — | None (additive) | Mark nodes active/failed/complete; confirm events recorded with correct from/to/at; existing flows unchanged. |
+| 1 | **Event log (write-only)** ✅ *done (build 2026.06.10.10)* — emit a `GraphEvent` on every graph status transition via `setGraphNodeStatus`; stored in the configured `status_history` array (Timeline-compatible) with `id`/`node`/`kind`/`causedBy` added; `id` backfilled. `status` still the live value. | — | None (additive) | Mark nodes active/failed/complete; confirm events recorded with correct from/to/at; existing flows unchanged. |
 | 2 | **History read + projection** — derive current status from the log; expose a per-node history view. | 1 | None (same status, new source) | Status matches pre-refactor for all RTPv4 nodes; history shows the sequence. |
 | 3 | **Scheduler + handlers (no-op refactor)** — move `markNodeFailed`/`makeNodeActive`/escalation/cancellation into per-type handlers behind a deterministic scheduler. | 1 | **None — verified identical** | Re-run the full RTPv4 scenario set (fail Validate → escalate+cancel; set active → reset+restore; mark complete) and confirm byte-identical frontmatter outcomes. |
 | 4 | **`Awaiting` state** — status + node-state + CSS (mirror `Cancelled`). | 3 | New state only | Set a node Awaiting; verify color/badge; frontier treats it distinctly. |
