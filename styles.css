@@ -2226,6 +2226,25 @@
   height: 15px;
 }
 
+.base-board-graph-history-controls {
+  margin-left: auto;
+}
+
+.base-board-graph-history-controls + .base-board-graph-zoom-controls {
+  margin-left: 6px;
+}
+
+.base-board-graph-zoom-button:disabled {
+  color: var(--text-faint);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.base-board-graph-zoom-button:disabled:hover {
+  background-color: transparent !important;
+  color: var(--text-faint);
+}
+
 .base-board-graph-zoom-controls + .base-board-graph-version {
   margin-left: 4px;
 }
@@ -2408,6 +2427,15 @@
   stroke-dasharray: 8 6;
 }
 
+.base-board-graph-edge--requirement-return-dormant {
+  stroke: color-mix(
+    in srgb,
+    var(--text-muted) 40%,
+    var(--background-modifier-border)
+  );
+  stroke-dasharray: 8 6;
+}
+
 .base-board-graph-arrow-marker--gating path {
   fill: color-mix(
     in srgb,
@@ -2452,6 +2480,14 @@
   fill: color-mix(
     in srgb,
     var(--text-success) 58%,
+    var(--background-modifier-border)
+  );
+}
+
+.base-board-graph-arrow-marker--requirement-return-dormant path {
+  fill: color-mix(
+    in srgb,
+    var(--text-muted) 40%,
     var(--background-modifier-border)
   );
 }
@@ -2661,6 +2697,27 @@
   border-style: dashed;
 }
 
+.base-board-graph-node--cancelled {
+  opacity: 0.55;
+  filter: grayscale(0.6);
+  border-style: dashed;
+  border-color: color-mix(
+    in srgb,
+    var(--color-orange, var(--text-warning)) 45%,
+    var(--background-modifier-border)
+  );
+  border-left-color: color-mix(
+    in srgb,
+    var(--color-orange, var(--text-warning)) 60%,
+    var(--background-modifier-border)
+  );
+}
+
+.base-board-graph-node--cancelled .base-board-graph-node-title {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
 .base-board-graph-node--active {
   border-color: color-mix(
     in srgb,
@@ -2714,6 +2771,10 @@
 
 .base-board-graph-node-state--invalidated {
   color: var(--text-faint);
+}
+
+.base-board-graph-node-state--cancelled {
+  color: var(--color-orange, var(--text-warning));
 }
 
 .base-board-graph-collapse {

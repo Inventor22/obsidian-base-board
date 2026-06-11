@@ -36,19 +36,25 @@ rule wins:
 | Priority | State | Trigger | Visual style | Badge icon |
 |----------|-------|---------|--------------|------------|
 | 1 | `invalidated` | status is `invalidated` or `skipped` | 45% opacity, grayscale, dashed border; faint badge | `lucide-circle-off` |
-| 2 | `interrupted` | status is `interrupted` or `failed` | error/red border + red tint | `lucide-ban` |
-| 3 | `active` (explicit) | status is `in progress`, `doing`, or `active` | accent border + glow; status color (`In Progress` = blue `#2f81f7`) | `lucide-play` |
-| 4 | `completed` | status is `completed` or `done` | success/green border + green tint | `lucide-check` |
-| 5 | `blocked` | status is `blocked` | error/red border | `lucide-octagon-alert` |
-| 6 | `waiting` | own `depends_on` deps OR any ancestor's deps are not all completed | muted, dashed border, 72% opacity | `lucide-lock` |
-| 7 | `completed` | node has incomplete children (container delegating work) | success/green | `lucide-check` |
-| 8 | `active` (computed) | ready: deps done and no incomplete children | accent border + glow | `lucide-play` |
+| 2 | `cancelled` | status is `cancelled`/`canceled` | 55% opacity, grayscale, dashed orange border, strikethrough title | `lucide-x-circle` |
+| 3 | `interrupted` | status is `interrupted` or `failed` | error/red border + red tint | `lucide-ban` |
+| 4 | `active` (explicit) | status is `in progress`, `doing`, or `active` | accent border + glow; status color (`In Progress` = blue `#2f81f7`) | `lucide-play` |
+| 5 | `completed` | status is `completed` or `done` | success/green border + green tint | `lucide-check` |
+| 6 | `blocked` | status is `blocked` | error/red border | `lucide-octagon-alert` |
+| 7 | `waiting` | own `depends_on` deps OR any ancestor's deps are not all completed | muted, dashed border, 72% opacity | `lucide-lock` |
+| 8 | `completed` | node has incomplete children (container delegating work) | success/green | `lucide-check` |
+| 9 | `active` (computed) | ready: deps done and no incomplete children | accent border + glow | `lucide-play` |
 | — | `idle` | default for new/unprocessed nodes | neutral | `lucide-circle` |
 
 Notes:
-- **Explicit `active` (priority 3) overrides the container rule**, so a node
+- **Explicit `active` (priority 4) overrides the container rule**, so a node
   marked as active work (status `In Progress`) stays blue even when it has
   incomplete children. This is what the "Set as active work" action relies on.
+- **`invalidated` vs `cancelled`:** `invalidated` is a step in the *failed
+  chain* that was queued but never ran (the rings after the break point);
+  `cancelled` is in-flight work in a *parallel* branch, abandoned mid-flight
+  because the iteration is restarting. Both are terminal for dependency/state
+  computation (`isTerminalDependencyStatus`).
 - A **parent with incomplete children renders as `completed`** because its own
   work is delegated to the subprocess; the children carry the real state.
 - `waiting` considers both the node's own dependencies and its ancestors'
@@ -73,7 +79,7 @@ different frontmatter and renders as a differently colored edge.
 
 | Menu item | Menu icon | Frontmatter written | Edge kind(s) | Color / style |
 |-----------|-----------|---------------------|--------------|---------------|
-| **Subprocess** | `lucide-git-branch` | sets target's `parent` = source (parent/child) | `requirement-start` (down) and `requirement-return` (up) | start: `text-muted` 52% solid; return: `text-success` 58% dashed `8 6` |
+| **Subprocess** | `lucide-git-branch` | sets target's `parent` = source (parent/child) | `requirement-start` (down) and `requirement-return` (up) | start: `text-muted` 52% solid; return (fulfilled): `text-success` 58% dashed `8 6`; return (dormant): `text-muted` 40% dashed |
 | **Dependency / gating** | `lucide-lock` | adds `depends_on` on target → source | `gating` | `interactive-accent` 58% solid + gating arrowhead |
 | **Break** | `lucide-unlink` | adds `breaks_to` on source → target | `break` (triggered) / `break-dormant` | triggered: `text-error` 78% dashed `5 5`; dormant: `text-success` 42% (muted green) |
 | **Restart** | `lucide-refresh-cw` | adds `restarts_to` on source → target | `restart` | `text-success` 76% dashed `7 5` |
@@ -84,8 +90,15 @@ different frontmatter and renders as a differently colored edge.
   until that is done."
 - **Requirement-start** (muted gray, going down): structural containment from
   parent to child (a subprocess step).
-- **Requirement-return** (green dashed, going up): completion flowing back up
-  from child to parent.
+- **Requirement-return** (going up): completion flowing back up from child to
+  parent. State-driven (mirror of break edges): green **only when the child
+  (`edge.from`) is genuinely `Completed`**; otherwise (in-progress, planned,
+  waiting, cancelled, failed, …) it renders **dormant muted gray** — a
+  not-yet-fulfilled return is not a lie about completion. Reverses for free:
+  when the child later completes it goes green again. See `getEdgeMarkerKind`.
+  Example: when `Flight RTPv4 in AzAllocator` is `Cancelled`, its return link to
+  `Flight RTPv4` goes gray (NOT red — red is reserved for the break/escalation
+  causal chain, which AzAllocator is not on).
 - **Break** (red dashed when triggered, muted green when dormant): represents a
   failure path. A break is only red when its **source node is genuinely failed**
   (`interrupted`/`failed` or `blocked`) — i.e. the failure really happened and
@@ -106,6 +119,27 @@ different frontmatter and renders as a differently colored edge.
 
 Edge endpoints can be re-anchored by dragging the endpoint handle to a different
 node; this rewrites the corresponding frontmatter reference.
+
+### 2.3 Undo / redo
+
+The graph toolbar has **Undo** / **Redo** buttons (left of the zoom controls).
+They cover the mutating link/status actions: **Set as active work**, **Mark as
+failed**, **Create link**, **Delete link**, and **Rewire link**.
+
+- Implemented as a file-snapshot transaction. Each wrapped action calls
+  `beginGraphHistory(label)`; the low-level writers (`setGraphNodeStatus`,
+  `addGraphReference`, `removeGraphReference`, `replaceGraphReference`,
+  `updateGraphParent`, `ensureNextIteration`, `createTemplateNode`) snapshot
+  each touched file's prior content via `snapshotForUndo` while armed.
+  `commitGraphHistory` records a diff entry (before/after content per file).
+- Undo restores the **before** content of every file in the entry (recreating a
+  file whose before-state was "did not exist" → deletes it; e.g. the iteration
+  auto-created by Mark-as-failed); redo restores **after**.
+- Node **drag** (`graph_x`/`graph_y`) and **collapse** (`graph_collapsed`) are
+  intentionally NOT tracked (high-frequency, low-value), so they don't pollute
+  the history stack.
+- A new action clears the redo stack. Stack depth is capped at
+  `GRAPH_HISTORY_LIMIT` (50).
 
 ---
 
@@ -196,10 +230,28 @@ the parent):
 | Re-home the break point | Any same-parent sibling's `breaks_to: <parent>` is removed and re-added to the failed node, so the red break originates from the node that **actually** failed (not the originally-authored break point). |
 | Escalate up the parent chain | Walking from the failed node's parent to the root, a `breaks_to: <parent>` link is ensured at every level (created if missing), so the whole chain renders red. |
 | Invalidate | The gated-successor closure of the **break point** (the rollout rings after it, e.g. Canary → Pilot → Broad) becomes `Invalidated`. |
+| Cancel parallel branches | At each level **up to and including the iteration node**, the escalation child's *sibling* subtrees are parallel branches that were running concurrently. Their in-flight/pending work is set to `Cancelled`. Cancellation stops at the iteration boundary so it never touches the feature root's other children (the restart iteration). |
 | Next iteration | The iteration node on the chain gets a `restarts_to` next iteration, created to its right if none exists. |
+
+Worked example: failing `Validate RTPv4 Fabricator Stage automation` escalates
+red links up to `RTPv4` AND cancels the in-flight work in the parallel
+`Flight RTPv4 in AzAllocator` branch (sibling of `Flight RTPv4 in Fabricator`
+under `Flight RTPv4`), while leaving `RTPv4 Iteration 2` untouched.
+
+The **iteration boundary** is key: red-link escalation climbs all the way to the
+feature root, but parallel cancellation only runs from the failed node's parent
+up to (and including) the iteration node — `getIterationAncestor` plus the
+`withinIteration` flag in `markNodeFailed`. Only in-flight/pending statuses are
+cancelled (`isCancellableInFlight`); `Completed`, `Failed`, `Invalidated`,
+`Blocked`, and already-`Cancelled` nodes are preserved.
 
 **Flat graphs** (no escalation chain on the parent): just set the node `Failed`
 and `Invalidate` its own gated-successor closure.
+
+**Reversal:** "Set as active work" resumes the iteration — it resets `Cancelled`
+nodes within the activated node's iteration subtree back to `Planned` (alongside
+the existing `Failed`/`Invalidated` → `Planned` reset and break-point
+restoration). All of this is inside the undo transaction.
 
 ### Escalation red color (render-time)
 
@@ -222,6 +274,14 @@ Rules / guarantees:
   the failed status from the chain so the escalated break links go dormant
   (muted green) again. The `breaks_to` links created during escalation persist
   in frontmatter but render dormant once nothing on the chain is failed.
+
+### 5.2 Mark as complete (`markNodeComplete`)
+
+Right-click a node > **"Mark as complete"** sets just that node's status to
+`Completed` (green). Unlike "Set as active work" it does **not** reshuffle the
+rest of the graph — it only records the node's own completion (an explicit user
+override that also works on a previously failed node). An already-complete node
+is a no-op. Undoable (see §2.3).
 
 ---
 
@@ -266,6 +326,7 @@ View-config keys (Bases view config, not frontmatter): `graphViewport`,
 | Status value (case-insensitive) | Resulting state |
 |---------------------------------|-----------------|
 | `invalidated`, `skipped` | `invalidated` |
+| `cancelled`, `canceled` | `cancelled` |
 | `interrupted`, `failed` | `interrupted` |
 | `in progress`, `doing`, `active` | `active` (explicit; overrides container rule) |
 | `completed`, `done` | `completed` |

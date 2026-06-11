@@ -28,6 +28,7 @@ type GraphNodeState =
   | "blocked"
   | "interrupted"
   | "invalidated"
+  | "cancelled"
   | "idle";
 type GraphEdgeKind = "requirement-start" | "requirement-return" | "gating";
 type GraphFlowEdgeKind = GraphEdgeKind | "break" | "restart";
@@ -200,6 +201,17 @@ interface GraphEdge {
   kind: GraphFlowEdgeKind;
 }
 
+interface GraphHistoryFileChange {
+  path: string;
+  before: string | null;
+  after: string | null;
+}
+
+interface GraphHistoryEntry {
+  label: string;
+  files: GraphHistoryFileChange[];
+}
+
 interface GraphViewportState {
   scrollLeft: number;
   scrollTop: number;
@@ -221,12 +233,14 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.10.5";
+const GRAPH_BUILD_VERSION = "2026.06.10.9";
+const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
 const GRAPH_STATUS_PLANNED = "Planned";
 const GRAPH_STATUS_FAILED = "Failed";
 const GRAPH_STATUS_INVALIDATED = "Invalidated";
+const GRAPH_STATUS_CANCELLED = "Cancelled";
 const NODE_WIDTH = 220;
 const NODE_MIN_HEIGHT = 92;
 const X_STEP = 300;
@@ -296,6 +310,13 @@ export class GraphView extends BasesView {
   private pendingGraphPositions = new Map<string, { x: number; y: number }>();
   private breakEscalationSourcePaths = new Set<string>();
   private graphParentByPath = new Map<string, GraphNode>();
+  private graphHistoryActive = false;
+  private graphHistoryLabel = "";
+  private graphHistoryBefore = new Map<string, string | null>();
+  private graphUndoStack: GraphHistoryEntry[] = [];
+  private graphRedoStack: GraphHistoryEntry[] = [];
+  private graphUndoButtonEl: HTMLButtonElement | null = null;
+  private graphRedoButtonEl: HTMLButtonElement | null = null;
   private graphEndpointAnchorOverrides = new Map<
     string,
     GraphEndpointAnchorOverride
@@ -425,11 +446,58 @@ export class GraphView extends BasesView {
     this.renderToolbarStat(toolbarEl, "Active", activeCount, "active");
     this.renderToolbarStat(toolbarEl, "Waiting", waitingCount, "waiting");
     this.renderToolbarStat(toolbarEl, "Completed", completedCount, "completed");
+    this.renderGraphHistoryControls(toolbarEl);
     this.renderGraphZoomControls(toolbarEl);
     toolbarEl.createSpan({
       cls: "base-board-graph-version",
       text: `v${GRAPH_BUILD_VERSION}`,
     });
+  }
+
+  private renderGraphHistoryControls(toolbarEl: HTMLElement): void {
+    const controlsEl = toolbarEl.createDiv({
+      cls: "base-board-graph-zoom-controls base-board-graph-history-controls",
+    });
+    this.graphUndoButtonEl = this.renderGraphIconButton(
+      controlsEl,
+      "lucide-undo-2",
+      "Undo",
+      () => {
+        void this.undoGraphHistory();
+      },
+    );
+    this.graphRedoButtonEl = this.renderGraphIconButton(
+      controlsEl,
+      "lucide-redo-2",
+      "Redo",
+      () => {
+        void this.redoGraphHistory();
+      },
+    );
+    this.updateGraphHistoryButtons();
+  }
+
+  private renderGraphIconButton(
+    controlsEl: HTMLElement,
+    icon: string,
+    label: string,
+    onClick: () => void,
+  ): HTMLButtonElement {
+    const buttonEl = controlsEl.createEl("button", {
+      cls: "base-board-graph-zoom-button",
+      attr: {
+        type: "button",
+        "aria-label": label,
+      },
+    });
+    setIcon(buttonEl, icon);
+    setTooltip(buttonEl, label);
+    buttonEl.addEventListener("click", (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      onClick();
+    });
+    return buttonEl;
   }
 
   private renderToolbarStat(
@@ -555,6 +623,7 @@ export class GraphView extends BasesView {
     for (const kind of [
       "requirement-start",
       "requirement-return",
+      "requirement-return-dormant",
       "gating",
       "break",
       "break-dormant",
@@ -1775,6 +1844,7 @@ export class GraphView extends BasesView {
     sourceSlot: GraphNodeAnchorSlot,
     targetSlot: GraphNodeAnchorSlot,
   ): Promise<void> {
+    this.beginGraphHistory("Create link");
     if (kind === "requirement") {
       await this.updateGraphParent(targetNode, sourceNode);
     } else if (kind === "successor") {
@@ -1792,6 +1862,7 @@ export class GraphView extends BasesView {
       targetSlot,
     );
     new Notice("Created link");
+    await this.commitGraphHistory();
     this.render();
   }
 
@@ -2147,6 +2218,7 @@ export class GraphView extends BasesView {
   }
 
   private async deleteGraphEdge(edge: GraphEdge): Promise<void> {
+    this.beginGraphHistory("Delete link");
     if (edge.kind === "requirement-start") {
       await this.updateGraphParent(edge.to, null, edge.from);
     } else if (edge.kind === "requirement-return") {
@@ -2171,6 +2243,7 @@ export class GraphView extends BasesView {
     new Notice(
       edge.kind === "requirement-return" ? "Hid return line" : "Deleted line",
     );
+    await this.commitGraphHistory();
     this.render();
   }
 
@@ -2289,11 +2362,21 @@ export class GraphView extends BasesView {
   }
 
   private getEdgeMarkerKind(edge: GraphEdge): string {
-    if (edge.kind !== "break") return edge.kind;
-    if (this.isBreakEdgeTriggered(edge) || this.isBreakEdgeEscalated(edge)) {
-      return "break";
+    if (edge.kind === "break") {
+      if (this.isBreakEdgeTriggered(edge) || this.isBreakEdgeEscalated(edge)) {
+        return "break";
+      }
+      return "break-dormant";
     }
-    return "break-dormant";
+    // A requirement-return edge means "completion flowing back up from child to
+    // parent". It is only a true (green) completion line when the child
+    // (edge.from) is genuinely Completed; otherwise it renders dormant/muted.
+    if (edge.kind === "requirement-return") {
+      return this.isCompletedStatus(edge.from.status)
+        ? "requirement-return"
+        : "requirement-return-dormant";
+    }
+    return edge.kind;
   }
 
   /**
@@ -2313,6 +2396,7 @@ export class GraphView extends BasesView {
    *   interrupted, invalidated) are preserved and never overwritten.
    */
   private async makeNodeActive(node: GraphNode): Promise<void> {
+    this.beginGraphHistory("Set as active work");
     const newStatusByPath = new Map<string, string>();
     const isPreserved = (candidate: GraphNode): boolean =>
       this.isInterruptedStatus(candidate.status) ||
@@ -2370,14 +2454,54 @@ export class GraphView extends BasesView {
       parentByPath,
     );
 
+    // Reverse parallel-branch cancellation: resuming work in an iteration
+    // un-cancels the concurrent branches that were abandoned by a prior
+    // failure. Reset `Cancelled` nodes within this iteration's subtree to
+    // `Planned` (skipping any just set above).
+    const iterationRoot = this.getIterationAncestor(node, parentByPath);
+    let resumedUpdates = 0;
+    for (const candidate of [
+      iterationRoot,
+      ...this.getDownstreamGraphNodes(iterationRoot),
+    ]) {
+      if (newStatusByPath.has(candidate.file.path)) continue;
+      if (!this.isCancelledStatus(candidate.status)) continue;
+      await this.setGraphNodeStatus(candidate, GRAPH_STATUS_PLANNED);
+      resumedUpdates += 1;
+    }
+
     const parts = [`Set "${node.title}" as active work`];
     if (relatedUpdates > 0) {
       parts.push(
         `updated ${relatedUpdates} related node${relatedUpdates === 1 ? "" : "s"}`,
       );
     }
+    if (resumedUpdates > 0) {
+      parts.push(
+        `resumed ${resumedUpdates} parallel node${resumedUpdates === 1 ? "" : "s"}`,
+      );
+    }
     if (restoredBreak) parts.push("restored the break point");
     new Notice(parts.join(", "));
+    await this.commitGraphHistory();
+    this.render();
+  }
+
+  /**
+   * Marks a single node as complete (`Completed`, green). Unlike "Set as active
+   * work" this does not reshuffle the rest of the graph — it just records the
+   * node's own completion (an explicit user override that also works on a
+   * previously failed node). An already-complete node is a no-op. Undoable.
+   */
+  private async markNodeComplete(node: GraphNode): Promise<void> {
+    if (this.isCompletedStatus(node.status)) {
+      new Notice(`"${node.title}" is already complete`);
+      return;
+    }
+    this.beginGraphHistory("Mark as complete");
+    await this.setGraphNodeStatus(node, GRAPH_STATUS_COMPLETED);
+    new Notice(`Marked "${node.title}" as complete`);
+    await this.commitGraphHistory();
     this.render();
   }
 
@@ -2431,6 +2555,7 @@ export class GraphView extends BasesView {
     node: GraphNode,
     status: string,
   ): Promise<void> {
+    await this.snapshotForUndo(node.file.path);
     const propertyName = this.getGroupByProperty() ?? "status";
     await this.app.fileManager.processFrontMatter(
       node.file,
@@ -2438,6 +2563,104 @@ export class GraphView extends BasesView {
         frontmatter[propertyName] = status;
       },
     );
+  }
+
+  // --- Undo / redo -----------------------------------------------------------
+  // Mutating graph actions (set active, mark failed, create/delete/rewire
+  // links) are wrapped in an armed history transaction. While armed, the
+  // low-level frontmatter/file writers snapshot each touched file's prior
+  // content via `snapshotForUndo`, and `commitGraphHistory` records the diff so
+  // it can be reversed. Node drag/collapse writes are intentionally not armed.
+
+  private beginGraphHistory(label: string): void {
+    this.graphHistoryActive = true;
+    this.graphHistoryLabel = label;
+    this.graphHistoryBefore = new Map();
+  }
+
+  private async snapshotForUndo(path: string): Promise<void> {
+    if (!this.graphHistoryActive) return;
+    if (this.graphHistoryBefore.has(path)) return;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    const content =
+      file instanceof TFile ? await this.app.vault.read(file) : null;
+    this.graphHistoryBefore.set(path, content);
+  }
+
+  private async commitGraphHistory(): Promise<void> {
+    if (!this.graphHistoryActive) return;
+    this.graphHistoryActive = false;
+    const before = this.graphHistoryBefore;
+    this.graphHistoryBefore = new Map();
+    if (before.size === 0) return;
+
+    const files: GraphHistoryFileChange[] = [];
+    for (const [path, beforeContent] of before) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      const afterContent =
+        file instanceof TFile ? await this.app.vault.read(file) : null;
+      if (beforeContent === afterContent) continue;
+      files.push({ path, before: beforeContent, after: afterContent });
+    }
+    if (files.length === 0) return;
+
+    this.graphUndoStack.push({ label: this.graphHistoryLabel, files });
+    if (this.graphUndoStack.length > GRAPH_HISTORY_LIMIT) {
+      this.graphUndoStack.shift();
+    }
+    this.graphRedoStack = [];
+  }
+
+  private async applyGraphHistoryState(
+    files: GraphHistoryFileChange[],
+    useBefore: boolean,
+  ): Promise<void> {
+    for (const change of files) {
+      const content = useBefore ? change.before : change.after;
+      const existing = this.app.vault.getAbstractFileByPath(change.path);
+      if (content === null) {
+        if (existing instanceof TFile) {
+          await this.app.fileManager.trashFile(existing);
+        }
+      } else if (existing instanceof TFile) {
+        await this.app.vault.modify(existing, content);
+      } else {
+        await this.app.vault.create(change.path, content);
+      }
+    }
+  }
+
+  private async undoGraphHistory(): Promise<void> {
+    const entry = this.graphUndoStack.pop();
+    if (!entry) return;
+    await this.applyGraphHistoryState(entry.files, true);
+    this.graphRedoStack.push(entry);
+    this.graphEndpointAnchorOverrides.clear();
+    new Notice(`Undid: ${entry.label}`);
+    this.render();
+  }
+
+  private async redoGraphHistory(): Promise<void> {
+    const entry = this.graphRedoStack.pop();
+    if (!entry) return;
+    await this.applyGraphHistoryState(entry.files, false);
+    this.graphUndoStack.push(entry);
+    this.graphEndpointAnchorOverrides.clear();
+    new Notice(`Redid: ${entry.label}`);
+    this.render();
+  }
+
+  private updateGraphHistoryButtons(): void {
+    if (this.graphUndoButtonEl) {
+      const top = this.graphUndoStack[this.graphUndoStack.length - 1];
+      this.graphUndoButtonEl.disabled = !top;
+      setTooltip(this.graphUndoButtonEl, top ? `Undo: ${top.label}` : "Nothing to undo");
+    }
+    if (this.graphRedoButtonEl) {
+      const top = this.graphRedoStack[this.graphRedoStack.length - 1];
+      this.graphRedoButtonEl.disabled = !top;
+      setTooltip(this.graphRedoButtonEl, top ? `Redo: ${top.label}` : "Nothing to redo");
+    }
   }
 
   /**
@@ -2464,6 +2687,7 @@ export class GraphView extends BasesView {
    * Nodes already in a genuine failed state are preserved.
    */
   private async markNodeFailed(node: GraphNode): Promise<void> {
+    this.beginGraphHistory("Mark as failed");
     const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
     const parentNode = parentByPath.get(node.file.path) ?? null;
     const isEscalation =
@@ -2472,6 +2696,7 @@ export class GraphView extends BasesView {
     await this.setGraphNodeStatus(node, GRAPH_STATUS_FAILED);
     let structuralChanges = 0;
     let createdIteration = false;
+    let cancelledUpdates = 0;
 
     if (isEscalation && parentNode) {
       // Re-home the break point of the parent group onto the failed node.
@@ -2501,11 +2726,27 @@ export class GraphView extends BasesView {
       }
 
       // Escalate up the parent chain to the root, ensuring a break link exists
-      // at each level and creating the next iteration where appropriate.
+      // at each level and creating the next iteration where appropriate. While
+      // still inside the failed iteration, cancel in-flight work in parallel
+      // sibling branches (the concurrent work abandoned by the restart).
       const visited = new Set<string>([node.file.path]);
+      const cancelHandled = new Set<string>([node.file.path]);
+      let escalationChild: GraphNode = node;
+      let withinIteration = true;
       let current: GraphNode | null = parentNode;
       while (current && !visited.has(current.file.path)) {
         visited.add(current.file.path);
+
+        if (withinIteration) {
+          for (const sibling of current.children) {
+            if (sibling.file.path === escalationChild.file.path) continue;
+            cancelledUpdates += await this.cancelInFlightSubtree(
+              sibling,
+              cancelHandled,
+            );
+          }
+        }
+
         const ancestor: GraphNode | null =
           parentByPath.get(current.file.path) ?? null;
         if (!ancestor) break;
@@ -2521,7 +2762,11 @@ export class GraphView extends BasesView {
           if (await this.ensureNextIteration(current, ancestor)) {
             createdIteration = true;
           }
+          // Above the iteration is the feature family (including the restart
+          // iteration); stop cancelling parallel branches there.
+          withinIteration = false;
         }
+        escalationChild = current;
         current = ancestor;
       }
     }
@@ -2559,10 +2804,72 @@ export class GraphView extends BasesView {
         `invalidated ${invalidatedUpdates} downstream node${invalidatedUpdates === 1 ? "" : "s"}`,
       );
     }
+    if (cancelledUpdates > 0) {
+      parts.push(
+        `cancelled ${cancelledUpdates} parallel node${cancelledUpdates === 1 ? "" : "s"}`,
+      );
+    }
     if (structuralChanges > 0) parts.push("escalated the break upstream");
     if (createdIteration) parts.push("started a new iteration");
     new Notice(parts.join(", "));
+    await this.commitGraphHistory();
     this.render();
+  }
+
+  /**
+   * Cancels in-flight/pending work within a node's subtree closure (the node
+   * plus its children + gated successors, transitively). Completed, failed,
+   * invalidated, blocked, and already-cancelled nodes are left untouched.
+   * `handled` dedupes across overlapping sibling subtrees. Returns the count.
+   */
+  private async cancelInFlightSubtree(
+    root: GraphNode,
+    handled: Set<string>,
+  ): Promise<number> {
+    let count = 0;
+    for (const candidate of [root, ...this.getDownstreamGraphNodes(root)]) {
+      if (handled.has(candidate.file.path)) continue;
+      handled.add(candidate.file.path);
+      if (!this.isCancellableInFlight(candidate.status)) continue;
+      await this.setGraphNodeStatus(candidate, GRAPH_STATUS_CANCELLED);
+      count += 1;
+    }
+    return count;
+  }
+
+  private isCancellableInFlight(status: string | null): boolean {
+    return (
+      !this.isCompletedStatus(status) &&
+      !this.isInterruptedStatus(status) &&
+      !this.isInvalidatedStatus(status) &&
+      !this.isBlockedStatus(status) &&
+      !this.isCancelledStatus(status)
+    );
+  }
+
+  /**
+   * Walks up the parent chain from a node to the iteration it belongs to (a
+   * node with `type: iteration` or a `restarts_to` link). Falls back to the
+   * topmost ancestor when there is no explicit iteration node.
+   */
+  private getIterationAncestor(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+  ): GraphNode {
+    const visited = new Set<string>([node.file.path]);
+    let current = node;
+    while (true) {
+      if (
+        (current.nodeType ?? "").toLowerCase() === "iteration" ||
+        current.restartTargets.length > 0
+      ) {
+        return current;
+      }
+      const parent = parentByPath.get(current.file.path);
+      if (!parent || visited.has(parent.file.path)) return current;
+      visited.add(parent.file.path);
+      current = parent;
+    }
   }
 
   /**
@@ -2592,6 +2899,7 @@ export class GraphView extends BasesView {
       x: iterationNode.x + NODE_WIDTH + 136,
       y: iterationNode.y,
     });
+    await this.snapshotForUndo(iterationNode.file.path);
     await this.app.fileManager.processFrontMatter(
       iterationNode.file,
       (frontmatter: Record<string, unknown>) => {
@@ -2707,6 +3015,7 @@ export class GraphView extends BasesView {
     endpoint: GraphEdgeEndpoint,
     targetNode: GraphNode,
   ): Promise<void> {
+    this.beginGraphHistory("Rewire link");
     if (edge.kind === "requirement-start") {
       if (endpoint === "from") {
         await this.updateGraphParent(edge.to, targetNode);
@@ -2757,6 +3066,7 @@ export class GraphView extends BasesView {
     }
 
     new Notice(`Rewired line to ${targetNode.title}`);
+    await this.commitGraphHistory();
     this.render();
   }
 
@@ -2765,6 +3075,7 @@ export class GraphView extends BasesView {
     parentNode: GraphNode | null,
     expectedParentNode?: GraphNode,
   ): Promise<void> {
+    await this.snapshotForUndo(childNode.file.path);
     await this.app.fileManager.processFrontMatter(
       childNode.file,
       (frontmatter: Record<string, unknown>) => {
@@ -2795,6 +3106,7 @@ export class GraphView extends BasesView {
     oldTargetNode: GraphNode,
     newTargetNode: GraphNode,
   ): Promise<void> {
+    await this.snapshotForUndo(node.file.path);
     await this.app.fileManager.processFrontMatter(
       node.file,
       (frontmatter: Record<string, unknown>) => {
@@ -2829,6 +3141,7 @@ export class GraphView extends BasesView {
     relationKind: GraphReferenceListKind,
     targetNode: GraphNode,
   ): Promise<void> {
+    await this.snapshotForUndo(node.file.path);
     await this.app.fileManager.processFrontMatter(
       node.file,
       (frontmatter: Record<string, unknown>) => {
@@ -2856,6 +3169,7 @@ export class GraphView extends BasesView {
     relationKind: GraphReferenceListKind,
     targetNode: GraphNode,
   ): Promise<void> {
+    await this.snapshotForUndo(node.file.path);
     await this.app.fileManager.processFrontMatter(
       node.file,
       (frontmatter: Record<string, unknown>) => {
@@ -3167,6 +3481,14 @@ export class GraphView extends BasesView {
         .setIcon("lucide-play")
         .onClick(() => {
           void this.makeNodeActive(sourceNode);
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Mark as complete")
+        .setIcon("lucide-check")
+        .onClick(() => {
+          void this.markNodeComplete(sourceNode);
         });
     });
     menu.addItem((item) => {
@@ -3784,6 +4106,7 @@ export class GraphView extends BasesView {
       }
     }
     lines.push("---", "", `# ${displayTitle}`, "", "## Notes", "");
+    await this.snapshotForUndo(filePath);
     await this.app.vault.create(filePath, lines.join("\n"));
     const file = this.app.vault.getAbstractFileByPath(filePath);
     if (!(file instanceof TFile)) {
@@ -4250,6 +4573,8 @@ export class GraphView extends BasesView {
     for (const node of nodes) {
       if (this.isInvalidatedStatus(node.status)) {
         node.state = "invalidated";
+      } else if (this.isCancelledStatus(node.status)) {
+        node.state = "cancelled";
       } else if (this.isInterruptedStatus(node.status)) {
         node.state = "interrupted";
       } else if (this.isActiveStatus(node.status)) {
@@ -4341,7 +4666,8 @@ export class GraphView extends BasesView {
     return (
       this.isCompletedStatus(status) ||
       this.isInterruptedStatus(status) ||
-      this.isInvalidatedStatus(status)
+      this.isInvalidatedStatus(status) ||
+      this.isCancelledStatus(status)
     );
   }
 
@@ -5433,6 +5759,11 @@ export class GraphView extends BasesView {
     return normalizedStatus === "invalidated" || normalizedStatus === "skipped";
   }
 
+  private isCancelledStatus(status: string | null): boolean {
+    const normalizedStatus = status?.trim().toLowerCase();
+    return normalizedStatus === "cancelled" || normalizedStatus === "canceled";
+  }
+
   private isBlockedStatus(status: string | null): boolean {
     return status?.trim().toLowerCase() === "blocked";
   }
@@ -5450,6 +5781,7 @@ export class GraphView extends BasesView {
     if (state === "completed") return "lucide-check";
     if (state === "interrupted") return "lucide-ban";
     if (state === "invalidated") return "lucide-circle-off";
+    if (state === "cancelled") return "lucide-x-circle";
     if (state === "waiting") return "lucide-lock";
     if (state === "blocked") return "lucide-octagon-alert";
     if (state === "active") return "lucide-play";
