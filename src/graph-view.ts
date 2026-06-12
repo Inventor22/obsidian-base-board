@@ -24,6 +24,7 @@ type GraphLinkCreationKind = GraphRelationKind | "break" | "restart";
 type GraphNodeState =
   | "active"
   | "in-progress"
+  | "awaiting"
   | "waiting"
   | "completed"
   | "blocked"
@@ -244,7 +245,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.11.10";
+const GRAPH_BUILD_VERSION = "2026.06.11.12";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -252,6 +253,7 @@ const GRAPH_STATUS_PLANNED = "Planned";
 const GRAPH_STATUS_FAILED = "Failed";
 const GRAPH_STATUS_INVALIDATED = "Invalidated";
 const GRAPH_STATUS_CANCELLED = "Cancelled";
+const GRAPH_STATUS_AWAITING = "Awaiting";
 const NODE_WIDTH = 220;
 const NODE_MIN_HEIGHT = 92;
 const X_STEP = 300;
@@ -2474,9 +2476,11 @@ export class GraphView extends BasesView {
     }
     // A requirement-return edge means "completion flowing back up from child to
     // parent". It is only a true (green) completion line when the child
-    // (edge.from) is genuinely Completed; otherwise it renders dormant/muted.
+    // (edge.from) is genuinely Completed. This must use the child's DERIVED
+    // state, not its stored status: a group child carries no live stored
+    // status, so its return only greens when all of its descendants complete.
     if (edge.kind === "requirement-return") {
-      return this.isCompletedStatus(edge.from.status)
+      return edge.from.state === "completed"
         ? "requirement-return"
         : "requirement-return-dormant";
     }
@@ -2511,7 +2515,35 @@ export class GraphView extends BasesView {
     this.render();
   }
 
-  // --- Pure recompute work-node operations (GRAPH_SEMANTICS_SPEC.md) ----------
+  /**
+   * Work-node operation: Set Awaiting (Milestone 4). Like Set Active, the node
+   * becomes the live frontier and everything *before* it becomes `Completed`
+   * while everything *after* becomes `Planned` — but the node is *parked*,
+   * waiting on something external (a rollout to propagate, an agent awaiting
+   * input/verification) rather than actively in hand. Distinct from `Active`
+   * (amber, not blue) and non-terminal, so downstream stays gated. Only leaf
+   * statuses are written; groups derive.
+   */
+  private async markNodeAwaiting(node: GraphNode): Promise<void> {
+    if (node.children.length > 0) {
+      new Notice(
+        `"${node.title}" is a group — its state derives from its children.`,
+      );
+      return;
+    }
+    this.beginGraphHistory("Set as awaiting");
+    const target = this.buildExecutionPartitionTargets(node, {
+      before: GRAPH_STATUS_COMPLETED,
+      self: GRAPH_STATUS_AWAITING,
+      after: GRAPH_STATUS_PLANNED,
+    });
+    const updated = await this.applyLeafStatuses(target, node.file.path);
+    new Notice(
+      this.describeWorkNodeOp(`Set "${node.title}" as awaiting`, updated),
+    );
+    await this.commitGraphHistory();
+    this.render();
+  }
   // The only stored truth is the set of work-node (leaf) statuses. Each work
   // operation partitions the graph by EXECUTION ORDER relative to the acted-on
   // leaf X — "before X" (its dependency closure incl. ancestor deps) and
@@ -3479,6 +3511,14 @@ export class GraphView extends BasesView {
           .setIcon("lucide-play")
           .onClick(() => {
             void this.makeNodeActive(sourceNode);
+          });
+      });
+      menu.addItem((item) => {
+        item
+          .setTitle("Set as awaiting")
+          .setIcon("lucide-hourglass")
+          .onClick(() => {
+            void this.markNodeAwaiting(sourceNode);
           });
       });
       menu.addItem((item) => {
@@ -4641,6 +4681,7 @@ export class GraphView extends BasesView {
     if (this.isCancelledStatus(node.status)) return "cancelled";
     if (this.isInterruptedStatus(node.status)) return "interrupted";
     if (this.isActiveStatus(node.status)) return "active";
+    if (this.isAwaitingStatus(node.status)) return "awaiting";
     if (this.isCompletedStatus(node.status)) return "completed";
     if (this.isBlockedStatus(node.status)) return "blocked";
     if (
@@ -4661,6 +4702,7 @@ export class GraphView extends BasesView {
     const isLive = (state: GraphNodeState): boolean =>
       state === "active" ||
       state === "in-progress" ||
+      state === "awaiting" ||
       state === "interrupted" ||
       state === "blocked";
     if (childStates.some(isLive)) return "in-progress";
@@ -5836,6 +5878,10 @@ export class GraphView extends BasesView {
     return normalizedStatus === "cancelled" || normalizedStatus === "canceled";
   }
 
+  private isAwaitingStatus(status: string | null): boolean {
+    return status?.trim().toLowerCase() === "awaiting";
+  }
+
   private isBlockedStatus(status: string | null): boolean {
     return status?.trim().toLowerCase() === "blocked";
   }
@@ -5854,6 +5900,7 @@ export class GraphView extends BasesView {
     if (state === "interrupted") return "lucide-ban";
     if (state === "invalidated") return "lucide-circle-off";
     if (state === "cancelled") return "lucide-x-circle";
+    if (state === "awaiting") return "lucide-hourglass";
     if (state === "waiting") return "lucide-lock";
     if (state === "blocked") return "lucide-octagon-alert";
     if (state === "active") return "lucide-play";

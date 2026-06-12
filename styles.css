@@ -2751,6 +2751,23 @@
   );
 }
 
+/* Awaiting: live but parked (waiting on something external). Amber, solid
+   border, NOT dimmed — it is in-flight, distinct from the gray dependency
+   `waiting` lock and from the abandoned `cancelled` state. */
+.base-board-graph-node--awaiting {
+  border-color: color-mix(
+    in srgb,
+    var(--color-yellow, #d29922) 55%,
+    var(--background-modifier-border)
+  );
+  border-left-color: var(--color-yellow, #d29922);
+  background-color: color-mix(
+    in srgb,
+    var(--color-yellow, #d29922) 8%,
+    var(--background-secondary)
+  );
+}
+
 .base-board-graph-node--active {
   border-color: color-mix(
     in srgb,
@@ -2829,6 +2846,10 @@
 
 .base-board-graph-node-state--in-progress {
   color: var(--color-purple, #a371f7);
+}
+
+.base-board-graph-node-state--awaiting {
+  color: var(--color-yellow, #d29922);
 }
 
 .base-board-graph-collapse {

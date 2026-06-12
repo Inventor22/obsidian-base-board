@@ -45,17 +45,18 @@ Each node is one Obsidian note. A node has **two independent visual dimensions**
 | 2 | `cancelled` | status is `cancelled`/`canceled` | `lucide-x-circle` |
 | 3 | `interrupted` | status is `interrupted` or `failed` | `lucide-ban` |
 | 4 | `active` | status is `in progress`, `doing`, or `active` | `lucide-play` |
-| 5 | `completed` | status is `completed` or `done` | `lucide-check` |
-| 6 | `blocked` | status is `blocked` | `lucide-octagon-alert` |
-| 7 | `waiting` | own `depends_on` deps OR any ancestor's deps are not all terminal (by DERIVED state) | `lucide-lock` |
-| 8 | `active` (computed) | ready leaf: gating prerequisites satisfied | `lucide-play` |
+| 5 | `awaiting` | status is `awaiting` (live but parked, waiting on something external) | `lucide-hourglass` |
+| 6 | `completed` | status is `completed` or `done` | `lucide-check` |
+| 7 | `blocked` | status is `blocked` | `lucide-octagon-alert` |
+| 8 | `waiting` | own `depends_on` deps OR any ancestor's deps are not all terminal (by DERIVED state) | `lucide-lock` |
+| 9 | `active` (computed) | ready leaf: gating prerequisites satisfied | `lucide-play` |
 
 **Group (container) state** — derived fold over children's derived states
 (`deriveGroupState`), precedence `In Progress > Completed > Cancelled/Invalidated > Planned`:
 
 | Children condition | Group state | Visual |
 |--------------------|-------------|--------|
-| any child `active`/`in-progress`/`interrupted`/`blocked` | `in-progress` | **purple** tint + border (`--color-purple` `#a371f7`), NO glow |
+| any child `active`/`in-progress`/`awaiting`/`interrupted`/`blocked` | `in-progress` | **purple** tint + border (`--color-purple` `#a371f7`), NO glow |
 | all children `completed` | `completed` | green |
 | all children `cancelled` | `cancelled` | dim orange dashed |
 | all children `invalidated` | `invalidated` | dim grayscale dashed |
@@ -72,6 +73,12 @@ Notes:
 - **`invalidated` vs `cancelled`:** `invalidated` is work sequenced *after* a
   failed/pruned point that can no longer run; `cancelled` is a deliberately
   pruned sub-graph (`reason: pruned-manual` in the event log).
+- **`awaiting` (amber, `lucide-hourglass`)** is a live-but-parked leaf state:
+  the work has reached this node and is waiting on something external (a rollout
+  to propagate, an agent awaiting input/verification). It is **non-terminal**
+  (downstream stays gated/`waiting`) and counts as **live** in the group fold
+  (its container reads `in-progress`). Distinct from the gray dependency
+  `waiting` lock and the dimmed `cancelled` state — it is NOT dimmed.
 - Dependency/ancestor-dependency satisfaction (`areGatingPrerequisitesTerminal`)
   is evaluated against **derived** states (memoized), so group prerequisites
   resolve correctly even though groups carry no live stored status.
@@ -88,6 +95,7 @@ and writes **only leaf statuses**; group states and link colors derive on render
 | Action | Target | Effect on leaves |
 |--------|--------|------------------|
 | **Set as active work** | leaf | before → `Completed`, `X` → `In Progress` (Active), after → `Planned` |
+| **Set as awaiting** | leaf | before → `Completed`, `X` → `Awaiting`, after → `Planned` (like Active, but parked/non-terminal) |
 | **Mark as complete** | leaf | before → `Completed`, `X` → `Completed` (after untouched) |
 | **Mark as failed** | leaf | before → `Completed`, `X` → `Failed`, after → `Invalidated` |
 | **Prune (cancel sub-graph)** | group | subtree leaves → `Cancelled` (`reason: pruned-manual`), after-group leaves → `Invalidated` |
@@ -129,11 +137,15 @@ different frontmatter and renders as a differently colored edge.
   parent to child (a subprocess step).
 - **Requirement-return** (going up): completion flowing back up from child to
   parent. State-driven: green **only when the child (`edge.from`) is genuinely
-  `Completed`**; otherwise it renders **dormant muted gray**. It is also
-  **suppressed entirely** for a group on the active failure path (a derived red
-  break replaces the canonical return while a descendant is failed —
-  `brokenParentPaths` in `layoutGraph`). Reverses for free when the failure
-  clears. See `getEdgeMarkerKind`.
+  `Completed`** — evaluated against the child's **derived state**
+  (`edge.from.state === "completed"`), NOT its stored status. This matters for
+  **group** children (e.g. `repo`): a group carries no live stored status, so
+  its return only greens once all of its descendants complete; a stale stored
+  `Completed` on a container is ignored. Otherwise it renders **dormant muted
+  gray**. It is also **suppressed entirely** for a group on the active failure
+  path (a derived red break replaces the canonical return while a descendant is
+  failed — `brokenParentPaths` in `layoutGraph`). Reverses for free when the
+  failure clears. See `getEdgeMarkerKind`.
 - **Break** (red dashed when triggered, muted green when dormant): represents a
   failure path. There are two sources:
   1. **Derived (Milestone 3):** a genuinely failed **leaf** synthesizes a red
