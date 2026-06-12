@@ -176,8 +176,14 @@ structural edit/delete action — right-clicking one shows no menu. (The former
 removed: link visibility is being handled by an upcoming header by-type filter,
 and per-edge persisted hides are no longer a concept.)
 
-Edge endpoints can be re-anchored by dragging the endpoint handle to a different
-node; this rewrites the corresponding frontmatter reference.
+Edge endpoints can be re-anchored by dragging the endpoint handle. While
+dragging, when the cursor is over or near a node's boundary the node's
+**available anchor points are revealed** as candidate dots and the line snaps to
+the nearest one. Dropping on a slot of the **same node** re-anchors the line
+(cosmetic routing only, no relationship change); dropping on a slot of a
+**different** valid node rewrites the corresponding frontmatter reference
+(reassigns), carrying the chosen anchor for the simple `gating`/`break`/`restart`
+kinds. Anchor overrides are ephemeral view state (not persisted to frontmatter).
 
 ### 2.3 Undo / redo
 

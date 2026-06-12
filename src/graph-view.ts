@@ -245,7 +245,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.11.12";
+const GRAPH_BUILD_VERSION = "2026.06.11.13";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -275,6 +275,9 @@ const CONFIG_KEY_GRAPH_VIEWPORT = "graphViewport";
 const CONFIG_KEY_GRAPH_WORLD = "graphWorld";
 const GRAPH_EDGE_HANDLE_RADIUS = 7;
 const GRAPH_LINK_HANDLE_PROXIMITY_PX = 14;
+// While dragging a link endpoint, reveal a node's anchor slots when the cursor
+// is over the node or within this many px of its boundary.
+const GRAPH_ANCHOR_REVEAL_PX = 32;
 const GRAPH_TEMPLATE_CHILD_Y_STEP = 150;
 const GRAPH_TEMPLATE_CHILD_X_STEP = 260;
 const GRAPH_WORLD_CONTENT_PADDING_X = 1600;
@@ -809,6 +812,7 @@ export class GraphView extends BasesView {
     const pathEl = this.renderedGraphEdgeEls[edgeIndex];
     if (!pathEl) return;
 
+    const currentNode = this.getEdgeEndpointNode(edge, endpoint);
     const originalPath = pathEl.getAttribute("d") ?? this.getEdgePath(edge);
     let didDrag = false;
     let dropNode: GraphNode | null = null;
@@ -818,13 +822,33 @@ export class GraphView extends BasesView {
       endpoint: GraphEdgeEndpoint;
       handleEl: SVGCircleElement;
     } | null = null;
+    let anchorTarget: { node: GraphNode; slot: GraphNodeAnchorSlot } | null =
+      null;
+    let anchorSlotNodePath: string | null = null;
+    const anchorSlotEls: SVGCircleElement[] = [];
     const startClientX = event.clientX;
     const startClientY = event.clientY;
+
+    // Snapshot node element positions once so near-border detection during the
+    // drag does not repeatedly query the DOM.
+    const nodeElsByPath = new Map<string, HTMLElement>();
+    this.containerEl
+      .querySelectorAll<HTMLElement>(".base-board-graph-node")
+      .forEach((nodeEl) => {
+        if (nodeEl.dataset.filePath) {
+          nodeElsByPath.set(nodeEl.dataset.filePath, nodeEl);
+        }
+      });
 
     this.containerEl.addClass("base-board-graph--edge-rewiring");
     pathEl.addClass("base-board-graph-edge--rewiring");
     handleEl.addClass("base-board-graph-edge-handle--dragging");
 
+    const clearAnchorSlots = () => {
+      for (const slotEl of anchorSlotEls) slotEl.remove();
+      anchorSlotEls.length = 0;
+      anchorSlotNodePath = null;
+    };
     const clearDropTarget = () => {
       dropNodeEl?.removeClass("base-board-graph-node--edge-drop-target");
       dropHandleTarget?.handleEl.removeClass(
@@ -833,6 +857,42 @@ export class GraphView extends BasesView {
       dropNodeEl = null;
       dropNode = null;
       dropHandleTarget = null;
+    };
+    const showAnchorSlots = (
+      node: GraphNode,
+      nearestSlot: GraphNodeAnchorSlot,
+    ) => {
+      if (anchorSlotNodePath !== node.file.path) {
+        clearAnchorSlots();
+        anchorSlotNodePath = node.file.path;
+        for (const slot of GRAPH_NODE_ANCHOR_SLOTS) {
+          const point = this.getNodeAnchorPointForSlot(node, slot);
+          const slotEl = activeDocument.createElementNS(
+            "http://www.w3.org/2000/svg",
+            "circle",
+          );
+          slotEl.addClass("base-board-graph-anchor-slot");
+          slotEl.setAttribute("r", String(GRAPH_EDGE_HANDLE_RADIUS - 1));
+          slotEl.setAttribute("cx", String(point.x));
+          slotEl.setAttribute("cy", String(point.y));
+          slotEl.dataset.side = slot.side;
+          slotEl.dataset.xRatio = String(slot.xRatio);
+          slotEl.dataset.yRatio = String(slot.yRatio);
+          svgEl.appendChild(slotEl);
+          anchorSlotEls.push(slotEl);
+        }
+      }
+      for (const slotEl of anchorSlotEls) {
+        const isActive =
+          slotEl.dataset.side === nearestSlot.side &&
+          slotEl.dataset.xRatio === String(nearestSlot.xRatio) &&
+          slotEl.dataset.yRatio === String(nearestSlot.yRatio);
+        if (isActive) {
+          slotEl.addClass("base-board-graph-anchor-slot--active");
+        } else {
+          slotEl.removeClass("base-board-graph-anchor-slot--active");
+        }
+      }
     };
 
     const moveHandler = (moveEvent: MouseEvent) => {
@@ -848,13 +908,8 @@ export class GraphView extends BasesView {
 
       moveEvent.preventDefault();
       const graphPoint = this.getGraphPointFromMouseEvent(moveEvent, svgEl);
-      pathEl.setAttribute(
-        "d",
-        this.getFloatingEdgePath(edge, endpoint, graphPoint),
-      );
-      handleEl.setAttribute("cx", String(graphPoint.x));
-      handleEl.setAttribute("cy", String(graphPoint.y));
 
+      // 1) Overlapping another edge's handle on the same node → swap anchors.
       const nextDropHandleTarget = this.getValidEdgeEndpointDropHandle(
         edge,
         endpoint,
@@ -862,36 +917,82 @@ export class GraphView extends BasesView {
         moveEvent.clientX,
         moveEvent.clientY,
       );
-      if (
-        nextDropHandleTarget &&
-        dropHandleTarget &&
-        nextDropHandleTarget.handleEl === dropHandleTarget.handleEl &&
-        nextDropHandleTarget.endpoint === dropHandleTarget.endpoint
-      ) {
-        return;
-      }
-
-      clearDropTarget();
       if (nextDropHandleTarget) {
-        dropHandleTarget = nextDropHandleTarget;
-        dropHandleTarget.handleEl.addClass(
-          "base-board-graph-edge-handle--drop-target",
+        anchorTarget = null;
+        clearAnchorSlots();
+        if (
+          !(
+            dropHandleTarget &&
+            nextDropHandleTarget.handleEl === dropHandleTarget.handleEl &&
+            nextDropHandleTarget.endpoint === dropHandleTarget.endpoint
+          )
+        ) {
+          clearDropTarget();
+          dropHandleTarget = nextDropHandleTarget;
+          dropHandleTarget.handleEl.addClass(
+            "base-board-graph-edge-handle--drop-target",
+          );
+        }
+        pathEl.setAttribute(
+          "d",
+          this.getFloatingEdgePath(edge, endpoint, graphPoint),
         );
+        handleEl.setAttribute("cx", String(graphPoint.x));
+        handleEl.setAttribute("cy", String(graphPoint.y));
         return;
       }
 
-      const nextDropNode = this.getValidEdgeEndpointDropNode(
-        edge,
-        endpoint,
-        this.getGraphNodeFromPoint(moveEvent.clientX, moveEvent.clientY),
+      // 2) Over/near a node → reveal its anchor slots and snap to the nearest.
+      //    The current endpoint's own node is a valid target (re-anchor on the
+      //    same node); a different node must be a valid reassign target.
+      const hoverNode = this.getNodeNearClientPoint(
+        moveEvent.clientX,
+        moveEvent.clientY,
+        nodeElsByPath,
+        GRAPH_ANCHOR_REVEAL_PX,
       );
-      if (nextDropNode?.file.path === dropNode?.file.path) return;
-      if (!nextDropNode) return;
-      const nextDropNodeEl = this.getRenderedGraphNodeEl(nextDropNode);
-      if (!nextDropNodeEl) return;
-      dropNode = nextDropNode;
-      dropNodeEl = nextDropNodeEl;
-      dropNodeEl.addClass("base-board-graph-node--edge-drop-target");
+      const sameNode = hoverNode?.file.path === currentNode.file.path;
+      const reassignNode =
+        hoverNode && !sameNode
+          ? this.getValidEdgeEndpointDropNode(edge, endpoint, hoverNode)
+          : null;
+      const nodeEl = hoverNode
+        ? (nodeElsByPath.get(hoverNode.file.path) ?? null)
+        : null;
+      if (hoverNode && nodeEl && (sameNode || reassignNode)) {
+        const slot = this.getNearestAnchorSlotForNode(
+          nodeEl,
+          moveEvent.clientX,
+          moveEvent.clientY,
+        );
+        clearDropTarget();
+        if (reassignNode) {
+          dropNode = reassignNode;
+          dropNodeEl = nodeEl;
+          dropNodeEl.addClass("base-board-graph-node--edge-drop-target");
+        }
+        anchorTarget = { node: hoverNode, slot };
+        showAnchorSlots(hoverNode, slot);
+        const anchorPoint = this.getNodeAnchorPointForSlot(hoverNode, slot);
+        pathEl.setAttribute(
+          "d",
+          this.getFloatingEdgePath(edge, endpoint, anchorPoint),
+        );
+        handleEl.setAttribute("cx", String(anchorPoint.x));
+        handleEl.setAttribute("cy", String(anchorPoint.y));
+        return;
+      }
+
+      // 3) No target → floating; clear all targets/affordances.
+      anchorTarget = null;
+      clearAnchorSlots();
+      clearDropTarget();
+      pathEl.setAttribute(
+        "d",
+        this.getFloatingEdgePath(edge, endpoint, graphPoint),
+      );
+      handleEl.setAttribute("cx", String(graphPoint.x));
+      handleEl.setAttribute("cy", String(graphPoint.y));
     };
 
     const upHandler = (upEvent: MouseEvent) => {
@@ -902,9 +1003,11 @@ export class GraphView extends BasesView {
       handleEl.removeClass("base-board-graph-edge-handle--dragging");
       const targetNode = dropNode;
       const targetHandle = dropHandleTarget;
+      const targetAnchor = anchorTarget;
+      clearAnchorSlots();
       clearDropTarget();
 
-      if (!didDrag || (!targetNode && !targetHandle)) {
+      if (!didDrag || (!targetHandle && !targetAnchor)) {
         pathEl.setAttribute("d", originalPath);
         this.syncRenderedGraphEdges();
         return;
@@ -915,6 +1018,7 @@ export class GraphView extends BasesView {
       window.setTimeout(() => {
         this.suppressNextNodeClick = false;
       }, 0);
+
       if (targetHandle) {
         this.swapGraphEndpointAnchors(
           edge,
@@ -925,8 +1029,27 @@ export class GraphView extends BasesView {
         return;
       }
 
-      if (targetNode) {
-        void this.reassignGraphEdgeEndpoint(edge, endpoint, targetNode);
+      if (targetAnchor) {
+        if (targetAnchor.node.file.path === currentNode.file.path) {
+          // Re-anchor the line on the same node (cosmetic routing only).
+          this.setEndpointAnchorOverride(
+            edge,
+            endpoint,
+            targetAnchor.node,
+            targetAnchor.slot,
+          );
+        } else if (targetNode) {
+          // Reassign to a different node, carrying the chosen anchor slot.
+          void this.reassignGraphEdgeEndpoint(
+            edge,
+            endpoint,
+            targetNode,
+            targetAnchor.slot,
+          );
+        } else {
+          pathEl.setAttribute("d", originalPath);
+          this.syncRenderedGraphEdges();
+        }
       }
     };
 
@@ -1592,6 +1715,76 @@ export class GraphView extends BasesView {
     const anchorX = rect.width * slot.xRatio;
     const anchorY = rect.height * slot.yRatio;
     return Math.hypot(anchorX - x, anchorY - y);
+  }
+
+  /**
+   * Finds the node whose rendered box (expanded by `margin`) is under or
+   * closest to a client point — used while dragging a link endpoint to reveal
+   * a node's anchor slots when the cursor is over it or near its boundary.
+   * Tries the node directly under the cursor first, then the nearest within
+   * `margin`. `nodeElsByPath` is a snapshot of node elements taken at drag
+   * start to avoid repeated DOM queries.
+   */
+  private getNodeNearClientPoint(
+    clientX: number,
+    clientY: number,
+    nodeElsByPath: Map<string, HTMLElement>,
+    margin: number,
+  ): GraphNode | null {
+    const over = this.getGraphNodeFromPoint(clientX, clientY);
+    if (over) return over;
+    let nearest: GraphNode | null = null;
+    let nearestDistance = margin;
+    for (const node of this.visibleNodes) {
+      const nodeEl = nodeElsByPath.get(node.file.path);
+      if (!nodeEl) continue;
+      const rect = nodeEl.getBoundingClientRect();
+      const dx = Math.max(rect.left - clientX, 0, clientX - rect.right);
+      const dy = Math.max(rect.top - clientY, 0, clientY - rect.bottom);
+      const distance = Math.hypot(dx, dy);
+      if (distance <= nearestDistance) {
+        nearestDistance = distance;
+        nearest = node;
+      }
+    }
+    return nearest;
+  }
+
+  /** Nearest anchor slot on a node to a client point (cursor may be outside). */
+  private getNearestAnchorSlotForNode(
+    nodeEl: HTMLElement,
+    clientX: number,
+    clientY: number,
+  ): GraphNodeAnchorSlot {
+    const rect = nodeEl.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    return GRAPH_NODE_ANCHOR_SLOTS.reduce((nearestSlot, candidateSlot) =>
+      this.getNodeAnchorSlotDistance(candidateSlot, rect, x, y) <
+      this.getNodeAnchorSlotDistance(nearestSlot, rect, x, y)
+        ? candidateSlot
+        : nearestSlot,
+    );
+  }
+
+  /**
+   * Pins a link endpoint to a specific anchor slot on its current node (a
+   * cosmetic routing override, not a relationship change). Used when a line end
+   * is dragged from one anchor point to another on the same node.
+   */
+  private setEndpointAnchorOverride(
+    edge: GraphEdge,
+    endpoint: GraphEdgeEndpoint,
+    node: GraphNode,
+    slot: GraphNodeAnchorSlot,
+  ): void {
+    const anchorPoint = this.getNodeAnchorPointForSlot(node, slot);
+    this.graphEndpointAnchorOverrides.set(
+      this.getEdgeEndpointOverrideKey(edge, endpoint),
+      this.getGraphEndpointAnchorOverride(node, anchorPoint),
+    );
+    this.syncRenderedGraphEdges();
+    new Notice("Re-anchored line");
   }
 
   private snapNodeLinkHandleToSlot(
@@ -3042,6 +3235,7 @@ export class GraphView extends BasesView {
     edge: GraphEdge,
     endpoint: GraphEdgeEndpoint,
     targetNode: GraphNode,
+    anchorSlot?: GraphNodeAnchorSlot,
   ): Promise<void> {
     this.beginGraphHistory("Rewire link");
     if (edge.kind === "requirement-start") {
@@ -3094,6 +3288,30 @@ export class GraphView extends BasesView {
     }
 
     new Notice(`Rewired line to ${targetNode.title}`);
+    // Carry the chosen anchor slot onto the reassigned endpoint for the simple
+    // source→target kinds, whose resulting edge identity is predictable. (The
+    // requirement/containment kinds re-derive their endpoints, so they keep the
+    // default anchor.) Set before render so it is picked up immediately.
+    if (
+      anchorSlot &&
+      (edge.kind === "gating" ||
+        edge.kind === "break" ||
+        edge.kind === "restart")
+    ) {
+      const fromPath =
+        endpoint === "from" ? targetNode.file.path : edge.from.file.path;
+      const toPath =
+        endpoint === "to" ? targetNode.file.path : edge.to.file.path;
+      const key = [edge.kind, fromPath, toPath, endpoint].join("::");
+      const anchorPoint = this.getNodeAnchorPointForSlot(
+        targetNode,
+        anchorSlot,
+      );
+      this.graphEndpointAnchorOverrides.set(
+        key,
+        this.getGraphEndpointAnchorOverride(targetNode, anchorPoint),
+      );
+    }
     await this.commitGraphHistory();
     this.render();
   }

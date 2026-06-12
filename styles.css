@@ -2376,6 +2376,26 @@
   cursor: grabbing;
 }
 
+/* Candidate anchor points revealed on a node while dragging a link endpoint
+   near its boundary. Non-interactive hints; the nearest one is highlighted. */
+.base-board-graph-anchor-slot {
+  pointer-events: none;
+  fill: var(--background-primary);
+  stroke: color-mix(
+    in srgb,
+    var(--interactive-accent) 55%,
+    var(--background-modifier-border)
+  );
+  stroke-width: 1.5;
+  opacity: 0.55;
+}
+
+.base-board-graph-anchor-slot--active {
+  fill: var(--interactive-accent);
+  stroke: var(--interactive-accent);
+  opacity: 1;
+}
+
 .base-board-graph-edge--gating {
   stroke: color-mix(
     in srgb,
