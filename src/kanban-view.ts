@@ -25,6 +25,10 @@ import {
   CONFIG_KEY_COLUMN_COLORS,
 } from "./constants";
 import { getColumnColor } from "./status-colors";
+import {
+  buildTransitionEvent,
+  type TransitionEvent,
+} from "./transition-history";
 
 const ARCHIVE_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000;
 const PLANNED_COLUMN = "Planned";
@@ -32,14 +36,6 @@ const ARCHIVE_DROP_COLUMN = "Archived";
 const ARCHIVE_TARGET_STATUS = "Completed";
 const ARCHIVED_PROPERTY = "archived";
 const STACKED_COLUMN_GROUPS = [["Flighting", "Blocked"]];
-
-interface TransitionHistoryEntry {
-  from: string | null;
-  to: string | null;
-  at: string;
-  property: string;
-  source: "baseboard-drag-drop";
-}
 
 interface ArchivedEntry {
   file: TFile;
@@ -500,7 +496,7 @@ export class KanbanView extends BasesView implements HoverParent {
     groupByProp: string,
   ): { from: string | null; to: string | null; at: Date } | null {
     if (!rawRecord || typeof rawRecord !== "object") return null;
-    const record = rawRecord as Partial<TransitionHistoryEntry>;
+    const record = rawRecord as Partial<TransitionEvent>;
     if (
       typeof record.property === "string" &&
       record.property !== groupByProp
@@ -1264,14 +1260,37 @@ export class KanbanView extends BasesView implements HoverParent {
       history.push(existingHistory);
     }
 
-    const entry: TransitionHistoryEntry = {
+    const nodeId = this.ensureNodeId(fm);
+    const entry = buildTransitionEvent({
+      node: nodeId,
       from: sourceColumn === NO_VALUE_COLUMN ? null : sourceColumn,
       to: targetColumnName === NO_VALUE_COLUMN ? null : targetColumnName,
-      at: new Date().toISOString(),
       property: groupByProp,
       source: "baseboard-drag-drop",
-    };
+    });
 
     fm[propertyName] = [...history, entry];
+  }
+
+  /** Ensures the note carries a stable frontmatter `id`, backfilling one. */
+  private ensureNodeId(fm: Record<string, unknown>): string {
+    const existing = fm.id;
+    if (typeof existing === "string" && existing.trim().length > 0) {
+      return existing.trim();
+    }
+    const rawTitle =
+      typeof fm.title === "string" && fm.title.trim()
+        ? fm.title.trim()
+        : "node";
+    const slug =
+      rawTitle
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 40) || "node";
+    const rand = Math.random().toString(36).slice(2, 6);
+    const generated = `${slug}-${rand}`;
+    fm.id = generated;
+    return generated;
   }
 }

@@ -2438,6 +2438,18 @@
   );
 }
 
+/* Membership / aggregation links (rollup_to) — manual, distinct from the work
+   graph. Thin dotted neutral so they don't read as requirement/gating/break. */
+.base-board-graph-edge--membership {
+  stroke: color-mix(
+    in srgb,
+    var(--text-faint) 70%,
+    var(--background-modifier-border)
+  );
+  stroke-width: 1.5;
+  stroke-dasharray: 2 4;
+}
+
 .base-board-graph-edge--requirement-return {
   stroke: color-mix(
     in srgb,
@@ -2484,6 +2496,14 @@
   fill: color-mix(
     in srgb,
     var(--text-success) 76%,
+    var(--background-modifier-border)
+  );
+}
+
+.base-board-graph-arrow-marker--membership path {
+  fill: color-mix(
+    in srgb,
+    var(--text-faint) 70%,
     var(--background-modifier-border)
   );
 }
@@ -2704,6 +2724,59 @@
   font-size: var(--font-ui-smaller);
 }
 
+.base-board-graph-frontier-list {
+  list-style: none;
+  margin: 0 0 12px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.base-board-graph-frontier-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background-color: var(--background-secondary);
+}
+
+.base-board-graph-frontier-crumb {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.base-board-graph-frontier-leaf {
+  color: var(--text-normal);
+  font-weight: var(--font-semibold);
+}
+
+.base-board-graph-frontier-sep {
+  color: var(--text-faint);
+}
+
+.base-board-graph-frontier-meta {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+
+.base-board-graph-frontier-meta--blocked,
+.base-board-graph-frontier-meta--interrupted {
+  color: var(--text-error);
+}
+
+.base-board-graph-frontier-meta--awaiting {
+  color: var(--text-warning);
+}
+
+.base-board-graph-frontier-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
 .base-board-graph-node--completed {
   border-color: color-mix(
     in srgb,
@@ -2903,6 +2976,72 @@
 .base-board-graph-collapse:focus-visible {
   color: var(--interactive-accent);
   outline: none;
+}
+
+/* Lock toggle on a subgraph root. Subtle (open) when unlocked, prominent when
+   locked; click toggles graph_locked. */
+.base-board-graph-lock {
+  appearance: none;
+  position: absolute;
+  top: 8px;
+  right: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0 !important;
+  border-radius: 50%;
+  background-color: var(--background-primary) !important;
+  box-shadow: none !important;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0.4;
+}
+
+.base-board-graph-lock--locked {
+  color: var(--text-warning);
+  opacity: 1;
+}
+
+.base-board-graph-lock:hover,
+.base-board-graph-lock:focus-visible {
+  color: var(--interactive-accent);
+  opacity: 1;
+  outline: none;
+}
+
+.base-board-graph-lock svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* Agency badge (top-left): shown when a node is agent- or mixed-executed. */
+.base-board-graph-agency {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background-color: var(--background-primary);
+  color: var(--text-accent);
+}
+
+.base-board-graph-agency--mixed {
+  color: var(--color-cyan, var(--text-accent));
+}
+
+.base-board-graph-agency svg {
+  width: 12px;
+  height: 12px;
 }
 
 .base-board-graph-node-title {

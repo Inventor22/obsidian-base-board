@@ -105,14 +105,36 @@ branches (those imperative behaviors were removed). The red break link is
 derived (see §2.1).
 
 
-### 1.3 Node types
+### 1.3 Node model — three axes
 
-`nodeType` is a descriptive label only (no color impact). Allowed values
-(`GRAPH_NODE_TYPE_OPTIONS`):
+A node is classified on three **independent** axes (see
+`GRAPH_ARCHITECTURE_PLAN.md` "Node model — three axes"):
 
-`feature`, `iteration`, `dev`, `rollout`, `repo`, `stage`, `canary`, `pilot`,
-`broad`, `design`, `implementation`, `review`, `await`, `enable`, `verify`,
-`task`.
+1. **Kind** (`kind`, closed) — the behavioural archetype the engine branches on:
+   `work` · `process` · `group` · `impact`. **Inferred from structure** by
+   `assignNodeKinds` (no children/members → `work`; has children → `process`;
+   has members via `rollup_to` → `group`). A `group` with no members yet must
+   declare `kind: group` explicitly — there is **no label-name fallback**. Only
+   persisted when not the default (`createTemplateNode` writes `kind` only for
+   non-`work`). `isScopeNode` is now `kind === "group"`.
+2. **Label** (`type`, open, cosmetic) — the domain descriptor: `feature`, `dev`,
+   `stage`, `semester`, `career`, "house", … No behaviour keys off it.
+   `semester`/`career`/etc. are *labels on `group`-kind nodes*, not kinds.
+3. **Agency** (`executor` + `autonomy`) — who runs the work: executor
+   `human`·`agent`·`mixed`, autonomy `propose`·`execute`·`autopilot`.
+   **Inherited down containment** (nearest-explicit-wins, like the lock;
+   `assignNodeAgency`), default `human`/`propose`. A non-human node shows an
+   agency badge (top-left: `lucide-bot` agent, `lucide-users` mixed); the
+   right-click **Run by** / **Autonomy** items cycle the values (written
+   explicitly). Independent of the lock (lock = structure editability).
+
+**Group/scope nodes** (`kind === "group"`) are pure aggregation containers: they
+derive state by **rolling up their members** (`rollup_to`) via the group fold,
+get no work-node/Prune/agency actions, and the work engine never follows
+`rollup_to`, so a scope can never read `Failed` — the boundary is automatic.
+
+The **Add node** modal picks a **Kind** (Work item / Subprocess / Group) plus an
+optional free **Label**; the template-internal labels come from **Add template**.
 
 ---
 
@@ -128,6 +150,33 @@ different frontmatter and renders as a differently colored edge.
 | **Dependency / gating** | `lucide-lock` | adds `depends_on` on target → source | `gating` | `interactive-accent` 58% solid + gating arrowhead |
 | **Break** | `lucide-unlink` | adds `breaks_to` on source → target | `break` (triggered) / `break-dormant` | triggered: `text-error` 78% dashed `5 5`; dormant: `text-success` 42% (muted green) |
 | **Restart** | `lucide-refresh-cw` | adds `restarts_to` on source → target | `restart` | `text-success` 76% dashed `7 5` |
+| **Roll up into (membership)** | `lucide-layers` | adds `rollup_to` on source → target (source is a member of the target scope) | `membership` | `text-faint` 70% thin dotted `2 4` |
+
+Membership links are the **only manually editable** structural relation
+(create via the menu, remove via right-click "Remove from scope", reassign by
+dragging the endpoint). They are many-to-many (`rollup_to` is a list). The
+requirement/gating/break/restart edges are computed/structural.
+
+### 2.2.1 Subgraph lock (`graph_locked`)
+
+A node can carry `graph_locked: true|false`, which governs its **containment
+subtree**. Effective lock = the value of the **nearest self-or-ancestor with an
+explicit `graph_locked`** (default unlocked) — so a locked template root freezes
+its whole subtree, and a nested template with its own lock is an independent
+unit (unlocking an ancestor does not free it). Resolved in `assignNodeLocks`
+(`node.effectiveLocked`).
+
+- **Templates insert locked** (their root gets `graph_locked: true`). Every
+  subgraph root (a node with children) shows a **clickable lock toggle**
+  (top-right): `lucide-lock` (prominent) when locked, `lucide-lock-open`
+  (subtle) when unlocked — clicking it toggles the lock. The right-click
+  **Lock/Unlock subgraph** item does the same. Both write an explicit value (so
+  it overrides any inherited lock).
+- **Locked freezes internal structure:** no adding child nodes/templates, no
+  creating/deleting/rewiring structural edges (`requirement`/`gating`/`break`/
+  `restart`), no dragging structural endpoints, inside the locked region.
+- **Still allowed when locked:** repositioning/collapsing nodes (layout, not
+  structure) and **membership (`rollup_to`)** links (external aggregation).
 
 ### 2.1 Edge color meaning
 

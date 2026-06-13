@@ -18,9 +18,14 @@ import { CardDetailModal } from "./card-detail-modal";
 import { InputModal } from "./modals";
 import { ORDER_PROPERTY, sanitizeFilename } from "./constants";
 import { getColumnColor } from "./status-colors";
+import { buildTransitionEvent } from "./transition-history";
 
 type GraphRelationKind = "requirement" | "successor";
-type GraphLinkCreationKind = GraphRelationKind | "break" | "restart";
+type GraphLinkCreationKind =
+  | GraphRelationKind
+  | "break"
+  | "restart"
+  | "membership";
 type GraphNodeState =
   | "active"
   | "in-progress"
@@ -33,7 +38,7 @@ type GraphNodeState =
   | "cancelled"
   | "idle";
 type GraphEdgeKind = "requirement-start" | "requirement-return" | "gating";
-type GraphFlowEdgeKind = GraphEdgeKind | "break" | "restart";
+type GraphFlowEdgeKind = GraphEdgeKind | "break" | "restart" | "membership";
 type GraphWorkflowTemplate =
   | "feature-simple"
   | "feature-detailed"
@@ -44,7 +49,29 @@ type GraphWorkflowTemplate =
   | "ring-basic";
 type GraphAnchorSide = "top" | "right" | "bottom" | "left";
 type GraphEdgeEndpoint = "from" | "to";
-type GraphReferenceListKind = "depends_on" | "breaks_to" | "restarts_to";
+type GraphReferenceListKind =
+  | "depends_on"
+  | "breaks_to"
+  | "restarts_to"
+  | "rollup_to";
+// Node model axes (see GRAPH_ARCHITECTURE_PLAN.md "Node model — three axes").
+// Kind = behaviour (the only axis the engine branches on); `type` = open label;
+// agency = who executes the work and how autonomously.
+type GraphNodeKind = "work" | "process" | "group" | "impact";
+type GraphExecutor = "human" | "agent" | "mixed";
+type GraphAutonomy = "propose" | "execute" | "autopilot";
+const GRAPH_NODE_KINDS: readonly GraphNodeKind[] = [
+  "work",
+  "process",
+  "group",
+  "impact",
+];
+const GRAPH_EXECUTORS: readonly GraphExecutor[] = ["human", "agent", "mixed"];
+const GRAPH_AUTONOMY_LEVELS: readonly GraphAutonomy[] = [
+  "propose",
+  "execute",
+  "autopilot",
+];
 
 interface GraphEndpointAnchorOverride {
   side: GraphAnchorSide;
@@ -70,24 +97,14 @@ interface GraphTemplateDefinition {
   preview: string[];
 }
 
-const GRAPH_NODE_TYPE_OPTIONS = [
-  "feature",
-  "iteration",
-  "dev",
-  "rollout",
-  "repo",
-  "stage",
-  "canary",
-  "pilot",
-  "broad",
-  "design",
-  "implementation",
-  "review",
-  "await",
-  "enable",
-  "verify",
-  "task",
-] as const;
+// Curated choices for the manual "Add node" picker: the behavioural KIND, not
+// a domain label (those template labels are produced by templates). A node's
+// concrete name/label is the title plus an optional free `type` descriptor.
+const GRAPH_ADD_NODE_KIND_OPTIONS: { value: GraphNodeKind; label: string }[] = [
+  { value: "work", label: "Work item" },
+  { value: "process", label: "Subprocess" },
+  { value: "group", label: "Group / scope" },
+];
 
 const GRAPH_TEMPLATE_DEFINITIONS: GraphTemplateDefinition[] = [
   {
@@ -176,6 +193,7 @@ interface GraphNode {
   dependsOnKeys: string[];
   breaksToKeys: string[];
   restartsToKeys: string[];
+  rollupToKeys: string[];
   nodeType: string | null;
   workflow: string | null;
   collapsed: boolean;
@@ -185,6 +203,23 @@ interface GraphNode {
   predecessors: GraphNode[];
   breakTargets: GraphNode[];
   restartTargets: GraphNode[];
+  rollupTargets: GraphNode[];
+  members: GraphNode[];
+  // Node-model axes (GRAPH_ARCHITECTURE_PLAN.md). `kind` = behavioural
+  // archetype (inferred unless explicit); `executor`/`autonomy` = agency
+  // (inherited down containment, nearest-explicit-wins). `*Explicit` is the
+  // node's own stored value (null = unset).
+  kindExplicit: GraphNodeKind | null;
+  kind: GraphNodeKind;
+  executorExplicit: GraphExecutor | null;
+  executor: GraphExecutor;
+  autonomyExplicit: GraphAutonomy | null;
+  autonomy: GraphAutonomy;
+  // Subgraph lock (Step B). `lockedExplicit` is this node's own stored
+  // `graph_locked` (null = unset); `effectiveLocked` is the resolved value
+  // (nearest self-or-ancestor with an explicit lock wins).
+  lockedExplicit: boolean | null;
+  effectiveLocked: boolean;
   x: number;
   y: number;
   savedX: number | null;
@@ -196,6 +231,21 @@ interface GraphEdge {
   from: GraphNode;
   to: GraphNode;
   kind: GraphFlowEdgeKind;
+}
+
+// A single active-frontier item, projected for the read-only frontier panel
+// (and, later, the Kanban projection). `lineage` is the work breadcrumb from
+// the feature/work-root down to the node (excludes the scope/aggregation layer).
+interface GraphFrontierItem {
+  lineage: string[];
+  status: string | null;
+  state: GraphNodeState;
+}
+
+// A graph-hygiene finding: a node disconnected from the hierarchy.
+interface GraphHygieneItem {
+  title: string;
+  reason: string;
 }
 
 interface GraphHistoryFileChange {
@@ -245,7 +295,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.11.13";
+const GRAPH_BUILD_VERSION = "2026.06.13.1";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -271,6 +321,7 @@ const GRAPH_PAN_MARGIN_Y = 320;
 const GRAPH_POSITION_PROPERTY_X = "graph_x";
 const GRAPH_POSITION_PROPERTY_Y = "graph_y";
 const GRAPH_COLLAPSED_PROPERTY = "graph_collapsed";
+const GRAPH_LOCKED_PROPERTY = "graph_locked";
 const CONFIG_KEY_GRAPH_VIEWPORT = "graphViewport";
 const CONFIG_KEY_GRAPH_WORLD = "graphWorld";
 const GRAPH_EDGE_HANDLE_RADIUS = 7;
@@ -461,6 +512,7 @@ export class GraphView extends BasesView {
     this.renderToolbarStat(toolbarEl, "Active", activeCount, "active");
     this.renderToolbarStat(toolbarEl, "Waiting", waitingCount, "waiting");
     this.renderToolbarStat(toolbarEl, "Completed", completedCount, "completed");
+    this.renderGraphFrontierButton(toolbarEl);
     this.renderGraphHistoryControls(toolbarEl);
     this.renderGraphZoomControls(toolbarEl);
     toolbarEl.createSpan({
@@ -529,6 +581,105 @@ export class GraphView extends BasesView {
       cls: "base-board-graph-stat-value",
       text: String(count),
     });
+  }
+
+  private renderGraphFrontierButton(toolbarEl: HTMLElement): void {
+    const controlsEl = toolbarEl.createDiv({
+      cls: "base-board-graph-zoom-controls",
+    });
+    this.renderGraphIconButton(
+      controlsEl,
+      "lucide-target",
+      "Active frontier & hygiene",
+      () => {
+        this.showGraphFrontier();
+      },
+    );
+  }
+
+  // --- Frontier / lineage / hygiene (read-only projection of the graph) -------
+  // The "active frontier" is the set of actionable work leaves at the live edge
+  // of each branch — the nodes that will project onto the Kanban. This panel is
+  // a read-only validation surface for that derivation + the work breadcrumb.
+
+  /**
+   * A leaf is on the frontier when it is actionable now: a work leaf (not a
+   * group/container) whose gating prerequisites are satisfied and which is not
+   * terminal — i.e. its derived state is the live edge (active/awaiting/blocked/
+   * failed), never completed/cancelled/invalidated/waiting.
+   */
+  private isFrontierLeaf(node: GraphNode): boolean {
+    if (node.children.length > 0) return false;
+    if (node.kind === "group") return false;
+    return (
+      node.state === "active" ||
+      node.state === "awaiting" ||
+      node.state === "blocked" ||
+      node.state === "interrupted"
+    );
+  }
+
+  private getGraphFrontier(): GraphNode[] {
+    return this.visibleNodes.filter((node) => this.isFrontierLeaf(node));
+  }
+
+  /**
+   * The work breadcrumb for a node: the containment chain from the node up to
+   * (and including) the topmost non-group ancestor — the feature/work-root.
+   * Stops *below* the scope/aggregation layer (a `group` ancestor), since the
+   * scope context is the lens's job, not the breadcrumb's. Returned top→down.
+   */
+  private getNodeLineage(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+  ): string[] {
+    const chain: string[] = [node.title];
+    const seen = new Set<string>([node.file.path]);
+    let parent = parentByPath.get(node.file.path) ?? null;
+    while (parent && !seen.has(parent.file.path)) {
+      if (parent.kind === "group") break;
+      chain.push(parent.title);
+      seen.add(parent.file.path);
+      parent = parentByPath.get(parent.file.path) ?? null;
+    }
+    return chain.reverse();
+  }
+
+  /**
+   * Finds work/process nodes disconnected from the hierarchy: containment roots
+   * that are not rolled up into any scope (e.g. leftover Kanban-era items). Used
+   * to drive folding the vault's disparate items into the proper structure.
+   */
+  private getGraphHygiene(): GraphHygieneItem[] {
+    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const items: GraphHygieneItem[] = [];
+    for (const node of this.visibleNodes) {
+      if (node.kind === "group") continue;
+      if (parentByPath.has(node.file.path)) continue; // placed under a parent
+      if (node.rollupTargets.length > 0) continue; // rolled up into a scope
+      items.push({
+        title: node.title,
+        reason:
+          node.children.length === 0
+            ? "orphan work item — no parent and no scope"
+            : "feature/root not linked to any scope",
+      });
+    }
+    return items;
+  }
+
+  private showGraphFrontier(): void {
+    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const frontier: GraphFrontierItem[] = this.getGraphFrontier()
+      .map((node) => ({
+        lineage: this.getNodeLineage(node, parentByPath),
+        status: node.status,
+        state: node.state,
+      }))
+      .sort((first, second) =>
+        first.lineage.join(" › ").localeCompare(second.lineage.join(" › ")),
+      );
+    new GraphFrontierModal(this.app, frontier, this.getGraphHygiene()).open();
   }
 
   private renderGraphZoomControls(toolbarEl: HTMLElement): void {
@@ -643,6 +794,7 @@ export class GraphView extends BasesView {
       "break",
       "break-dormant",
       "restart",
+      "membership",
     ] as const) {
       const markerEl = activeDocument.createElementNS(
         "http://www.w3.org/2000/svg",
@@ -805,6 +957,8 @@ export class GraphView extends BasesView {
     handleEl: SVGCircleElement,
   ): void {
     if (event.button !== 0) return;
+    // Structural edges inside a locked subgraph are not draggable.
+    if (this.isEdgeStructurallyLocked(edge)) return;
     event.preventDefault();
     event.stopPropagation();
 
@@ -1486,6 +1640,41 @@ export class GraphView extends BasesView {
       });
     }
 
+    if (node.descendantCount > 0) {
+      const lockBtn = nodeEl.createEl("button", {
+        cls: `base-board-graph-lock${
+          node.effectiveLocked ? " base-board-graph-lock--locked" : ""
+        }`,
+        attr: {
+          type: "button",
+          title: node.effectiveLocked ? "Unlock subgraph" : "Lock subgraph",
+        },
+      });
+      setIcon(
+        lockBtn,
+        node.effectiveLocked ? "lucide-lock" : "lucide-lock-open",
+      );
+      lockBtn.addEventListener("click", (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void this.toggleGraphLock(node);
+      });
+    }
+
+    // Agency badge (top-left) when the node is not human-executed.
+    if (node.executor !== "human") {
+      const agencyEl = nodeEl.createSpan({
+        cls: `base-board-graph-agency base-board-graph-agency--${node.executor}`,
+        attr: {
+          title: `Run by ${node.executor} \u00b7 autonomy: ${node.autonomy}`,
+        },
+      });
+      setIcon(
+        agencyEl,
+        node.executor === "agent" ? "lucide-bot" : "lucide-users",
+      );
+    }
+
     const titleEl = nodeEl.createDiv({
       cls: "base-board-graph-node-title",
       text: node.title,
@@ -1982,6 +2171,27 @@ export class GraphView extends BasesView {
     sourceSlot: GraphNodeAnchorSlot,
     targetSlot: GraphNodeAnchorSlot,
   ): void {
+    // When either endpoint is in a locked subgraph, only the membership
+    // (aggregation) link is offered — structural links are frozen.
+    if (sourceNode.effectiveLocked || targetNode.effectiveLocked) {
+      const lockedMenu = new Menu();
+      lockedMenu.addItem((item) => {
+        item
+          .setTitle("Roll up into (membership)")
+          .setIcon("lucide-layers")
+          .onClick(() => {
+            void this.createGraphLink(
+              sourceNode,
+              targetNode,
+              "membership",
+              sourceSlot,
+              targetSlot,
+            );
+          });
+      });
+      lockedMenu.showAtMouseEvent(event);
+      return;
+    }
     const menu = new Menu();
     menu.addItem((item) => {
       item
@@ -2039,6 +2249,20 @@ export class GraphView extends BasesView {
           );
         });
     });
+    menu.addItem((item) => {
+      item
+        .setTitle("Roll up into (membership)")
+        .setIcon("lucide-layers")
+        .onClick(() => {
+          void this.createGraphLink(
+            sourceNode,
+            targetNode,
+            "membership",
+            sourceSlot,
+            targetSlot,
+          );
+        });
+    });
     menu.showAtMouseEvent(event);
   }
 
@@ -2049,6 +2273,15 @@ export class GraphView extends BasesView {
     sourceSlot: GraphNodeAnchorSlot,
     targetSlot: GraphNodeAnchorSlot,
   ): Promise<void> {
+    if (
+      kind !== "membership" &&
+      (sourceNode.effectiveLocked || targetNode.effectiveLocked)
+    ) {
+      new Notice(
+        "Subgraph is locked \u2014 unlock it to add structural links.",
+      );
+      return;
+    }
     this.beginGraphHistory("Create link");
     if (kind === "requirement") {
       await this.updateGraphParent(targetNode, sourceNode);
@@ -2056,8 +2289,10 @@ export class GraphView extends BasesView {
       await this.addGraphReference(targetNode, "depends_on", sourceNode);
     } else if (kind === "break") {
       await this.addGraphReference(sourceNode, "breaks_to", targetNode);
-    } else {
+    } else if (kind === "restart") {
       await this.addGraphReference(sourceNode, "restarts_to", targetNode);
+    } else {
+      await this.addGraphReference(sourceNode, "rollup_to", targetNode);
     }
     this.setCreatedGraphLinkAnchorOverrides(
       sourceNode,
@@ -2099,6 +2334,7 @@ export class GraphView extends BasesView {
     if (kind === "requirement") return "requirement-start";
     if (kind === "successor") return "gating";
     if (kind === "break") return "break";
+    if (kind === "membership") return "membership";
     return "restart";
   }
 
@@ -2409,11 +2645,15 @@ export class GraphView extends BasesView {
     // Requirement-return edges are derived from containment and have no
     // structural edit action, so they expose no context menu.
     if (edge.kind === "requirement-return") return;
+    // Structural edges in a locked subgraph cannot be deleted/rewired.
+    if (this.isEdgeStructurallyLocked(edge)) return;
 
     const menu = new Menu();
     menu.addItem((item) => {
       item
-        .setTitle("Delete line")
+        .setTitle(
+          edge.kind === "membership" ? "Remove from scope" : "Delete line",
+        )
         .setIcon("lucide-unlink")
         .onClick(() => {
           void this.deleteGraphEdge(edge);
@@ -2426,11 +2666,15 @@ export class GraphView extends BasesView {
     // Requirement-return edges are derived from containment; there is nothing
     // to delete on them.
     if (edge.kind === "requirement-return") return;
+    // Structural edges inside a locked subgraph are frozen.
+    if (this.isEdgeStructurallyLocked(edge)) return;
     this.beginGraphHistory("Delete link");
     if (edge.kind === "requirement-start") {
       await this.updateGraphParent(edge.to, null, edge.from);
     } else if (edge.kind === "gating") {
       await this.removeGraphReference(edge.to, "depends_on", edge.from);
+    } else if (edge.kind === "membership") {
+      await this.removeGraphReference(edge.from, "rollup_to", edge.to);
     } else {
       await this.removeGraphReference(
         edge.from,
@@ -2446,7 +2690,9 @@ export class GraphView extends BasesView {
       this.getEdgeEndpointOverrideKey(edge, "to"),
     );
 
-    new Notice("Deleted line");
+    new Notice(
+      edge.kind === "membership" ? "Removed from scope" : "Deleted line",
+    );
     await this.commitGraphHistory();
     this.render();
   }
@@ -2969,39 +3215,16 @@ export class GraphView extends BasesView {
       history.push(existing);
     }
 
-    const event: Record<string, unknown> = {
-      id: this.getGeneratedEventId(),
+    const event = buildTransitionEvent({
       node: nodeId,
-      kind: this.getGraphEventKind(to),
       from,
       to,
-      at: new Date().toISOString(),
       property: propertyName,
-      causedBy: "human",
       source: "baseboard-graph",
-    };
-    if (reason) event.reason = reason;
+      reason,
+    });
 
     frontmatter[historyProperty] = [...history, event];
-  }
-
-  /** Maps a target status string to a GraphEvent `kind` (see GRAPH_ARCHITECTURE_PLAN.md). */
-  private getGraphEventKind(status: string): string {
-    if (this.isActiveStatus(status)) return "activated";
-    if (this.isCompletedStatus(status)) return "completed";
-    if (this.isInterruptedStatus(status)) return "failed";
-    if (this.isInvalidatedStatus(status)) return "invalidated";
-    if (this.isCancelledStatus(status)) return "cancelled";
-    const normalized = status.trim().toLowerCase();
-    if (normalized === "awaiting") return "awaiting";
-    if (normalized === "planned") return "planned";
-    return "transition";
-  }
-
-  private getGeneratedEventId(): string {
-    const time = Date.now().toString(36);
-    const rand = Math.random().toString(36).slice(2, 8);
-    return `evt-${time}-${rand}`;
   }
 
   // --- Undo / redo -----------------------------------------------------------
@@ -3189,6 +3412,7 @@ export class GraphView extends BasesView {
       "depends_on",
       "breaks_to",
       "restarts_to",
+      "rollup_to",
     ] as const) {
       const propertyName = this.getGraphReferenceListPropertyName(
         frontmatter,
@@ -3270,6 +3494,20 @@ export class GraphView extends BasesView {
           this.addGraphReference(targetNode, "depends_on", edge.from),
         ]);
       }
+    } else if (edge.kind === "membership") {
+      if (endpoint === "from") {
+        await Promise.all([
+          this.removeGraphReference(edge.from, "rollup_to", edge.to),
+          this.addGraphReference(targetNode, "rollup_to", edge.to),
+        ]);
+      } else {
+        await this.replaceGraphReference(
+          edge.from,
+          "rollup_to",
+          edge.to,
+          targetNode,
+        );
+      }
     } else {
       const relationKind = edge.kind === "break" ? "breaks_to" : "restarts_to";
       if (endpoint === "from") {
@@ -3296,7 +3534,8 @@ export class GraphView extends BasesView {
       anchorSlot &&
       (edge.kind === "gating" ||
         edge.kind === "break" ||
-        edge.kind === "restart")
+        edge.kind === "restart" ||
+        edge.kind === "membership")
     ) {
       const fromPath =
         endpoint === "from" ? targetNode.file.path : edge.from.file.path;
@@ -3526,6 +3765,68 @@ export class GraphView extends BasesView {
     this.render();
   }
 
+  /**
+   * Locks/unlocks a node's subgraph (Step B). Writes an explicit `graph_locked`
+   * so it overrides any inherited value (nearest-explicit-wins): unlocking a
+   * node frees its subtree even if an ancestor is locked, and locking freezes
+   * it even inside an unlocked parent.
+   */
+  private async toggleGraphLock(node: GraphNode): Promise<void> {
+    const nextLocked = !node.effectiveLocked;
+    this.beginGraphHistory(nextLocked ? "Lock subgraph" : "Unlock subgraph");
+    await this.snapshotForUndo(node.file.path);
+    await this.app.fileManager.processFrontMatter(
+      node.file,
+      (frontmatter: Record<string, unknown>) => {
+        frontmatter[GRAPH_LOCKED_PROPERTY] = nextLocked;
+      },
+    );
+    new Notice(
+      nextLocked ? `Locked "${node.title}"` : `Unlocked "${node.title}"`,
+    );
+    await this.commitGraphHistory();
+    this.render();
+  }
+
+  /** Cycles a node's executor (human → agent → mixed), writing it explicitly. */
+  private async cycleNodeExecutor(node: GraphNode): Promise<void> {
+    const next =
+      GRAPH_EXECUTORS[
+        (GRAPH_EXECUTORS.indexOf(node.executor) + 1) % GRAPH_EXECUTORS.length
+      ];
+    this.beginGraphHistory("Set executor");
+    await this.snapshotForUndo(node.file.path);
+    await this.app.fileManager.processFrontMatter(
+      node.file,
+      (frontmatter: Record<string, unknown>) => {
+        frontmatter.executor = next;
+      },
+    );
+    new Notice(`"${node.title}" run by ${next}`);
+    await this.commitGraphHistory();
+    this.render();
+  }
+
+  /** Cycles a node's autonomy (propose → execute → autopilot), written explicitly. */
+  private async cycleNodeAutonomy(node: GraphNode): Promise<void> {
+    const next =
+      GRAPH_AUTONOMY_LEVELS[
+        (GRAPH_AUTONOMY_LEVELS.indexOf(node.autonomy) + 1) %
+          GRAPH_AUTONOMY_LEVELS.length
+      ];
+    this.beginGraphHistory("Set autonomy");
+    await this.snapshotForUndo(node.file.path);
+    await this.app.fileManager.processFrontMatter(
+      node.file,
+      (frontmatter: Record<string, unknown>) => {
+        frontmatter.autonomy = next;
+      },
+    );
+    new Notice(`"${node.title}" autonomy: ${next}`);
+    await this.commitGraphHistory();
+    this.render();
+  }
+
   private showCanvasCreateMenu(event: MouseEvent, canvasEl: HTMLElement): void {
     const targetEl = event.target instanceof Element ? event.target : null;
     if (
@@ -3553,6 +3854,16 @@ export class GraphView extends BasesView {
     sourceNode: GraphNode | null,
     point?: { x: number; y: number },
   ): void {
+    // A locked subgraph cannot have new nodes/templates added inside it.
+    if (sourceNode?.effectiveLocked) {
+      menu.addItem((item) => {
+        item
+          .setTitle("Subgraph locked \u2014 unlock to add")
+          .setIcon("lucide-lock")
+          .setDisabled(true);
+      });
+      return;
+    }
     menu.addItem((item) => {
       item
         .setTitle("Add node")
@@ -3580,9 +3891,19 @@ export class GraphView extends BasesView {
       sourceNode ? "Add child node" : "Add node",
       (value) => {
         if (sourceNode) {
-          void this.createChildNode(sourceNode, value.title, value.type);
+          void this.createChildNode(
+            sourceNode,
+            value.title,
+            value.kind,
+            value.label,
+          );
         } else if (point) {
-          void this.createStandaloneNode(value.type, value.title, point);
+          void this.createStandaloneNode(
+            value.kind,
+            value.label,
+            value.title,
+            point,
+          );
         }
       },
     ).open();
@@ -3605,7 +3926,8 @@ export class GraphView extends BasesView {
   }
 
   private async createStandaloneNode(
-    type: string,
+    kind: GraphNodeKind,
+    label: string,
     title: string,
     point: { x: number; y: number },
   ): Promise<void> {
@@ -3617,9 +3939,10 @@ export class GraphView extends BasesView {
     );
     await this.createTemplateNode({
       title: safeTitle,
-      type,
-      workflow: this.getWorkflowForNodeType(type),
-      status: type === "feature" ? "In Progress" : "To Do",
+      type: label || undefined,
+      kind,
+      workflow: label ? this.getWorkflowForNodeType(label) : undefined,
+      status: "To Do",
       tags: this.visibleNodes[0] ? this.getTags(this.visibleNodes[0].file) : [],
       x: point.x,
       y: point.y,
@@ -3630,15 +3953,21 @@ export class GraphView extends BasesView {
   private async createChildNode(
     sourceNode: GraphNode,
     title: string,
-    type: string,
+    kind: GraphNodeKind,
+    label: string,
   ): Promise<void> {
     const safeTitle = title.trim();
     if (!safeTitle) return;
+    if (sourceNode.effectiveLocked) {
+      new Notice("Subgraph is locked \u2014 unlock it to add nodes.");
+      return;
+    }
     await this.createTemplateNode({
       title: safeTitle,
-      type,
-      workflow: this.getWorkflowForNodeType(type),
-      status: type === "feature" ? "In Progress" : "To Do",
+      type: label || undefined,
+      kind,
+      workflow: label ? this.getWorkflowForNodeType(label) : undefined,
+      status: "To Do",
       parent: this.getWikiLink(sourceNode.file),
       tags: this.getTags(sourceNode.file),
     });
@@ -3721,8 +4050,11 @@ export class GraphView extends BasesView {
     menu.addSeparator();
     // Work-node operations are only valid on leaf (work) nodes. Group nodes
     // derive their state from their children (GRAPH_SEMANTICS_SPEC.md); their
-    // one allowed action is Prune (Cancel sub-graph).
-    if (sourceNode.children.length === 0) {
+    // one allowed action is Prune (Cancel sub-graph). Scope/aggregation nodes
+    // are not work at all — they only roll up members, so they get neither.
+    if (this.isScopeNode(sourceNode)) {
+      // Scope node: aggregation only; no work-node or prune actions.
+    } else if (sourceNode.children.length === 0) {
       menu.addItem((item) => {
         item
           .setTitle("Set as active work")
@@ -3764,6 +4096,48 @@ export class GraphView extends BasesView {
             void this.pruneGroup(sourceNode);
           });
       });
+    }
+    if (sourceNode.descendantCount > 0) {
+      menu.addItem((item) => {
+        item
+          .setTitle(
+            sourceNode.effectiveLocked ? "Unlock subgraph" : "Lock subgraph",
+          )
+          .setIcon(
+            sourceNode.effectiveLocked ? "lucide-lock-open" : "lucide-lock",
+          )
+          .onClick(() => {
+            void this.toggleGraphLock(sourceNode);
+          });
+      });
+    }
+    // Agency (who executes the work). Not applicable to pure group/aggregation
+    // nodes. Cycles executor and, when an agent is involved, autonomy.
+    if (sourceNode.kind !== "group") {
+      menu.addItem((item) => {
+        item
+          .setTitle(`Run by: ${sourceNode.executor}`)
+          .setIcon(
+            sourceNode.executor === "agent"
+              ? "lucide-bot"
+              : sourceNode.executor === "mixed"
+                ? "lucide-users"
+                : "lucide-user",
+          )
+          .onClick(() => {
+            void this.cycleNodeExecutor(sourceNode);
+          });
+      });
+      if (sourceNode.executor !== "human") {
+        menu.addItem((item) => {
+          item
+            .setTitle(`Autonomy: ${sourceNode.autonomy}`)
+            .setIcon("lucide-gauge")
+            .onClick(() => {
+              void this.cycleNodeAutonomy(sourceNode);
+            });
+        });
+      }
     }
     menu.addSeparator();
     menu.addItem((item) => {
@@ -3943,6 +4317,7 @@ export class GraphView extends BasesView {
       status: "In Progress",
       parent: sourceNode ? this.getWikiLink(sourceNode.file) : undefined,
       tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      locked: true,
       x: origin.x,
       y: origin.y,
     });
@@ -4019,6 +4394,7 @@ export class GraphView extends BasesView {
       status: "To Do",
       parent: sourceNode ? this.getWikiLink(sourceNode.file) : undefined,
       tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+      locked: true,
       x: origin.x,
       y: origin.y,
     });
@@ -4079,6 +4455,7 @@ export class GraphView extends BasesView {
               tags: sourceNode
                 ? this.getTags(sourceNode.file)
                 : this.getRootTags(),
+              locked: true,
               x: origin.x,
               y: origin.y,
             }),
@@ -4143,6 +4520,7 @@ export class GraphView extends BasesView {
               tags: sourceNode
                 ? this.getTags(sourceNode.file)
                 : this.getRootTags(),
+              locked: true,
               x: origin.x,
               y: origin.y,
             }),
@@ -4198,6 +4576,7 @@ export class GraphView extends BasesView {
             type: "ring",
             status: "To Do",
             tags: this.getRootTags(),
+            locked: true,
             x: origin.x,
             y: origin.y,
           }),
@@ -4270,6 +4649,7 @@ export class GraphView extends BasesView {
       dependsOnKeys: [],
       breaksToKeys: [],
       restartsToKeys: [],
+      rollupToKeys: [],
       nodeType,
       workflow,
       collapsed: false,
@@ -4279,6 +4659,16 @@ export class GraphView extends BasesView {
       predecessors: [],
       breakTargets: [],
       restartTargets: [],
+      rollupTargets: [],
+      members: [],
+      kindExplicit: null,
+      kind: "work",
+      executorExplicit: null,
+      executor: "human",
+      autonomyExplicit: null,
+      autonomy: "propose",
+      lockedExplicit: null,
+      effectiveLocked: false,
       x: position.x,
       y: position.y,
       savedX: null,
@@ -4332,12 +4722,14 @@ export class GraphView extends BasesView {
   private async createTemplateNode(options: {
     title: string;
     displayTitle?: string;
-    type: string;
+    type?: string;
+    kind?: GraphNodeKind;
     status: string;
     parent?: string;
     workflow?: string;
     dependsOn?: string[];
     tags?: string[];
+    locked?: boolean;
     x?: number;
     y?: number;
   }): Promise<TFile> {
@@ -4349,14 +4741,26 @@ export class GraphView extends BasesView {
       "---",
       `title: ${this.formatYamlScalar(displayTitle)}`,
       `status: ${this.formatYamlScalar(options.status)}`,
-      `type: ${this.formatYamlScalar(options.type)}`,
+    ];
+    if (options.type) {
+      lines.push(`type: ${this.formatYamlScalar(options.type)}`);
+    }
+    // Only persist `kind` when it is not the structural default (`work`); the
+    // rest is inferred. Groups especially need it (empty groups look like work).
+    if (options.kind && options.kind !== "work") {
+      lines.push(`kind: ${this.formatYamlScalar(options.kind)}`);
+    }
+    lines.push(
       `kanban_order: ${this.getNextOrder(options.status)}`,
       `graph_order: ${this.getNextOrder(options.status)}`,
       `created: ${new Date().toISOString()}`,
       `id: ${this.getGeneratedId(options.title)}`,
-    ];
+    );
     if (options.workflow) {
       lines.push(`workflow: ${this.formatYamlScalar(options.workflow)}`);
+    }
+    if (options.locked) {
+      lines.push(`${GRAPH_LOCKED_PROPERTY}: true`);
     }
     if (options.parent) {
       lines.push(`parent: ${this.formatYamlScalar(options.parent)}`);
@@ -4491,6 +4895,7 @@ export class GraphView extends BasesView {
         dependsOnKeys: this.getDependsOnKeys(file),
         breaksToKeys: this.getBreaksToKeys(file),
         restartsToKeys: this.getRestartsToKeys(file),
+        rollupToKeys: this.getRollupToKeys(file),
         nodeType: this.getNodeType(file),
         workflow: this.getWorkflow(file),
         collapsed: this.isGraphCollapsed(file),
@@ -4500,6 +4905,16 @@ export class GraphView extends BasesView {
         predecessors: [],
         breakTargets: [],
         restartTargets: [],
+        rollupTargets: [],
+        members: [],
+        kindExplicit: this.getGraphKind(file),
+        kind: "work",
+        executorExplicit: this.getGraphExecutor(file),
+        executor: "human",
+        autonomyExplicit: this.getGraphAutonomy(file),
+        autonomy: "propose",
+        lockedExplicit: this.getGraphLockedExplicit(file),
+        effectiveLocked: false,
         x: 0,
         y: 0,
         savedX: this.getSavedGraphPosition(file, GRAPH_POSITION_PROPERTY_X),
@@ -4543,6 +4958,14 @@ export class GraphView extends BasesView {
         }
         node.breakTargets.push(breakTarget);
       }
+      // Aggregation membership: `rollup_to` links a node up into a scope
+      // (many-to-many). The scope discovers its members via the reverse edge.
+      for (const rollupKey of node.rollupToKeys) {
+        const scope = nodesByIdentity.get(rollupKey);
+        if (!scope || scope.file.path === node.file.path) continue;
+        node.rollupTargets.push(scope);
+        scope.members.push(node);
+      }
     }
 
     for (const node of nodes) {
@@ -4557,7 +4980,10 @@ export class GraphView extends BasesView {
       node.descendantCount = this.getDescendantCount(node);
     }
 
+    this.assignNodeKinds(nodes);
     this.assignNodeStates(nodes);
+    this.assignNodeLocks(nodes);
+    this.assignNodeAgency(nodes);
     return this.getVisibleGraphNodes(nodes);
   }
 
@@ -4587,6 +5013,12 @@ export class GraphView extends BasesView {
       );
       node.restartTargets = node.restartTargets.filter((target) =>
         visiblePaths.has(target.file.path),
+      );
+      node.rollupTargets = node.rollupTargets.filter((target) =>
+        visiblePaths.has(target.file.path),
+      );
+      node.members = node.members.filter((member) =>
+        visiblePaths.has(member.file.path),
       );
     }
 
@@ -4714,6 +5146,10 @@ export class GraphView extends BasesView {
           to: successor,
           kind: isRestart ? "restart" : "gating",
         });
+      }
+      // Membership (manual aggregation): the node rolls up into each scope.
+      for (const scope of node.rollupTargets) {
+        edges.push({ from: node, to: scope, kind: "membership" });
       }
       // Authored `breaks_to` links only render when the source is genuinely
       // failed (a real triggered break). Dormant authored breaks are not drawn —
@@ -4857,6 +5293,106 @@ export class GraphView extends BasesView {
     }
   }
 
+  /**
+   * Resolves each node's effective subgraph lock (Step B). Lock is inherited
+   * down containment; the nearest self-or-ancestor with an explicit
+   * `graph_locked` decides, defaulting to unlocked. So a locked template root
+   * freezes its whole subtree, and a nested template with its own lock is an
+   * independent locked unit (unlocking an ancestor does not free it).
+   */
+  /**
+   * Computes each node's behavioural `kind` (GRAPH_ARCHITECTURE_PLAN.md). An
+   * explicit `kind` wins; otherwise it is inferred from structure (members →
+   * group, children → process, else work). A `group` with no members yet must
+   * declare `kind: group` explicitly — there is no label-name fallback.
+   */
+  private assignNodeKinds(nodes: GraphNode[]): void {
+    for (const node of nodes) {
+      node.kind = node.kindExplicit ?? this.inferNodeKind(node);
+    }
+  }
+
+  private inferNodeKind(node: GraphNode): GraphNodeKind {
+    if (node.members.length > 0) return "group";
+    if (node.children.length > 0) return "process";
+    return "work";
+  }
+
+  /**
+   * Resolves each node's effective agency (executor + autonomy). Like the lock,
+   * agency is inherited down containment (nearest self-or-ancestor with an
+   * explicit value wins); defaults executor `human`, autonomy `propose`.
+   */
+  private assignNodeAgency(nodes: GraphNode[]): void {
+    const parentByPath = this.getResolvedParentsByPath(nodes);
+    for (const node of nodes) {
+      node.executor =
+        this.resolveInheritedValue(
+          node,
+          parentByPath,
+          (candidate) => candidate.executorExplicit,
+        ) ?? "human";
+      node.autonomy =
+        this.resolveInheritedValue(
+          node,
+          parentByPath,
+          (candidate) => candidate.autonomyExplicit,
+        ) ?? "propose";
+    }
+  }
+
+  private resolveInheritedValue<T>(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+    pick: (candidate: GraphNode) => T | null,
+  ): T | null {
+    const seen = new Set<string>();
+    let current: GraphNode | null = node;
+    while (current && !seen.has(current.file.path)) {
+      seen.add(current.file.path);
+      const value = pick(current);
+      if (value !== null) return value;
+      current = parentByPath.get(current.file.path) ?? null;
+    }
+    return null;
+  }
+
+  private assignNodeLocks(nodes: GraphNode[]): void {
+    const parentByPath = this.getResolvedParentsByPath(nodes);
+    for (const node of nodes) {
+      const seen = new Set<string>();
+      let current: GraphNode | null = node;
+      let resolved = false;
+      while (current && !seen.has(current.file.path)) {
+        seen.add(current.file.path);
+        if (current.lockedExplicit !== null) {
+          node.effectiveLocked = current.lockedExplicit;
+          resolved = true;
+          break;
+        }
+        current = parentByPath.get(current.file.path) ?? null;
+      }
+      if (!resolved) node.effectiveLocked = false;
+    }
+  }
+
+  /**
+   * Structural edges define a node's computed shape and are frozen when locked.
+   * Membership (`rollup_to`) is the one manually-editable relation and is never
+   * locked (rolling a subgraph up into a scope is an external act).
+   */
+  private isStructuralEdge(edge: GraphEdge): boolean {
+    return edge.kind !== "membership";
+  }
+
+  /** True when an edge is structural AND either endpoint is in a locked subgraph. */
+  private isEdgeStructurallyLocked(edge: GraphEdge): boolean {
+    return (
+      this.isStructuralEdge(edge) &&
+      (edge.from.effectiveLocked || edge.to.effectiveLocked)
+    );
+  }
+
   private deriveNodeState(
     node: GraphNode,
     parentByPath: Map<string, GraphNode>,
@@ -4870,10 +5406,11 @@ export class GraphView extends BasesView {
     if (inProgress.has(node.file.path)) return "idle";
     inProgress.add(node.file.path);
 
+    const aggregationChildren = this.getAggregationChildren(node);
     const state =
-      node.children.length > 0
+      aggregationChildren.length > 0
         ? this.deriveGroupState(
-            node.children.map((child) =>
+            aggregationChildren.map((child) =>
               this.deriveNodeState(child, parentByPath, memo, inProgress),
             ),
           )
@@ -4882,6 +5419,25 @@ export class GraphView extends BasesView {
     inProgress.delete(node.file.path);
     memo.set(node.file.path, state);
     return state;
+  }
+
+  /**
+   * The set a node derives its group state from: containment `children` for
+   * normal nodes, plus `members` (incoming `rollup_to`) for scope/aggregation
+   * nodes. A scope thus rolls up the state of everything that belongs to it.
+   */
+  private getAggregationChildren(node: GraphNode): GraphNode[] {
+    if (this.isScopeNode(node)) {
+      return node.children.length > 0
+        ? [...node.children, ...node.members]
+        : node.members;
+    }
+    return node.children;
+  }
+
+  /** Aggregation/scope nodes: pure rollup containers (no work state machine). */
+  private isScopeNode(node: GraphNode): boolean {
+    return node.kind === "group";
   }
 
   /**
@@ -5937,6 +6493,30 @@ export class GraphView extends BasesView {
     return this.normalizeText(frontmatter?.type);
   }
 
+  /** This node's own explicit `kind` (null = infer from structure). */
+  private getGraphKind(file: TFile): GraphNodeKind | null {
+    const raw = this.normalizeText(this.getFrontmatter(file)?.kind)
+      ?.toLowerCase()
+      .trim();
+    return GRAPH_NODE_KINDS.find((kind) => kind === raw) ?? null;
+  }
+
+  /** This node's own explicit `executor` agency (null = inherit). */
+  private getGraphExecutor(file: TFile): GraphExecutor | null {
+    const raw = this.normalizeText(this.getFrontmatter(file)?.executor)
+      ?.toLowerCase()
+      .trim();
+    return GRAPH_EXECUTORS.find((executor) => executor === raw) ?? null;
+  }
+
+  /** This node's own explicit `autonomy` level (null = inherit). */
+  private getGraphAutonomy(file: TFile): GraphAutonomy | null {
+    const raw = this.normalizeText(this.getFrontmatter(file)?.autonomy)
+      ?.toLowerCase()
+      .trim();
+    return GRAPH_AUTONOMY_LEVELS.find((level) => level === raw) ?? null;
+  }
+
   private getWorkflow(file: TFile): string | null {
     const frontmatter = this.getFrontmatter(file);
     return this.normalizeText(frontmatter?.workflow);
@@ -5945,6 +6525,14 @@ export class GraphView extends BasesView {
   private isGraphCollapsed(file: TFile): boolean {
     const frontmatter = this.getFrontmatter(file);
     return frontmatter?.[GRAPH_COLLAPSED_PROPERTY] === true;
+  }
+
+  /** This node's own stored `graph_locked` (null = no explicit value). */
+  private getGraphLockedExplicit(file: TFile): boolean | null {
+    const value = this.getFrontmatter(file)?.[GRAPH_LOCKED_PROPERTY];
+    if (value === true) return true;
+    if (value === false) return false;
+    return null;
   }
 
   private getDependsOnKeys(file: TFile): string[] {
@@ -5960,6 +6548,11 @@ export class GraphView extends BasesView {
   private getRestartsToKeys(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
     return this.normalizeReferences(frontmatter?.restarts_to);
+  }
+
+  private getRollupToKeys(file: TFile): string[] {
+    const frontmatter = this.getFrontmatter(file);
+    return this.normalizeReferences(frontmatter?.rollup_to);
   }
 
   private getTags(file: TFile): string[] {
@@ -6287,13 +6880,18 @@ export class GraphView extends BasesView {
 
 class GraphNodeModal extends Modal {
   private titleValue = "";
-  private typeValue = "";
+  private kindValue: GraphNodeKind = "work";
+  private labelValue = "";
   private submitButtonEl: HTMLButtonElement | null = null;
 
   constructor(
     app: App,
     private modalTitle: string,
-    private onSubmit: (value: { title: string; type: string }) => void,
+    private onSubmit: (value: {
+      title: string;
+      kind: GraphNodeKind;
+      label: string;
+    }) => void,
   ) {
     super(app);
   }
@@ -6320,16 +6918,30 @@ class GraphNodeModal extends Modal {
       }, 50);
     });
 
-    new Setting(contentEl).setName("Type").addDropdown((dropdown) => {
-      dropdown.addOption("", "Select type");
-      for (const type of GRAPH_NODE_TYPE_OPTIONS) {
-        dropdown.addOption(type, type);
-      }
-      dropdown.onChange((value) => {
-        this.typeValue = value;
-        this.updateSubmitState();
+    new Setting(contentEl)
+      .setName("Kind")
+      .setDesc(
+        "A work item, a subprocess (container), or a group (aggregation).",
+      )
+      .addDropdown((dropdown) => {
+        for (const option of GRAPH_ADD_NODE_KIND_OPTIONS) {
+          dropdown.addOption(option.value, option.label);
+        }
+        dropdown.setValue(this.kindValue);
+        dropdown.onChange((value) => {
+          this.kindValue = value as GraphNodeKind;
+        });
       });
-    });
+
+    new Setting(contentEl)
+      .setName("Label")
+      .setDesc("Optional descriptor such as feature, semester, or career.")
+      .addText((text) => {
+        text.setPlaceholder("Optional");
+        text.onChange((value) => {
+          this.labelValue = value.trim();
+        });
+      });
 
     new Setting(contentEl).addButton((button) => {
       button
@@ -6343,12 +6955,16 @@ class GraphNodeModal extends Modal {
 
   private updateSubmitState(): void {
     if (!this.submitButtonEl) return;
-    this.submitButtonEl.disabled = !this.titleValue || !this.typeValue;
+    this.submitButtonEl.disabled = !this.titleValue;
   }
 
   private submit(): void {
-    if (!this.titleValue || !this.typeValue) return;
-    this.onSubmit({ title: this.titleValue, type: this.typeValue });
+    if (!this.titleValue) return;
+    this.onSubmit({
+      title: this.titleValue,
+      kind: this.kindValue,
+      label: this.labelValue,
+    });
     this.close();
   }
 
@@ -6494,6 +7110,97 @@ class GraphHistoryModal extends Modal {
         cls: "base-board-graph-history-meta",
         text: metaParts.join(" · "),
       });
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+// Read-only validation panel for the active-frontier derivation and graph
+// hygiene. Shows each frontier leaf with its work breadcrumb and the set of
+// nodes disconnected from the hierarchy.
+class GraphFrontierModal extends Modal {
+  constructor(
+    app: App,
+    private frontier: GraphFrontierItem[],
+    private hygiene: GraphHygieneItem[],
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("base-board-graph-frontier-modal");
+
+    contentEl.createEl("h3", {
+      text: `Active frontier (${this.frontier.length})`,
+    });
+    if (this.frontier.length === 0) {
+      contentEl.createEl("p", {
+        cls: "base-board-graph-frontier-empty",
+        text: "No actionable frontier nodes right now.",
+      });
+    } else {
+      const listEl = contentEl.createEl("ul", {
+        cls: "base-board-graph-frontier-list",
+      });
+      for (const item of this.frontier) {
+        const itemEl = listEl.createEl("li", {
+          cls: "base-board-graph-frontier-item",
+        });
+        const crumbEl = itemEl.createDiv({
+          cls: "base-board-graph-frontier-crumb",
+        });
+        item.lineage.forEach((segment, index) => {
+          const isLast = index === item.lineage.length - 1;
+          crumbEl.createSpan({
+            cls: isLast
+              ? "base-board-graph-frontier-leaf"
+              : "base-board-graph-frontier-seg",
+            text: segment,
+          });
+          if (!isLast) {
+            crumbEl.createSpan({
+              cls: "base-board-graph-frontier-sep",
+              text: " › ",
+            });
+          }
+        });
+        itemEl.createSpan({
+          cls: `base-board-graph-frontier-meta base-board-graph-frontier-meta--${item.state}`,
+          text: `${item.status ?? "(no status)"} · ${item.state}`,
+        });
+      }
+    }
+
+    contentEl.createEl("h3", {
+      text: `Hygiene (${this.hygiene.length})`,
+    });
+    if (this.hygiene.length === 0) {
+      contentEl.createEl("p", {
+        cls: "base-board-graph-frontier-empty",
+        text: "Every node is connected to the hierarchy.",
+      });
+    } else {
+      const hygieneEl = contentEl.createEl("ul", {
+        cls: "base-board-graph-frontier-list",
+      });
+      for (const finding of this.hygiene) {
+        const findingEl = hygieneEl.createEl("li", {
+          cls: "base-board-graph-frontier-item",
+        });
+        findingEl.createSpan({
+          cls: "base-board-graph-frontier-leaf",
+          text: finding.title,
+        });
+        findingEl.createSpan({
+          cls: "base-board-graph-frontier-meta",
+          text: finding.reason,
+        });
+      }
     }
   }
 
