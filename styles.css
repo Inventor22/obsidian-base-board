@@ -2450,6 +2450,14 @@
   stroke-dasharray: 2 4;
 }
 
+/* Compensation (saga): a triggered rollback edge, effecting → mitigation. */
+.base-board-graph-edge--compensation {
+  stroke: var(--color-orange, #e0843a);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+  opacity: 0.9;
+}
+
 .base-board-graph-edge--requirement-return {
   stroke: color-mix(
     in srgb,
@@ -2506,6 +2514,10 @@
     var(--text-faint) 70%,
     var(--background-modifier-border)
   );
+}
+
+.base-board-graph-arrow-marker--compensation path {
+  fill: var(--color-orange, #e0843a);
 }
 
 .base-board-graph-arrow-marker--requirement-start path {
@@ -3044,6 +3056,26 @@
   height: 12px;
 }
 
+/* Mitigation badge: a live, triggered compensation (rollback) task. */
+.base-board-graph-mitigation {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background-color: var(--background-primary);
+  color: var(--color-orange, #e0843a);
+}
+
+.base-board-graph-mitigation svg {
+  width: 12px;
+  height: 12px;
+}
+
 .base-board-graph-node-title {
   padding-right: 24px;
   color: var(--text-normal);
@@ -3076,4 +3108,185 @@
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   Active-frontier projection board (Step D)
+   --------------------------------------------------------------------------- */
+
+.base-board-frontier-board {
+  align-items: flex-start;
+}
+
+.base-board-frontier-column {
+  flex: 0 0 auto;
+}
+
+.base-board-frontier-divider {
+  flex: 0 0 1px;
+  align-self: stretch;
+  margin: 0 6px;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    var(--background-modifier-border) 20%,
+    var(--background-modifier-border) 80%,
+    transparent
+  );
+}
+
+.base-board-frontier-column--history {
+  opacity: 0.85;
+}
+
+.base-board-frontier-column--history .base-board-column-header {
+  color: var(--text-muted);
+}
+
+.base-board-frontier-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.base-board-frontier-card--pinned {
+  border-color: color-mix(
+    in srgb,
+    var(--interactive-accent) 55%,
+    var(--background-modifier-border)
+  );
+}
+
+.base-board-frontier-crumb {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  line-height: 1.2;
+}
+
+.base-board-frontier-seg {
+  color: var(--text-muted);
+}
+
+.base-board-frontier-sep {
+  color: var(--text-faint);
+}
+
+.base-board-frontier-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.base-board-frontier-leaf {
+  color: var(--text-normal);
+  font-weight: var(--font-semibold);
+  line-height: 1.25;
+}
+
+.base-board-frontier-pin {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 0.12s ease,
+    color 0.12s ease;
+}
+
+.base-board-frontier-card:hover .base-board-frontier-pin,
+.base-board-frontier-pin--active {
+  opacity: 1;
+}
+
+.base-board-frontier-pin--active {
+  color: var(--interactive-accent);
+}
+
+.base-board-frontier-pin .svg-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.base-board-frontier-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+
+.base-board-frontier-status {
+  color: var(--text-muted);
+}
+
+.base-board-frontier-time {
+  color: var(--text-faint);
+}
+
+.base-board-frontier-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.base-board-frontier-chip {
+  font-size: var(--font-ui-smaller);
+  line-height: 1.1;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background-color: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.base-board-frontier-chip--people {
+  background-color: color-mix(
+    in srgb,
+    var(--color-blue) 22%,
+    var(--background-primary)
+  );
+  color: var(--text-normal);
+}
+
+.base-board-frontier-chip--repo {
+  background-color: color-mix(
+    in srgb,
+    var(--color-purple) 22%,
+    var(--background-primary)
+  );
+  color: var(--text-normal);
+}
+
+.base-board-frontier-chip--kind {
+  background-color: color-mix(
+    in srgb,
+    var(--color-green) 22%,
+    var(--background-primary)
+  );
+  color: var(--text-normal);
+}
+
+.base-board-frontier-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 48px auto;
+  max-width: 360px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.base-board-frontier-empty-icon .svg-icon {
+  width: 28px;
+  height: 28px;
+  color: var(--text-faint);
 }

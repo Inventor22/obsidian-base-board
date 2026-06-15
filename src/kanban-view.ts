@@ -29,6 +29,20 @@ import {
   buildTransitionEvent,
   type TransitionEvent,
 } from "./transition-history";
+import {
+  buildFrontierGraph,
+  getFrontierNodes,
+  getFrontierLineage,
+  normalizeReference,
+  normalizeReferences,
+  isCompletedStatus as engineIsCompletedStatus,
+  isBlockedStatus as engineIsBlockedStatus,
+  isActiveStatus as engineIsActiveStatus,
+  ENGINE_NODE_KINDS,
+  type EngineNodeKind,
+  type FrontierNode,
+  type FrontierRawNode,
+} from "./graph-engine";
 
 const ARCHIVE_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000;
 const PLANNED_COLUMN = "Planned";
@@ -36,6 +50,38 @@ const ARCHIVE_DROP_COLUMN = "Archived";
 const ARCHIVE_TARGET_STATUS = "Completed";
 const ARCHIVED_PROPERTY = "archived";
 const STACKED_COLUMN_GROUPS = [["Flighting", "Blocked"]];
+
+// --- Active-frontier projection (Step D) -----------------------------------
+// The frontier board is a derived projection of the graph: live columns are the
+// active frontier leaves bucketed by status; history columns read the event log.
+const PINNED_PROPERTY = "pinned";
+const FRONTIER_HISTORY_WINDOW_DAYS = 7;
+const FRONTIER_LIVE_COLUMNS = [
+  "To Do",
+  "In Progress",
+  "In Review",
+  "Blocked",
+] as const;
+
+/** A work card projected onto the frontier board. */
+interface FrontierCardModel {
+  file: TFile;
+  entry: BasesEntry;
+  title: string;
+  lineage: string[];
+  status: string | null;
+  state: FrontierNode["state"];
+  facets: { label: string; kind: string }[];
+  tags: string[];
+  pinned: boolean;
+  timestamp: Date | null;
+}
+
+/** Parses an explicit frontmatter `kind` into the engine's closed kind set. */
+function parseFrontmatterKind(value: unknown): EngineNodeKind | null {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : null;
+  return ENGINE_NODE_KINDS.find((kind) => kind === raw) ?? null;
+}
 
 interface ArchivedEntry {
   file: TFile;
@@ -53,15 +99,6 @@ interface PlannedEntry {
 }
 
 type BoardProjectionMode = "all" | "active-frontier";
-
-interface ProjectionEntry {
-  entry: BasesEntry;
-  file: TFile;
-  title: string;
-  columnName: string;
-  parentKey: string | null;
-  dependsOnKeys: string[];
-}
 
 // ---------------------------------------------------------------------------
 //  Kanban View
@@ -97,7 +134,6 @@ export class KanbanView extends BasesView implements HoverParent {
   /** Currently selected card file paths (for batch operations) */
   public selectedCards: Set<string> = new Set();
   public detailLeaf: WorkspaceLeaf | null = null;
-  private projectedOutCardPaths: Set<string> = new Set();
 
   constructor(
     controller: QueryController,
@@ -365,14 +401,10 @@ export class KanbanView extends BasesView implements HoverParent {
     );
   }
 
-  public entryMatchesBoardProjection(entry: BasesEntry): boolean {
-    const filePath = entry.file?.path;
-    if (!filePath) return true;
-    return !this.projectedOutCardPaths.has(filePath);
-  }
-
-  public isActionableFrontierStatus(status: string | null): boolean {
-    return !this.isCompletedStatus(status) && !this.isPlannedStatus(status);
+  public entryMatchesBoardProjection(_entry: BasesEntry): boolean {
+    // The active-frontier projection now renders its own derived board
+    // (renderFrontierBoard), so the classic board never projects entries out.
+    return true;
   }
 
   private getArchivedEntry(
@@ -676,8 +708,6 @@ export class KanbanView extends BasesView implements HoverParent {
     }
 
     this.currentGroups = groupedData;
-    this.projectedOutCardPaths = this.getProjectedOutCardPaths(groupedData);
-    const columns = this.getColumns();
 
     const boardEl = this.containerEl.createDiv({ cls: "base-board-board" });
 
@@ -688,6 +718,23 @@ export class KanbanView extends BasesView implements HoverParent {
       boardEl.addClass("base-board-board--animate");
       this.isFirstRender = false;
     }
+
+    // Active-frontier projection (Step D): a derived board driven by the graph
+    // frontier (live work) + the event log (recent history), not raw status
+    // grouping. The classic status board renders below in "all" mode.
+    if (this.getBoardProjectionMode() === "active-frontier") {
+      boardEl.addClass("base-board-frontier-board");
+      this.renderFrontierBoard(boardEl);
+      if (savedScrollLeft > 0 || savedScrollTop > 0) {
+        window.requestAnimationFrame(() => {
+          boardEl.scrollLeft = savedScrollLeft;
+          this.scrollEl.scrollTop = savedScrollTop;
+        });
+      }
+      return;
+    }
+
+    const columns = this.getColumns();
 
     const renderedColumns = new Set<string>();
     columns.forEach((columnName, idx) => {
@@ -981,122 +1028,380 @@ export class KanbanView extends BasesView implements HoverParent {
     return date.toLocaleDateString(undefined, options);
   }
 
-  private getProjectedOutCardPaths(groups: BasesEntryGroup[]): Set<string> {
-    if (this.getBoardProjectionMode() !== "active-frontier") return new Set();
+  // ---------------------------------------------------------------------------
+  //  Active-frontier projection board (Step D)
+  // ---------------------------------------------------------------------------
 
-    const projectionEntries = this.getProjectionEntries(groups);
-    const entriesByIdentity = new Map<string, ProjectionEntry>();
-    for (const projectionEntry of projectionEntries) {
-      for (const identity of this.getProjectionEntryIdentities(
-        projectionEntry,
-      )) {
-        entriesByIdentity.set(identity, projectionEntry);
+  /**
+   * Renders the frontier-projected board: live columns are the active frontier
+   * leaves (derived by the shared graph engine over the whole dataset) bucketed
+   * by status; history columns read the event log for recently completed and
+   * recently blocked work. Each card shows its work lineage breadcrumb.
+   */
+  private renderFrontierBoard(boardEl: HTMLElement): void {
+    const { raw, refByKey } = this.collectFrontierRawNodes();
+    const graph = buildFrontierGraph(raw);
+    const nodeByKey = new Map<string, FrontierNode>(
+      graph.map((node) => [node.key, node]),
+    );
+    const frontier = getFrontierNodes(graph);
+
+    const liveBuckets = new Map<string, FrontierCardModel[]>();
+    for (const columnName of FRONTIER_LIVE_COLUMNS) {
+      liveBuckets.set(columnName, []);
+    }
+    for (const node of frontier) {
+      const ref = refByKey.get(node.key);
+      if (!ref) continue;
+      if (!this.entryMatchesActiveTagFilters(ref.entry)) continue;
+      const columnName = this.frontierLiveColumn(node);
+      liveBuckets
+        .get(columnName)
+        ?.push(this.buildFrontierCard(node, ref, null));
+    }
+
+    const windowMs = FRONTIER_HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+    const completed: FrontierCardModel[] = [];
+    const recentlyBlocked: FrontierCardModel[] = [];
+    for (const [key, ref] of refByKey) {
+      const node = nodeByKey.get(key);
+      if (!node) continue;
+      if (node.children.length > 0 || node.kind === "group") continue; // leaves only
+      if (!this.entryMatchesActiveTagFilters(ref.entry)) continue;
+
+      if (node.state === "completed") {
+        const completedAt = this.getStatusEnteredWithinWindow(
+          ref.file,
+          engineIsCompletedStatus,
+          windowMs,
+        );
+        if (completedAt) {
+          completed.push(this.buildFrontierCard(node, ref, completedAt));
+        }
+        continue;
+      }
+
+      if (node.state !== "blocked") {
+        const blockedAt = this.getStatusEnteredWithinWindow(
+          ref.file,
+          engineIsBlockedStatus,
+          windowMs,
+        );
+        if (blockedAt) {
+          recentlyBlocked.push(this.buildFrontierCard(node, ref, blockedAt));
+        }
       }
     }
 
-    const hiddenParentPaths = new Set<string>();
-    const completedIdentities =
-      this.getCompletedProjectionIdentities(projectionEntries);
-    for (const projectionEntry of projectionEntries) {
-      if (!this.isActionableFrontierStatus(projectionEntry.columnName))
-        continue;
-      if (
-        this.isArchivedEntry(projectionEntry.entry, projectionEntry.columnName)
-      ) {
-        continue;
-      }
-      if (!this.entryMatchesActiveTagFilters(projectionEntry.entry)) continue;
-
-      const dependenciesSatisfied = projectionEntry.dependsOnKeys.every(
-        (dependencyKey) => completedIdentities.has(dependencyKey),
+    const totalCards =
+      frontier.length + completed.length + recentlyBlocked.length;
+    if (totalCards === 0) {
+      const emptyEl = boardEl.createDiv({
+        cls: "base-board-frontier-empty",
+      });
+      setIcon(
+        emptyEl.createSpan({ cls: "base-board-frontier-empty-icon" }),
+        "lucide-target",
       );
-      if (!dependenciesSatisfied) {
-        hiddenParentPaths.add(projectionEntry.file.path);
-        continue;
-      }
-
-      if (!projectionEntry.parentKey) continue;
-
-      const parent = entriesByIdentity.get(projectionEntry.parentKey);
-      if (!parent || parent.file.path === projectionEntry.file.path) continue;
-      hiddenParentPaths.add(parent.file.path);
+      emptyEl.createEl("p", {
+        text: "No active frontier work. Connect cards into a feature/work graph to populate the frontier.",
+      });
+      return;
     }
 
-    return hiddenParentPaths;
+    for (const columnName of FRONTIER_LIVE_COLUMNS) {
+      this.renderFrontierColumn(
+        boardEl,
+        columnName,
+        liveBuckets.get(columnName) ?? [],
+        false,
+      );
+    }
+
+    if (completed.length > 0 || recentlyBlocked.length > 0) {
+      boardEl.createDiv({ cls: "base-board-frontier-divider" });
+      this.renderFrontierColumn(boardEl, "Completed", completed, true);
+      this.renderFrontierColumn(
+        boardEl,
+        "Recently blocked",
+        recentlyBlocked,
+        true,
+      );
+    }
   }
 
-  private getProjectionEntries(groups: BasesEntryGroup[]): ProjectionEntry[] {
-    const projectionEntries: ProjectionEntry[] = [];
-    for (const group of groups) {
-      const columnName = this.getColumnName(group.key);
-      for (const entry of group.entries) {
-        const file = entry.file;
-        if (!(file instanceof TFile)) continue;
-        projectionEntries.push({
-          entry,
-          file,
-          title: this.cardManager.getCardTitle(entry),
-          columnName,
-          parentKey: this.getParentKey(file),
-          dependsOnKeys: this.getDependsOnKeys(file),
+  /** Buckets a live frontier leaf into a board column by its state + status. */
+  private frontierLiveColumn(node: FrontierNode): string {
+    const status = node.status?.trim().toLowerCase();
+    if (node.state === "blocked" || node.state === "interrupted") {
+      return "Blocked";
+    }
+    if (node.state === "awaiting" || status === "in review") {
+      return "In Review";
+    }
+    if (
+      engineIsActiveStatus(node.status) ||
+      status === "flighting" ||
+      status === "in review"
+    ) {
+      return "In Progress";
+    }
+    return "To Do";
+  }
+
+  /** Reads the whole dataset into the raw rows the frontier engine needs. */
+  private collectFrontierRawNodes(): {
+    raw: FrontierRawNode[];
+    refByKey: Map<string, { file: TFile; entry: BasesEntry }>;
+  } {
+    const groupByProp = this.getGroupByProperty() ?? "status";
+    const raw: FrontierRawNode[] = [];
+    const refByKey = new Map<string, { file: TFile; entry: BasesEntry }>();
+    for (const entry of this.getCurrentEntries()) {
+      const file = entry.file;
+      if (!(file instanceof TFile)) continue;
+      const frontmatter = this.getFrontmatter(file);
+      const title = this.cardManager.getCardTitle(entry);
+      const id =
+        typeof frontmatter?.id === "string" ? frontmatter.id.toLowerCase() : "";
+      const identities = [
+        file.path.replace(/\.md$/i, "").toLowerCase(),
+        file.basename.toLowerCase(),
+        title.toLowerCase(),
+        id,
+      ].filter((identity) => identity.length > 0);
+      raw.push({
+        key: file.path,
+        title,
+        identities,
+        status: this.normalizeStatus(frontmatter?.[groupByProp]),
+        kindExplicit: parseFrontmatterKind(frontmatter?.kind),
+        parentKey: normalizeReference(frontmatter?.parent),
+        dependsOnKeys: normalizeReferences(frontmatter?.depends_on),
+        rollupToKeys: normalizeReferences(frontmatter?.rollup_to),
+      });
+      refByKey.set(file.path, { file, entry });
+    }
+    return { raw, refByKey };
+  }
+
+  /** Builds the render model for a frontier card (breadcrumb + facets + tags). */
+  private buildFrontierCard(
+    node: FrontierNode,
+    ref: { file: TFile; entry: BasesEntry },
+    timestamp: Date | null,
+  ): FrontierCardModel {
+    const frontmatter = this.getFrontmatter(ref.file);
+    const facets: { label: string; kind: string }[] = [];
+    const people = frontmatter?.people;
+    const peopleList = Array.isArray(people) ? people : people ? [people] : [];
+    for (const person of peopleList) {
+      const label = this.normalizeStatus(person);
+      if (label) facets.push({ label, kind: "people" });
+    }
+    const repo = this.normalizeStatus(frontmatter?.repo);
+    if (repo) facets.push({ label: repo, kind: "repo" });
+    const kindLabel = this.normalizeStatus(frontmatter?.kind);
+    if (kindLabel) facets.push({ label: kindLabel, kind: "kind" });
+
+    return {
+      file: ref.file,
+      entry: ref.entry,
+      title: node.title,
+      lineage: getFrontierLineage(node),
+      status: node.status,
+      state: node.state,
+      facets,
+      tags: this.tags.extractTagsFromFile(ref.file),
+      pinned: frontmatter?.[PINNED_PROPERTY] === true,
+      timestamp,
+    };
+  }
+
+  private renderFrontierColumn(
+    boardEl: HTMLElement,
+    columnName: string,
+    cards: FrontierCardModel[],
+    isHistory: boolean,
+  ): void {
+    const sorted = [...cards].sort((first, second) => {
+      if (first.pinned !== second.pinned) return first.pinned ? -1 : 1;
+      if (isHistory) {
+        const firstTime = first.timestamp?.getTime() ?? 0;
+        const secondTime = second.timestamp?.getTime() ?? 0;
+        if (firstTime !== secondTime) return secondTime - firstTime;
+      }
+      return first.lineage
+        .join(" › ")
+        .localeCompare(second.lineage.join(" › "));
+    });
+
+    const columnEl = boardEl.createDiv({
+      cls: isHistory
+        ? "base-board-column base-board-frontier-column base-board-frontier-column--history"
+        : "base-board-column base-board-frontier-column",
+    });
+    columnEl.dataset.columnName = columnName;
+
+    const columnColor = getColumnColor(this.config, columnName);
+    columnEl.style.setProperty("--column-color", columnColor);
+    const accentEl = columnEl.createDiv({ cls: "base-board-column-accent" });
+    accentEl.style.backgroundColor = columnColor;
+
+    const headerEl = columnEl.createDiv({ cls: "base-board-column-header" });
+    headerEl.style.setProperty("--base-board-column-color", columnColor);
+    headerEl.createSpan({ cls: "base-board-column-title", text: columnName });
+    headerEl.createSpan({
+      cls: "base-board-column-count",
+      text: String(sorted.length),
+    });
+
+    const cardsEl = columnEl.createDiv({ cls: "base-board-cards" });
+    for (const card of sorted) {
+      this.renderFrontierCard(cardsEl, card);
+    }
+  }
+
+  private renderFrontierCard(
+    cardsEl: HTMLElement,
+    card: FrontierCardModel,
+  ): void {
+    const cardEl = cardsEl.createDiv({
+      cls: "base-board-card base-board-frontier-card",
+    });
+    cardEl.dataset.filePath = card.file.path;
+    if (card.pinned) cardEl.addClass("base-board-frontier-card--pinned");
+
+    // Work lineage breadcrumb (replaces the old hierarchy tags).
+    if (card.lineage.length > 1) {
+      const crumbEl = cardEl.createDiv({
+        cls: "base-board-frontier-crumb",
+      });
+      card.lineage.forEach((segment, index) => {
+        const isLast = index === card.lineage.length - 1;
+        if (isLast) return; // leaf is shown as the card title
+        crumbEl.createSpan({
+          cls: "base-board-frontier-seg",
+          text: segment,
+        });
+        crumbEl.createSpan({
+          cls: "base-board-frontier-sep",
+          text: " › ",
+        });
+      });
+    }
+
+    const titleRow = cardEl.createDiv({ cls: "base-board-frontier-title-row" });
+    titleRow.createSpan({
+      cls: "base-board-frontier-leaf",
+      text: card.title,
+    });
+    const pinBtn = titleRow.createEl("button", {
+      cls: card.pinned
+        ? "base-board-frontier-pin base-board-frontier-pin--active"
+        : "base-board-frontier-pin",
+      attr: {
+        type: "button",
+        "aria-label": card.pinned ? "Unpin card" : "Pin card",
+        title: card.pinned ? "Unpin card" : "Pin card",
+      },
+    });
+    setIcon(pinBtn, "lucide-pin");
+    pinBtn.addEventListener("click", (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void this.toggleFrontierPin(card.file, !card.pinned);
+    });
+
+    const metaRow = cardEl.createDiv({ cls: "base-board-frontier-meta" });
+    if (card.status) {
+      metaRow.createSpan({
+        cls: "base-board-frontier-status",
+        text: card.status,
+      });
+    }
+    if (card.timestamp) {
+      metaRow.createSpan({
+        cls: "base-board-frontier-time",
+        text: this.formatArchiveDate(card.timestamp),
+      });
+    }
+
+    if (card.facets.length > 0 || card.tags.length > 0) {
+      const chipsEl = cardEl.createDiv({ cls: "base-board-frontier-chips" });
+      for (const facet of card.facets) {
+        chipsEl.createSpan({
+          cls: `base-board-frontier-chip base-board-frontier-chip--${facet.kind}`,
+          text: facet.label,
+        });
+      }
+      for (const tag of card.tags) {
+        chipsEl.createSpan({
+          cls: "base-board-frontier-chip base-board-frontier-chip--tag",
+          text: `#${tag}`,
         });
       }
     }
-    return projectionEntries;
+
+    cardEl.addEventListener("click", (event: MouseEvent) => {
+      this.cardManager.openCardFile(card.file, event);
+    });
   }
 
-  private getCompletedProjectionIdentities(
-    entries: ProjectionEntry[],
-  ): Set<string> {
-    const completedIdentities = new Set<string>();
-    for (const entry of entries) {
-      if (!this.isCompletedStatus(entry.columnName)) continue;
-      for (const identity of this.getProjectionEntryIdentities(entry)) {
-        completedIdentities.add(identity);
+  private async toggleFrontierPin(file: TFile, pinned: boolean): Promise<void> {
+    await this.app.fileManager.processFrontMatter(
+      file,
+      (frontmatter: Record<string, unknown>) => {
+        if (pinned) {
+          frontmatter[PINNED_PROPERTY] = true;
+        } else {
+          delete frontmatter[PINNED_PROPERTY];
+        }
+      },
+    );
+    this.scheduleRender();
+  }
+
+  /**
+   * The most recent time a note entered a status matching `matches` (a
+   * transition whose `to` matches and `from` does not), if within `windowMs`.
+   * Reads the event log (`status_history`).
+   */
+  private getStatusEnteredWithinWindow(
+    file: TFile,
+    matches: (status: string | null) => boolean,
+    windowMs: number,
+  ): Date | null {
+    const groupByProp = this.getGroupByProperty();
+    if (!groupByProp) return null;
+    const propertyName =
+      this.plugin.data_.transitionHistory.propertyName.trim();
+    if (!propertyName) return null;
+
+    const frontmatter = this.getFrontmatter(file);
+    const rawHistory = frontmatter?.[propertyName];
+    if (!Array.isArray(rawHistory)) return null;
+
+    const records = (rawHistory as unknown[])
+      .map((rawRecord) =>
+        this.parseTransitionHistoryRecord(rawRecord, groupByProp),
+      )
+      .filter(
+        (
+          record,
+        ): record is { from: string | null; to: string | null; at: Date } =>
+          record !== null,
+      )
+      .sort((first, second) => first.at.getTime() - second.at.getTime());
+
+    let enteredAt: Date | null = null;
+    for (const record of records) {
+      if (matches(record.to) && !matches(record.from)) {
+        enteredAt = record.at;
       }
     }
-    return completedIdentities;
-  }
-
-  private getProjectionEntryIdentities(entry: ProjectionEntry): string[] {
-    return [
-      entry.file.path.replace(/\.md$/i, "").toLowerCase(),
-      entry.file.basename.toLowerCase(),
-      entry.title.toLowerCase(),
-    ];
-  }
-
-  private getParentKey(file: TFile): string | null {
-    const frontmatter = this.getFrontmatter(file);
-    const value = frontmatter?.parent;
-    return this.normalizeReference(value);
-  }
-
-  private getDependsOnKeys(file: TFile): string[] {
-    const frontmatter = this.getFrontmatter(file);
-    const value = frontmatter?.depends_on;
-    return this.normalizeReferences(value);
-  }
-
-  private normalizeReferences(value: unknown): string[] {
-    const rawValues = Array.isArray(value) ? (value as unknown[]) : [value];
-    return rawValues
-      .map((rawValue) => this.normalizeReference(rawValue))
-      .filter((reference): reference is string => reference !== null);
-  }
-
-  private normalizeReference(value: unknown): string | null {
-    const firstValue = Array.isArray(value) ? (value as unknown[])[0] : value;
-    if (typeof firstValue !== "string") return null;
-    let normalized = firstValue.trim();
-    if (!normalized) return null;
-
-    const linkMatch = normalized.match(/^\[\[([^|\]]+)(?:\|[^\]]+)?\]\]$/);
-    if (linkMatch) normalized = linkMatch[1];
-    normalized = normalized.replace(/\.md$/i, "");
-    const slashIndex = normalized.lastIndexOf("/");
-    if (slashIndex >= 0) normalized = normalized.slice(slashIndex + 1);
-    return normalized.toLowerCase();
+    if (!enteredAt) return null;
+    return Date.now() - enteredAt.getTime() <= windowMs ? enteredAt : null;
   }
 
   // ---------------------------------------------------------------------------

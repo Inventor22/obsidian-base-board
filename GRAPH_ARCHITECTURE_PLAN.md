@@ -333,7 +333,7 @@ The Kanban gains: a **lens picker** = the clickable summarised scope hierarchy
 | A | **Scope type + `rollup_to`/`membership` edge + scope rollup** | additive | foundational; unblocks rollups & lens picker |
 | B | **Editability gate** — lock structural edges, membership editable | behaviour | ✅ *done (build 2026.06.12.2)* — `graph_locked` subgraph lock (inherited, nearest-explicit-wins); templates insert locked; lock badge + Lock/Unlock toggle; freezes add-node / structural link create+delete+rewire inside a locked subtree; membership + reposition stay free |
 | C | **Signal scheduler + per-type policy** (`pass`/`absorb`/`transform`) | refactor | generalises M3 escalation; bounce points |
-| D | **`frontier(scope)` query + scoped/frontier Kanban mode** | new view | 🟡 *groundwork done (build 2026.06.13.1)* — read-only **Active frontier & hygiene** panel: `isFrontierLeaf` (work leaf whose state is live: active/awaiting/blocked/interrupted) + `getGraphFrontier`, work breadcrumb `getNodeLineage` (climbs `parent` up to the feature/work-root, stops below the `group`/scope layer), `getGraphHygiene` (containment roots not rolled into any scope), surfaced via a `lucide-target` toolbar button → `GraphFrontierModal`. Read-only validation of the derivation; the scoped Kanban projection itself is still TBD. |
+| D | **`frontier(scope)` query + scoped/frontier Kanban mode** | new view | ✅ *done (build 2026.06.13.2)* — the shared **`src/graph-engine.ts`** now owns the single frontier derivation (state recompute, kind inference, `isFrontierLeaf`/`getFrontier`/`getNodeLineage`/`getHygiene`, status predicates, reference normalization, plus `buildFrontierGraph`/`getFrontierNodes`/`getFrontierLineage`); the Graph view delegates to it (no duplicated logic). The Kanban's **Active frontier** mode (`Show cards` dropdown) renders a derived board: **live columns** = active frontier leaves bucketed by status (To Do / In Progress / In Review=`Awaiting` / Blocked), **history columns** = event-log window (Completed + Recently blocked, last 7 days from `status_history`). Each card shows the **work lineage breadcrumb** (replacing hierarchy tags), keeps facet chips (people/repo/kind) + note tags, and has a **pin** toggle (`pinned` frontmatter → sorts to top). Scope is the whole graph (lens scoping is Step E). The classic status board stays as the "All cards" mode. |
 | E | **Lens object + clickable scope-hierarchy picker** | new view | |
 | F | **Schedule suggestion + priority overlay (pin #1)** | sugar | last |
 
@@ -352,6 +352,169 @@ The Kanban gains: a **lens picker** = the clickable summarised scope hierarchy
 5. **Lens persistence:** lenses durable in plugin config; priority overlay
    per-day-ephemeral. *(default: yes)*
 6. **Auto-switch:** schedule only *suggests*; user clicks to switch. *(default: yes)*
+
+## Compensation (saga) — failure-triggered mitigation
+
+> **Trigger phrase:** *Work on compensation/saga.* Captures the design
+> conversation (2026-06-13). When a deployed-then-validated change fails
+> validation, two things must happen in parallel: **mitigate now** (undo the
+> live side-effect — "disable the flag") and **fix forward** (a new iteration).
+> This is the Saga / compensating-action pattern, and it is the first concrete
+> behaviour of the Step C signal scheduler.
+
+### Responsibility split (graph vs. agent harness)
+
+The graph **instantiates declared structure deterministically**; the agent
+harness **invents and executes**. One-line test: *does the reaction need
+judgment?* No → graph; yes → harness.
+
+- **Declared compensation → graph activates it.** Given a pre-declared
+  compensation, wiring it onto the frontier at the right moment is mechanical
+  bookkeeping (deterministic, replayable, undoable, and works with **no agent
+  connected** — a human still sees the mitigation task at 2am). Creating a
+  *node* is inert structure — safe to do deterministically.
+- **Executing** the mitigation (run pfgold, verify) → **agent/human** (a
+  side-effecting, autonomy-gated *skill*).
+- **No declaration / novel mitigation** → the graph cannot invent a domain
+  action; it raises an **attention signal** and the **agent proposes** a
+  compensation (human-approved), which becomes a declaration the graph manages.
+
+### Encoding (decided)
+
+- **Relation `compensates`** (list) on the rollback/mitigation node → the
+  effecting node it undoes (e.g. `Disable flag` `compensates: [[Enable flag]]`).
+  Matches the "responder declares" convention of `depends_on`/`breaks_to`.
+- **"Effecting" is inferred** — a node is effecting iff something compensates it
+  (no extra `effecting:` flag).
+
+### A compensation is out-of-band (not a forward step)
+
+Crucial correction (after a first attempt modeled it with `depends_on`): a
+compensation must **not** sit in the forward sequence. As a `depends_on`
+successor it becomes the chain's terminal (steals the requirement-return) and is
+swept into the failure's `Invalidated` set. Instead it links **only** via
+`compensates` (what it undoes) + `parent` (where it lives), and is excluded from
+sibling-chains, the execution partition, and its parent's group fold. Its state
+is derived out-of-band:
+
+- **dormant** (`idle`, **hidden**) by default — when an upstream node is active
+  and nothing has failed, the compensation effectively does not exist;
+- **active** (frontier) when **triggered**: its effecting target is `Completed`
+  (effect live) AND a genuine failure has escalated through that target's
+  container (`computeBrokenScopePaths` → ancestors of failed leaves);
+- **completed** once executed.
+
+### Build status
+
+| Phase | What | Status |
+|-------|------|--------|
+| 1 | `compensates` relation (parse + link + reverse `compensatedBy`); compensation is **out-of-band** — `excludedFromFold`, excluded from sibling-chains + execution partition; state derived **dormant(`idle`, hidden) / active(triggered) / completed** via `applyCompensationStates` + `computeBrokenScopePaths` (failure-in-scope), NOT via `depends_on`. | ✅ *done (build 2026.06.13.6)* |
+| 1.5 | Render: orange **rollback edge** (effecting → compensation) when triggered + mitigation **badge**; derived/non-editable. | ✅ *done (build 2026.06.13.6)* |
+| 2 | **Template-ify** — bake enable↔disable into the flagged-ring template so every flagged rollout ships a dormant disable that auto-activates. | pending |
+| 3 | **Attention signal** for an effecting failure with **no** declared compensation (agent's cue to propose one). | pending |
+| 4 | Generalise into the **Step C** per-type signal scheduler; compensation handler = its first registered behaviour. | pending |
+
+Iteration spawn (fix-forward) stays a deliberate manual action for now; only the
+compensation is automated.
+
+## Graph layout engine (interactive organize + temporal)
+
+> **Trigger phrase:** *Build the graph layout engine.* Captures the design
+> conversation (2026-06-13). Goal: replace hand-positioned `graph_x`/`graph_y`
+> with an **algorithmic, undoable layout system** invoked from the graph, with
+> several layout modes — culminating in a **temporal** mode that unifies the
+> graph and timeline views.
+
+### Position storage (decided: view config, not note frontmatter)
+
+A node's position is only meaningful *to the graph view*, so positions move
+**out of per-note frontmatter into the graph view config** (the `.base` view,
+next to `graphViewport`/`graphWorld`) as a map `graphNodePositions: { <nodeId>:
+{x, y} }`.
+
+- **Why:** a relayout touches *one* config object, not N notes — no frontmatter
+  churn, no sync conflicts, no git noise, no `onDataUpdated` storm. (Hand-editing
+  70 notes per layout was the pain that motivated this.)
+- **Migration, not fallback:** read any legacy frontmatter `graph_x`/`graph_y`
+  once, fold into the config map, then stop writing frontmatter. Manual drags +
+  computed layouts both write the config map (single source of truth).
+- **Undo/redo:** positions leave the note files, so the existing *file-snapshot*
+  undo no longer covers them. Layout changes use a **dedicated in-memory layout
+  history** (before/after position-map snapshots) wired to the same toolbar
+  Undo/Redo buttons (a new entry kind alongside the file-diff entries).
+
+### Interaction
+
+- **Right-click a node → `Organize ▸ …`** lays out that node's **containment
+  subtree** (its descendants). **Right-click a template/group** organizes its
+  contained subgraph. A second scope organizes the **gating-connected flow**.
+- **Anchor on the clicked node** (decided): the clicked node keeps its current
+  `(x, y)`; descendants are laid out *relative* to it (cascading down or right),
+  so the rest of the graph does not jump. Organizing a deep node reflows only
+  that subtree.
+- All position writes for one organize = **one** layout-history entry = one undo.
+
+### Layout modes
+
+The data has two orthogonal relations → two axes: **containment** (`parent`,
+the hierarchy) and **gating** (`depends_on`, the execution sequence).
+
+1. **Tidy tree** — Reingold–Tilford contour packing over containment. Orientation
+   **top-down** or **left-to-right** (these are transposes — one engine + a swap).
+2. **Layered (a)** — *gated = left→right, subtree = top↓*. Reads like a release
+   pipeline / org chart: hierarchy descends, each gated sequence marches right.
+3. **Layered (b)** — *gated = top↓, subtree = left→right*. The transpose of (a);
+   reads like an indented outline / mind-map. **Reconciliation rule:** gating is
+   the **rank/flow axis**; containment is the **grouping axis** — a parent's
+   children cluster together and are ordered within the cluster by `depends_on`.
+4. **Physics / force-directed** — edges = springs (attraction), nodes = charged
+   particles (repulsion), iterate to equilibrium. Must be **seeded + fixed
+   iterations** so it is deterministic (for stable undo/redo); optional animated
+   settling. For messy cross-cut graphs with no clean root.
+5. **Mirror / transpose** — flip a selection about its bounding-box center
+   (`y' = minY+maxY − y`, or x), and transpose (swap x/y) to convert
+   top-down ↔ left-to-right. Cheap; one undoable transform each.
+
+### Temporal layout (the unifying fifth mode)
+
+`X = real time` (sourced from the event log — `status_history`'s `activated`/
+`completed` timestamps). The **Now line** is a vertical seam (≈¾ across the
+viewport): **left = history placed by real timestamps**; **right = future placed
+by structure** (reuse the layered/tidy engine, anchored at Now, ordered by
+dependency distance from Now). The **active frontier = the set of nodes whose
+`[start, end]` interval contains Now** — the vertical slice at the seam (same set
+Step D's Kanban projects).
+
+- **`start` = first-ever activation** (decided); `end` = final completion, or
+  *open* (extends to Now) while still live.
+- **Time scale:** **activity-compressed by default** (squeeze idle gaps — "where
+  did my energy flow") with an **honest/linear toggle**; reuse the Timeline
+  ruler (`TIMELINE_RULER_PLAN.md`) for scale + labels.
+- **Node encoding (by kind + collapse):**
+  - **leaf** → a **duration ribbon**: a real start-card + a dimmed **ghost echo**
+    card at `end`/Now, joined by a **state-colored ribbon** (blue active / amber
+    awaiting / red blocked / hatched planned) — which *is* the node's state
+    history over time.
+  - **collapsed group** → a single rolled-up **state ribbon** across its span.
+  - **expanded group** → a **nested labeled swimlane/bracket** spanning its
+    descendants' time range (sticky left label = swimlane label = the click/
+    collapse target), tinted by its derived rollup state. Groups are **never**
+    point-cards (a group is a span, not an instant).
+- Containment ⇒ **nested swimlanes** (Y); gating ⇒ left→right (already temporal);
+  `restart`/`break` ⇒ the only backward arcs (energy that looped back).
+- This **converges the graph and timeline views**: the temporal graph is the
+  timeline view at higher density; collapsing top-level scopes gives the
+  "where did my energy flow this quarter" one-glance view.
+
+### Build order
+
+| # | Piece | Notes |
+|---|-------|-------|
+| 1 | **Pure layout engine** (`src/graph-layout.ts`) | tidy tree + layered (a/b) + transpose/mirror; pure `compute(root, descendants, mode, opts) → Map<id,{x,y}>`. No side effects, deterministic. |
+| 2 | **Config-based positions + migration** | `graphNodePositions` map; read in `getSavedGraphPosition`; drags write the map. |
+| 3 | **Layout undo entry + Organize menu** | in-memory before/after position-map history on the existing Undo/Redo buttons; `Organize ▸ Top-down / Left-to-right / Layered / Mirror` on nodes/templates, anchored on the clicked node. |
+| 4 | **Physics mode** | seeded force-directed; optional animation. |
+| 5 | **Temporal mode** | needs the event log (have), the Timeline ruler (have), and pieces 1–3; converges with the Timeline view. |
 
 ## Cross-references
 

@@ -4,6 +4,7 @@ import {
   BasesPropertyId,
   BasesView,
   Menu,
+  MenuItem,
   Modal,
   Notice,
   NullValue,
@@ -19,6 +20,34 @@ import { InputModal } from "./modals";
 import { ORDER_PROPERTY, sanitizeFilename } from "./constants";
 import { getColumnColor } from "./status-colors";
 import { buildTransitionEvent } from "./transition-history";
+import {
+  type EngineNodeState,
+  type EngineNodeKind,
+  assignNodeKinds as engineAssignNodeKinds,
+  deriveStates as engineDeriveStates,
+  isFrontierLeaf as engineIsFrontierLeaf,
+  getNodeLineage as engineGetNodeLineage,
+  getHygiene as engineGetHygiene,
+  isScopeNode as engineIsScopeNode,
+  isCompletedStatus as engineIsCompletedStatus,
+  isInterruptedStatus as engineIsInterruptedStatus,
+  isInvalidatedStatus as engineIsInvalidatedStatus,
+  isCancelledStatus as engineIsCancelledStatus,
+  isAwaitingStatus as engineIsAwaitingStatus,
+  isBlockedStatus as engineIsBlockedStatus,
+  isActiveStatus as engineIsActiveStatus,
+  normalizeReference as engineNormalizeReference,
+  normalizeReferences as engineNormalizeReferences,
+} from "./graph-engine";
+import {
+  computeSubtreeLayout,
+  mirrorVertical,
+  mirrorHorizontal,
+  type LayoutNode,
+  type LayoutOrientation,
+  type LayoutSiblingOrder,
+  type PositionMap,
+} from "./graph-layout";
 
 type GraphRelationKind = "requirement" | "successor";
 type GraphLinkCreationKind =
@@ -26,19 +55,16 @@ type GraphLinkCreationKind =
   | "break"
   | "restart"
   | "membership";
-type GraphNodeState =
-  | "active"
-  | "in-progress"
-  | "awaiting"
-  | "waiting"
-  | "completed"
-  | "blocked"
-  | "interrupted"
-  | "invalidated"
-  | "cancelled"
-  | "idle";
+// State + kind unions are owned by the shared engine (graph-engine.ts) so the
+// Graph and Kanban views derive frontier state from one source of truth.
+type GraphNodeState = EngineNodeState;
 type GraphEdgeKind = "requirement-start" | "requirement-return" | "gating";
-type GraphFlowEdgeKind = GraphEdgeKind | "break" | "restart" | "membership";
+type GraphFlowEdgeKind =
+  | GraphEdgeKind
+  | "break"
+  | "restart"
+  | "membership"
+  | "compensation";
 type GraphWorkflowTemplate =
   | "feature-simple"
   | "feature-detailed"
@@ -53,11 +79,12 @@ type GraphReferenceListKind =
   | "depends_on"
   | "breaks_to"
   | "restarts_to"
-  | "rollup_to";
+  | "rollup_to"
+  | "compensates";
 // Node model axes (see GRAPH_ARCHITECTURE_PLAN.md "Node model — three axes").
 // Kind = behaviour (the only axis the engine branches on); `type` = open label;
 // agency = who executes the work and how autonomously.
-type GraphNodeKind = "work" | "process" | "group" | "impact";
+type GraphNodeKind = EngineNodeKind;
 type GraphExecutor = "human" | "agent" | "mixed";
 type GraphAutonomy = "propose" | "execute" | "autopilot";
 const GRAPH_NODE_KINDS: readonly GraphNodeKind[] = [
@@ -194,6 +221,10 @@ interface GraphNode {
   breaksToKeys: string[];
   restartsToKeys: string[];
   rollupToKeys: string[];
+  // Compensation (saga). `compensates` points from a rollback/mitigation node to
+  // the effecting node it undoes; a node is "effecting" by inference (something
+  // compensates it). See GRAPH_ARCHITECTURE_PLAN.md "Compensation (saga)".
+  compensatesKeys: string[];
   nodeType: string | null;
   workflow: string | null;
   collapsed: boolean;
@@ -205,6 +236,13 @@ interface GraphNode {
   restartTargets: GraphNode[];
   rollupTargets: GraphNode[];
   members: GraphNode[];
+  // Compensation (saga): resolved targets this node undoes, and the reverse
+  // (this node's effect is undone by these compensations).
+  compensatesTargets: GraphNode[];
+  compensatedBy: GraphNode[];
+  // A compensation is out-of-band: it opts out of its parent's group fold and
+  // the forward sequence (it is a failure-triggered branch, not a step).
+  excludedFromFold: boolean;
   // Node-model axes (GRAPH_ARCHITECTURE_PLAN.md). `kind` = behavioural
   // archetype (inferred unless explicit); `executor`/`autonomy` = agency
   // (inherited down containment, nearest-explicit-wins). `*Explicit` is the
@@ -254,9 +292,19 @@ interface GraphHistoryFileChange {
   after: string | null;
 }
 
+// A layout (node-position) change. Positions live in the graph view config
+// (not note frontmatter), so they ride the same Undo/Redo as file edits via
+// this dedicated entry kind. `before` is null for a node that had no stored
+// position (it was using a legacy/auto position).
+interface GraphPositionChange {
+  before: Record<string, { x: number; y: number } | null>;
+  after: Record<string, { x: number; y: number }>;
+}
+
 interface GraphHistoryEntry {
   label: string;
   files: GraphHistoryFileChange[];
+  positions?: GraphPositionChange;
 }
 
 // A parsed transition event read back from a note's history array (Milestone 2:
@@ -295,7 +343,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.13.1";
+const GRAPH_BUILD_VERSION = "2026.06.13.6";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -324,6 +372,7 @@ const GRAPH_COLLAPSED_PROPERTY = "graph_collapsed";
 const GRAPH_LOCKED_PROPERTY = "graph_locked";
 const CONFIG_KEY_GRAPH_VIEWPORT = "graphViewport";
 const CONFIG_KEY_GRAPH_WORLD = "graphWorld";
+const CONFIG_KEY_GRAPH_NODE_POSITIONS = "graphNodePositions";
 const GRAPH_EDGE_HANDLE_RADIUS = 7;
 const GRAPH_LINK_HANDLE_PROXIMITY_PX = 14;
 // While dragging a link endpoint, reveal a node's anchor slots when the cursor
@@ -609,14 +658,7 @@ export class GraphView extends BasesView {
    * failed), never completed/cancelled/invalidated/waiting.
    */
   private isFrontierLeaf(node: GraphNode): boolean {
-    if (node.children.length > 0) return false;
-    if (node.kind === "group") return false;
-    return (
-      node.state === "active" ||
-      node.state === "awaiting" ||
-      node.state === "blocked" ||
-      node.state === "interrupted"
-    );
+    return engineIsFrontierLeaf(node);
   }
 
   private getGraphFrontier(): GraphNode[] {
@@ -633,16 +675,11 @@ export class GraphView extends BasesView {
     node: GraphNode,
     parentByPath: Map<string, GraphNode>,
   ): string[] {
-    const chain: string[] = [node.title];
-    const seen = new Set<string>([node.file.path]);
-    let parent = parentByPath.get(node.file.path) ?? null;
-    while (parent && !seen.has(parent.file.path)) {
-      if (parent.kind === "group") break;
-      chain.push(parent.title);
-      seen.add(parent.file.path);
-      parent = parentByPath.get(parent.file.path) ?? null;
-    }
-    return chain.reverse();
+    return engineGetNodeLineage(
+      node,
+      (candidate) =>
+        parentByPath.get((candidate as GraphNode).file.path) ?? null,
+    );
   }
 
   /**
@@ -652,20 +689,11 @@ export class GraphView extends BasesView {
    */
   private getGraphHygiene(): GraphHygieneItem[] {
     const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
-    const items: GraphHygieneItem[] = [];
-    for (const node of this.visibleNodes) {
-      if (node.kind === "group") continue;
-      if (parentByPath.has(node.file.path)) continue; // placed under a parent
-      if (node.rollupTargets.length > 0) continue; // rolled up into a scope
-      items.push({
-        title: node.title,
-        reason:
-          node.children.length === 0
-            ? "orphan work item — no parent and no scope"
-            : "feature/root not linked to any scope",
-      });
-    }
-    return items;
+    return engineGetHygiene(
+      this.visibleNodes,
+      (candidate) =>
+        parentByPath.get((candidate as GraphNode).file.path) ?? null,
+    );
   }
 
   private showGraphFrontier(): void {
@@ -795,6 +823,7 @@ export class GraphView extends BasesView {
       "break-dormant",
       "restart",
       "membership",
+      "compensation",
     ] as const) {
       const markerEl = activeDocument.createElementNS(
         "http://www.w3.org/2000/svg",
@@ -957,6 +986,8 @@ export class GraphView extends BasesView {
     handleEl: SVGCircleElement,
   ): void {
     if (event.button !== 0) return;
+    // Derived compensation edges are not directly rewirable.
+    if (edge.kind === "compensation") return;
     // Structural edges inside a locked subgraph are not draggable.
     if (this.isEdgeStructurallyLocked(edge)) return;
     event.preventDefault();
@@ -1673,6 +1704,20 @@ export class GraphView extends BasesView {
         agencyEl,
         node.executor === "agent" ? "lucide-bot" : "lucide-users",
       );
+    }
+
+    // Mitigation badge: a live, triggered compensation (rollback) task.
+    if (
+      node.compensatesTargets.length > 0 &&
+      this.isLiveGraphState(node.state)
+    ) {
+      const mitigationEl = nodeEl.createSpan({
+        cls: "base-board-graph-mitigation",
+        attr: {
+          title: "Mitigation \u2014 undoes a live change after a failure",
+        },
+      });
+      setIcon(mitigationEl, "lucide-undo-2");
     }
 
     const titleEl = nodeEl.createDiv({
@@ -2642,9 +2687,11 @@ export class GraphView extends BasesView {
     event.preventDefault();
     event.stopPropagation();
 
-    // Requirement-return edges are derived from containment and have no
-    // structural edit action, so they expose no context menu.
-    if (edge.kind === "requirement-return") return;
+    // Requirement-return and compensation edges are derived (from containment /
+    // triggered `compensates`), so they expose no structural edit action.
+    if (edge.kind === "requirement-return" || edge.kind === "compensation") {
+      return;
+    }
     // Structural edges in a locked subgraph cannot be deleted/rewired.
     if (this.isEdgeStructurallyLocked(edge)) return;
 
@@ -2663,9 +2710,10 @@ export class GraphView extends BasesView {
   }
 
   private async deleteGraphEdge(edge: GraphEdge): Promise<void> {
-    // Requirement-return edges are derived from containment; there is nothing
-    // to delete on them.
-    if (edge.kind === "requirement-return") return;
+    // Requirement-return and compensation edges are derived; nothing to delete.
+    if (edge.kind === "requirement-return" || edge.kind === "compensation") {
+      return;
+    }
     // Structural edges inside a locked subgraph are frozen.
     if (this.isEdgeStructurallyLocked(edge)) return;
     this.beginGraphHistory("Delete link");
@@ -3009,10 +3057,10 @@ export class GraphView extends BasesView {
     const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
     const beforeLeaves = this.getLeafNodes(
       this.getUpstreamDependencyNodes(node),
-    );
+    ).filter((leaf) => !this.isCompensationNode(leaf));
     const afterLeaves = this.getLeafNodes(
       this.getDownstreamResetNodes(node, parentByPath),
-    );
+    ).filter((leaf) => !this.isCompensationNode(leaf));
     const target = new Map<
       string,
       { node: GraphNode; status: string; reason?: string }
@@ -3296,6 +3344,7 @@ export class GraphView extends BasesView {
     const entry = this.graphUndoStack.pop();
     if (!entry) return;
     await this.applyGraphHistoryState(entry.files, true);
+    if (entry.positions) this.applyPositionHistory(entry.positions, true);
     this.graphRedoStack.push(entry);
     this.graphEndpointAnchorOverrides.clear();
     new Notice(`Undid: ${entry.label}`);
@@ -3306,6 +3355,7 @@ export class GraphView extends BasesView {
     const entry = this.graphRedoStack.pop();
     if (!entry) return;
     await this.applyGraphHistoryState(entry.files, false);
+    if (entry.positions) this.applyPositionHistory(entry.positions, false);
     this.graphUndoStack.push(entry);
     this.graphEndpointAnchorOverrides.clear();
     new Notice(`Redid: ${entry.label}`);
@@ -3413,6 +3463,7 @@ export class GraphView extends BasesView {
       "breaks_to",
       "restarts_to",
       "rollup_to",
+      "compensates",
     ] as const) {
       const propertyName = this.getGraphReferenceListPropertyName(
         frontmatter,
@@ -3735,24 +3786,135 @@ export class GraphView extends BasesView {
   }
 
   private async persistGraphNodePositions(nodes: GraphNode[]): Promise<void> {
-    for (const node of nodes) {
-      this.pendingGraphPositions.set(node.file.path, {
-        x: Math.round(node.x),
-        y: Math.round(node.y),
-      });
-    }
-
-    await Promise.all(
-      nodes.map((node) =>
-        this.app.fileManager.processFrontMatter(
-          node.file,
-          (frontmatter: Record<string, unknown>) => {
-            frontmatter[GRAPH_POSITION_PROPERTY_X] = Math.round(node.x);
-            frontmatter[GRAPH_POSITION_PROPERTY_Y] = Math.round(node.y);
-          },
-        ),
-      ),
+    this.applyGraphNodePositions(
+      nodes.map((node) => ({ path: node.file.path, x: node.x, y: node.y })),
+      nodes.length > 1
+        ? `Move ${nodes.length} nodes`
+        : `Move ${nodes[0]?.title ?? "node"}`,
     );
+  }
+
+  /**
+   * Writes node positions to the graph view config and records one undoable
+   * layout-history entry. Used by drag and by Organize. An optimistic
+   * `pendingGraphPositions` overlay keeps the view correct until the config
+   * write round-trips through `onDataUpdated`.
+   */
+  private applyGraphNodePositions(
+    updates: { path: string; x: number; y: number }[],
+    label: string,
+  ): void {
+    if (updates.length === 0) return;
+    const positions = { ...this.getGraphNodePositions() };
+    const before: Record<string, { x: number; y: number } | null> = {};
+    const after: Record<string, { x: number; y: number }> = {};
+    for (const update of updates) {
+      const existing = positions[update.path];
+      before[update.path] = existing ? { ...existing } : null;
+      const point = { x: Math.round(update.x), y: Math.round(update.y) };
+      positions[update.path] = point;
+      after[update.path] = point;
+      this.pendingGraphPositions.set(update.path, point);
+    }
+    this.pushLayoutHistory(label, { before, after });
+    this.config?.set(CONFIG_KEY_GRAPH_NODE_POSITIONS, positions);
+  }
+
+  private pushLayoutHistory(
+    label: string,
+    positions: GraphPositionChange,
+  ): void {
+    this.graphUndoStack.push({ label, files: [], positions });
+    if (this.graphUndoStack.length > GRAPH_HISTORY_LIMIT) {
+      this.graphUndoStack.shift();
+    }
+    this.graphRedoStack = [];
+    this.updateGraphHistoryButtons();
+  }
+
+  private applyPositionHistory(
+    change: GraphPositionChange,
+    useBefore: boolean,
+  ): void {
+    const positions = { ...this.getGraphNodePositions() };
+    const target = useBefore ? change.before : change.after;
+    for (const path of Object.keys(target)) {
+      const value = target[path];
+      if (value === null) {
+        delete positions[path];
+        this.pendingGraphPositions.delete(path);
+      } else {
+        positions[path] = value;
+        this.pendingGraphPositions.set(path, value);
+      }
+    }
+    this.config?.set(CONFIG_KEY_GRAPH_NODE_POSITIONS, positions);
+  }
+
+  // --- Organize (algorithmic layout, see GRAPH_ARCHITECTURE_PLAN.md) ---------
+
+  /** Builds a layout-engine tree from a node's (visible) containment subtree. */
+  private buildLayoutNode(node: GraphNode, seen: Set<string>): LayoutNode {
+    seen.add(node.file.path);
+    return {
+      id: node.file.path,
+      title: node.title,
+      order: this.getOrder(node.file),
+      dependsOn: node.predecessors.map((predecessor) => predecessor.file.path),
+      children: node.children
+        .filter((child) => !seen.has(child.file.path))
+        .map((child) => this.buildLayoutNode(child, seen)),
+    };
+  }
+
+  /**
+   * Organizes a node's containment subtree with the layout engine, anchored on
+   * the clicked node (it keeps its position; descendants reflow around it). The
+   * write is one undoable layout-history entry.
+   */
+  private organizeSubtree(
+    node: GraphNode,
+    orientation: LayoutOrientation,
+    siblingOrder: LayoutSiblingOrder,
+  ): void {
+    if (node.children.length === 0) return;
+    const root = this.buildLayoutNode(node, new Set<string>());
+    const topDown = orientation === "top-down";
+    const positions = computeSubtreeLayout(root, {
+      orientation,
+      siblingOrder,
+      levelGap: topDown ? 220 : 320,
+      columnGap: topDown ? 280 : 150,
+      anchor: { x: node.x, y: node.y },
+    });
+    const updates = [...positions].map(([path, point]) => ({
+      path,
+      x: point.x,
+      y: point.y,
+    }));
+    this.applyGraphNodePositions(updates, `Organize ${node.title}`);
+    new Notice(`Organized ${updates.length} nodes under "${node.title}"`);
+    this.render();
+  }
+
+  /** Mirrors a node's containment subtree about its own bounding box. */
+  private mirrorSubtree(
+    node: GraphNode,
+    axis: "vertical" | "horizontal",
+  ): void {
+    const subtree = [node, ...this.getContainmentDescendants(node)];
+    const current: PositionMap = new Map(
+      subtree.map((member) => [member.file.path, { x: member.x, y: member.y }]),
+    );
+    const flipped =
+      axis === "vertical" ? mirrorVertical(current) : mirrorHorizontal(current);
+    const updates = [...flipped].map(([path, point]) => ({
+      path,
+      x: point.x,
+      y: point.y,
+    }));
+    this.applyGraphNodePositions(updates, `Mirror ${node.title}`);
+    this.render();
   }
 
   private async toggleGraphCollapse(node: GraphNode): Promise<void> {
@@ -4138,6 +4300,60 @@ export class GraphView extends BasesView {
             });
         });
       }
+    }
+    if (sourceNode.children.length > 0) {
+      menu.addSeparator();
+      menu.addItem((item) => {
+        item.setTitle("Organize subtree").setIcon("lucide-layout-dashboard");
+        const submenu = (
+          item as MenuItem & { setSubmenu: () => Menu }
+        ).setSubmenu();
+        submenu.addItem((sub) =>
+          sub
+            .setTitle("Tidy — top-down")
+            .setIcon("lucide-chevrons-down")
+            .onClick(() =>
+              this.organizeSubtree(sourceNode, "top-down", "natural"),
+            ),
+        );
+        submenu.addItem((sub) =>
+          sub
+            .setTitle("Tidy — left-to-right")
+            .setIcon("lucide-chevrons-right")
+            .onClick(() =>
+              this.organizeSubtree(sourceNode, "left-right", "natural"),
+            ),
+        );
+        submenu.addItem((sub) =>
+          sub
+            .setTitle("Layered — gated →, subtree ↓")
+            .setIcon("lucide-network")
+            .onClick(() =>
+              this.organizeSubtree(sourceNode, "top-down", "gating"),
+            ),
+        );
+        submenu.addItem((sub) =>
+          sub
+            .setTitle("Layered — gated ↓, subtree →")
+            .setIcon("lucide-network")
+            .onClick(() =>
+              this.organizeSubtree(sourceNode, "left-right", "gating"),
+            ),
+        );
+        submenu.addSeparator();
+        submenu.addItem((sub) =>
+          sub
+            .setTitle("Mirror vertical")
+            .setIcon("lucide-flip-vertical-2")
+            .onClick(() => this.mirrorSubtree(sourceNode, "vertical")),
+        );
+        submenu.addItem((sub) =>
+          sub
+            .setTitle("Mirror horizontal")
+            .setIcon("lucide-flip-horizontal-2")
+            .onClick(() => this.mirrorSubtree(sourceNode, "horizontal")),
+        );
+      });
     }
     menu.addSeparator();
     menu.addItem((item) => {
@@ -4650,6 +4866,7 @@ export class GraphView extends BasesView {
       breaksToKeys: [],
       restartsToKeys: [],
       rollupToKeys: [],
+      compensatesKeys: [],
       nodeType,
       workflow,
       collapsed: false,
@@ -4661,6 +4878,9 @@ export class GraphView extends BasesView {
       restartTargets: [],
       rollupTargets: [],
       members: [],
+      compensatesTargets: [],
+      compensatedBy: [],
+      excludedFromFold: false,
       kindExplicit: null,
       kind: "work",
       executorExplicit: null,
@@ -4896,6 +5116,7 @@ export class GraphView extends BasesView {
         breaksToKeys: this.getBreaksToKeys(file),
         restartsToKeys: this.getRestartsToKeys(file),
         rollupToKeys: this.getRollupToKeys(file),
+        compensatesKeys: this.getCompensatesKeys(file),
         nodeType: this.getNodeType(file),
         workflow: this.getWorkflow(file),
         collapsed: this.isGraphCollapsed(file),
@@ -4907,6 +5128,9 @@ export class GraphView extends BasesView {
         restartTargets: [],
         rollupTargets: [],
         members: [],
+        compensatesTargets: [],
+        compensatedBy: [],
+        excludedFromFold: false,
         kindExplicit: this.getGraphKind(file),
         kind: "work",
         executorExplicit: this.getGraphExecutor(file),
@@ -4966,6 +5190,15 @@ export class GraphView extends BasesView {
         node.rollupTargets.push(scope);
         scope.members.push(node);
       }
+      // Compensation (saga): `compensates` links a rollback/mitigation node to
+      // the effecting node it undoes; the effecting node discovers its
+      // compensations via the reverse edge.
+      for (const compensatesKey of node.compensatesKeys) {
+        const effecting = nodesByIdentity.get(compensatesKey);
+        if (!effecting || effecting.file.path === node.file.path) continue;
+        node.compensatesTargets.push(effecting);
+        effecting.compensatedBy.push(node);
+      }
     }
 
     for (const node of nodes) {
@@ -4978,6 +5211,10 @@ export class GraphView extends BasesView {
 
     for (const node of nodes) {
       node.descendantCount = this.getDescendantCount(node);
+      // A compensation is out-of-band: exclude it from its parent's fold (and,
+      // below, from sibling chains, the execution partition, and — when dormant
+      // — visibility).
+      node.excludedFromFold = node.compensatesTargets.length > 0;
     }
 
     this.assignNodeKinds(nodes);
@@ -4995,7 +5232,8 @@ export class GraphView extends BasesView {
     }
 
     const visibleNodes = nodes.filter(
-      (node) => !hiddenPaths.has(node.file.path),
+      (node) =>
+        !hiddenPaths.has(node.file.path) && !this.isDormantCompensation(node),
     );
     const visiblePaths = new Set(visibleNodes.map((node) => node.file.path));
     for (const node of visibleNodes) {
@@ -5122,7 +5360,12 @@ export class GraphView extends BasesView {
 
     const edges: GraphEdge[] = [];
     for (const node of nodes) {
-      const childChains = this.getSiblingChains(node.children);
+      // Compensations are out-of-band (failure-triggered branches), so they are
+      // excluded from the forward sibling chain — no requirement-start/return,
+      // and they never act as the chain terminal.
+      const childChains = this.getSiblingChains(
+        node.children.filter((child) => !this.isCompensationNode(child)),
+      );
       for (const chain of childChains) {
         const firstChild = chain[0];
         const lastChild = chain[chain.length - 1];
@@ -5150,6 +5393,14 @@ export class GraphView extends BasesView {
       // Membership (manual aggregation): the node rolls up into each scope.
       for (const scope of node.rollupTargets) {
         edges.push({ from: node, to: scope, kind: "membership" });
+      }
+      // Compensation (saga): when a declared compensation is live (triggered by
+      // a failure), draw a rollback edge from the effecting node to its
+      // mitigation. Latent (un-triggered) compensations are not drawn.
+      for (const compensation of node.compensatedBy) {
+        if (this.isLiveGraphState(compensation.state)) {
+          edges.push({ from: node, to: compensation, kind: "compensation" });
+        }
       }
       // Authored `breaks_to` links only render when the source is genuinely
       // failed (a real triggered break). Dormant authored breaks are not drawn —
@@ -5286,11 +5537,85 @@ export class GraphView extends BasesView {
    */
   private assignNodeStates(nodes: GraphNode[]): void {
     const parentByPath = this.getResolvedParentsByPath(nodes);
-    const memo = new Map<string, GraphNodeState>();
-    const inProgress = new Set<string>();
+    engineDeriveStates(
+      nodes,
+      (node) => parentByPath.get((node as GraphNode).file.path) ?? null,
+    );
+    this.applyCompensationStates(nodes, parentByPath);
+  }
+
+  /** A node that undoes an effecting node (`compensates`). */
+  private isCompensationNode(node: GraphNode): boolean {
+    return node.compensatesTargets.length > 0;
+  }
+
+  private isDormantCompensation(node: GraphNode): boolean {
+    return this.isCompensationNode(node) && node.state === "idle";
+  }
+
+  /**
+   * Compensation (saga) state — derived out-of-band, not from forward gating.
+   * A compensation is `idle` (dormant; hidden) unless **triggered**: its
+   * effecting target's effect is live (`completed`) AND a genuine failure has
+   * escalated through that target's container (the same stage/ring). Triggered →
+   * `active` frontier; already-run → `completed`. Overrides the engine's generic
+   * derivation (a gateless compensation would otherwise read `active`).
+   * See GRAPH_ARCHITECTURE_PLAN.md "Compensation (saga)".
+   */
+  private applyCompensationStates(
+    nodes: GraphNode[],
+    parentByPath: Map<string, GraphNode>,
+  ): void {
+    const brokenScopePaths = this.computeBrokenScopePaths(nodes, parentByPath);
     for (const node of nodes) {
-      node.state = this.deriveNodeState(node, parentByPath, memo, inProgress);
+      if (!this.isCompensationNode(node)) continue;
+      if (this.isCompletedStatus(node.status)) {
+        node.state = "completed";
+      } else if (this.isGenuinelyFailedStatus(node.status)) {
+        node.state = "interrupted";
+      } else {
+        node.state = this.isCompensationTriggered(
+          node,
+          parentByPath,
+          brokenScopePaths,
+        )
+          ? "active"
+          : "idle";
+      }
     }
+  }
+
+  /** Paths of every containment ancestor of a genuinely-failed leaf. */
+  private computeBrokenScopePaths(
+    nodes: GraphNode[],
+    parentByPath: Map<string, GraphNode>,
+  ): Set<string> {
+    const broken = new Set<string>();
+    for (const node of nodes) {
+      if (!this.isGenuinelyFailedStatus(node.status)) continue;
+      const seen = new Set<string>([node.file.path]);
+      let current = parentByPath.get(node.file.path) ?? null;
+      while (current && !seen.has(current.file.path)) {
+        seen.add(current.file.path);
+        broken.add(current.file.path);
+        current = parentByPath.get(current.file.path) ?? null;
+      }
+    }
+    return broken;
+  }
+
+  private isCompensationTriggered(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+    brokenScopePaths: Set<string>,
+  ): boolean {
+    return node.compensatesTargets.some((effecting) => {
+      if (effecting.state !== "completed") return false;
+      const effectingParent = parentByPath.get(effecting.file.path);
+      return effectingParent
+        ? brokenScopePaths.has(effectingParent.file.path)
+        : false;
+    });
   }
 
   /**
@@ -5307,15 +5632,7 @@ export class GraphView extends BasesView {
    * declare `kind: group` explicitly — there is no label-name fallback.
    */
   private assignNodeKinds(nodes: GraphNode[]): void {
-    for (const node of nodes) {
-      node.kind = node.kindExplicit ?? this.inferNodeKind(node);
-    }
-  }
-
-  private inferNodeKind(node: GraphNode): GraphNodeKind {
-    if (node.members.length > 0) return "group";
-    if (node.children.length > 0) return "process";
-    return "work";
+    engineAssignNodeKinds(nodes);
   }
 
   /**
@@ -5393,145 +5710,9 @@ export class GraphView extends BasesView {
     );
   }
 
-  private deriveNodeState(
-    node: GraphNode,
-    parentByPath: Map<string, GraphNode>,
-    memo: Map<string, GraphNodeState>,
-    inProgress: Set<string>,
-  ): GraphNodeState {
-    const cached = memo.get(node.file.path);
-    if (cached) return cached;
-    // Cycle guard: a node referenced while it is still being computed resolves
-    // to a neutral state so derivation terminates on malformed graphs.
-    if (inProgress.has(node.file.path)) return "idle";
-    inProgress.add(node.file.path);
-
-    const aggregationChildren = this.getAggregationChildren(node);
-    const state =
-      aggregationChildren.length > 0
-        ? this.deriveGroupState(
-            aggregationChildren.map((child) =>
-              this.deriveNodeState(child, parentByPath, memo, inProgress),
-            ),
-          )
-        : this.deriveLeafState(node, parentByPath, memo, inProgress);
-
-    inProgress.delete(node.file.path);
-    memo.set(node.file.path, state);
-    return state;
-  }
-
-  /**
-   * The set a node derives its group state from: containment `children` for
-   * normal nodes, plus `members` (incoming `rollup_to`) for scope/aggregation
-   * nodes. A scope thus rolls up the state of everything that belongs to it.
-   */
-  private getAggregationChildren(node: GraphNode): GraphNode[] {
-    if (this.isScopeNode(node)) {
-      return node.children.length > 0
-        ? [...node.children, ...node.members]
-        : node.members;
-    }
-    return node.children;
-  }
-
   /** Aggregation/scope nodes: pure rollup containers (no work state machine). */
   private isScopeNode(node: GraphNode): boolean {
-    return node.kind === "group";
-  }
-
-  /**
-   * Leaf (work-node) state read from its stored status. A ready leaf with no
-   * explicit lifecycle status falls through to the computed active frontier
-   * (gating prerequisites satisfied) or `waiting` (prerequisites pending).
-   */
-  private deriveLeafState(
-    node: GraphNode,
-    parentByPath: Map<string, GraphNode>,
-    memo: Map<string, GraphNodeState>,
-    inProgress: Set<string>,
-  ): GraphNodeState {
-    if (this.isInvalidatedStatus(node.status)) return "invalidated";
-    if (this.isCancelledStatus(node.status)) return "cancelled";
-    if (this.isInterruptedStatus(node.status)) return "interrupted";
-    if (this.isActiveStatus(node.status)) return "active";
-    if (this.isAwaitingStatus(node.status)) return "awaiting";
-    if (this.isCompletedStatus(node.status)) return "completed";
-    if (this.isBlockedStatus(node.status)) return "blocked";
-    if (
-      !this.areGatingPrerequisitesTerminal(node, parentByPath, memo, inProgress)
-    ) {
-      return "waiting";
-    }
-    return "active";
-  }
-
-  /**
-   * Group-state fold (GRAPH_SEMANTICS_SPEC.md Layer A) over the children's
-   * derived states. Precedence (decreasing):
-   * In Progress > Completed > Cancelled/Invalidated > Planned.
-   */
-  private deriveGroupState(childStates: GraphNodeState[]): GraphNodeState {
-    if (childStates.length === 0) return "idle";
-    const isLive = (state: GraphNodeState): boolean =>
-      state === "active" ||
-      state === "in-progress" ||
-      state === "awaiting" ||
-      state === "interrupted" ||
-      state === "blocked";
-    if (childStates.some(isLive)) return "in-progress";
-    if (childStates.every((state) => state === "completed")) return "completed";
-    if (childStates.every((state) => state === "cancelled")) return "cancelled";
-    if (childStates.every((state) => state === "invalidated")) {
-      return "invalidated";
-    }
-    if (
-      childStates.every(
-        (state) => state === "cancelled" || state === "invalidated",
-      )
-    ) {
-      return childStates.some((state) => state === "invalidated")
-        ? "invalidated"
-        : "cancelled";
-    }
-    // Mixed completed/planned with no live work: not finished, no active
-    // frontier — render as waiting (Planned).
-    return "waiting";
-  }
-
-  /**
-   * True when every gating prerequisite of a node — its own `depends_on`
-   * predecessors plus the predecessors of each containment ancestor — is in a
-   * terminal DERIVED state. Uses derived states (not stored status) so group
-   * prerequisites resolve correctly under the derived model.
-   */
-  private areGatingPrerequisitesTerminal(
-    node: GraphNode,
-    parentByPath: Map<string, GraphNode>,
-    memo: Map<string, GraphNodeState>,
-    inProgress: Set<string>,
-  ): boolean {
-    const isTerminal = (state: GraphNodeState): boolean =>
-      state === "completed" ||
-      state === "interrupted" ||
-      state === "invalidated" ||
-      state === "cancelled";
-    const seen = new Set<string>();
-    let current: GraphNode | null = node;
-    while (current && !seen.has(current.file.path)) {
-      seen.add(current.file.path);
-      for (const predecessor of current.predecessors) {
-        const state = this.deriveNodeState(
-          predecessor,
-          parentByPath,
-          memo,
-          inProgress,
-        );
-        if (!isTerminal(state)) return false;
-      }
-      current = parentByPath.get(current.file.path) ?? null;
-    }
-    return true;
+    return engineIsScopeNode(node);
   }
 
   private getResolvedParentsByPath(nodes: GraphNode[]): Map<string, GraphNode> {
@@ -6555,6 +6736,11 @@ export class GraphView extends BasesView {
     return this.normalizeReferences(frontmatter?.rollup_to);
   }
 
+  private getCompensatesKeys(file: TFile): string[] {
+    const frontmatter = this.getFrontmatter(file);
+    return this.normalizeReferences(frontmatter?.compensates);
+  }
+
   private getTags(file: TFile): string[] {
     const frontmatter = this.getFrontmatter(file);
     const rawTags = frontmatter?.tags;
@@ -6571,24 +6757,11 @@ export class GraphView extends BasesView {
   }
 
   private normalizeReferences(value: unknown): string[] {
-    const rawValues = Array.isArray(value) ? (value as unknown[]) : [value];
-    return rawValues
-      .map((rawValue) => this.normalizeReference(rawValue))
-      .filter((reference): reference is string => reference !== null);
+    return engineNormalizeReferences(value);
   }
 
   private normalizeReference(value: unknown): string | null {
-    const firstValue = Array.isArray(value) ? (value as unknown[])[0] : value;
-    if (typeof firstValue !== "string") return null;
-    let normalized = firstValue.trim();
-    if (!normalized) return null;
-
-    const linkMatch = normalized.match(/^\[\[([^|\]]+)(?:\|[^\]]+)?\]\]$/);
-    if (linkMatch) normalized = linkMatch[1];
-    normalized = normalized.replace(/\.md$/i, "");
-    const slashIndex = normalized.lastIndexOf("/");
-    if (slashIndex >= 0) normalized = normalized.slice(slashIndex + 1);
-    return normalized.toLowerCase();
+    return engineNormalizeReference(value);
   }
 
   private normalizeText(value: unknown): string | null {
@@ -6647,62 +6820,77 @@ export class GraphView extends BasesView {
       : Number.POSITIVE_INFINITY;
   }
 
+  /** Node positions live in the graph view config (not note frontmatter). */
+  private getGraphNodePositions(): Record<string, { x: number; y: number }> {
+    const raw = this.config?.get(CONFIG_KEY_GRAPH_NODE_POSITIONS);
+    return raw && typeof raw === "object"
+      ? (raw as Record<string, { x: number; y: number }>)
+      : {};
+  }
+
   private getSavedGraphPosition(
     file: TFile,
     propertyName: string,
   ): number | null {
-    const frontmatter = this.getFrontmatter(file);
-    const pendingPosition = this.pendingGraphPositions.get(file.path);
-    if (pendingPosition) {
-      const savedX = frontmatter?.[GRAPH_POSITION_PROPERTY_X];
-      const savedY = frontmatter?.[GRAPH_POSITION_PROPERTY_Y];
-      if (savedX === pendingPosition.x && savedY === pendingPosition.y) {
+    const axis = propertyName === GRAPH_POSITION_PROPERTY_X ? "x" : "y";
+    const pending = this.pendingGraphPositions.get(file.path);
+    const stored = this.getGraphNodePositions()[file.path];
+    if (pending) {
+      if (stored && stored.x === pending.x && stored.y === pending.y) {
         this.pendingGraphPositions.delete(file.path);
       } else {
-        return propertyName === GRAPH_POSITION_PROPERTY_X
-          ? pendingPosition.x
-          : pendingPosition.y;
+        return pending[axis];
       }
     }
-
-    const value = frontmatter?.[propertyName];
+    if (
+      stored &&
+      typeof stored[axis] === "number" &&
+      Number.isFinite(stored[axis])
+    ) {
+      return stored[axis];
+    }
+    // Legacy migration-read: fall back to per-note frontmatter graph_x/graph_y
+    // (older vaults). New writes only go to the config map.
+    const value = this.getFrontmatter(file)?.[propertyName];
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
 
   private isCompletedStatus(status: string | null): boolean {
-    const normalizedStatus = status?.trim().toLowerCase();
-    return normalizedStatus === "completed" || normalizedStatus === "done";
+    return engineIsCompletedStatus(status);
   }
 
   private isInterruptedStatus(status: string | null): boolean {
-    const normalizedStatus = status?.trim().toLowerCase();
-    return normalizedStatus === "interrupted" || normalizedStatus === "failed";
+    return engineIsInterruptedStatus(status);
   }
 
   private isInvalidatedStatus(status: string | null): boolean {
-    const normalizedStatus = status?.trim().toLowerCase();
-    return normalizedStatus === "invalidated" || normalizedStatus === "skipped";
+    return engineIsInvalidatedStatus(status);
   }
 
   private isCancelledStatus(status: string | null): boolean {
-    const normalizedStatus = status?.trim().toLowerCase();
-    return normalizedStatus === "cancelled" || normalizedStatus === "canceled";
+    return engineIsCancelledStatus(status);
   }
 
   private isAwaitingStatus(status: string | null): boolean {
-    return status?.trim().toLowerCase() === "awaiting";
+    return engineIsAwaitingStatus(status);
   }
 
   private isBlockedStatus(status: string | null): boolean {
-    return status?.trim().toLowerCase() === "blocked";
+    return engineIsBlockedStatus(status);
   }
 
   private isActiveStatus(status: string | null): boolean {
-    const normalizedStatus = status?.trim().toLowerCase();
+    return engineIsActiveStatus(status);
+  }
+
+  /** Live (non-terminal, on-the-frontier) derived states. */
+  private isLiveGraphState(state: GraphNodeState): boolean {
     return (
-      normalizedStatus === "in progress" ||
-      normalizedStatus === "doing" ||
-      normalizedStatus === "active"
+      state === "active" ||
+      state === "in-progress" ||
+      state === "awaiting" ||
+      state === "blocked" ||
+      state === "interrupted"
     );
   }
 
