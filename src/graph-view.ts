@@ -199,6 +199,7 @@ const GRAPH_TEMPLATE_DEFINITIONS: GraphTemplateDefinition[] = [
       "  enable feature flag",
       "  await feature flag rollout",
       "  verify",
+      "  disable feature flag (compensates enable)",
     ],
   },
   {
@@ -222,9 +223,14 @@ interface GraphNode {
   restartsToKeys: string[];
   rollupToKeys: string[];
   // Compensation (saga). `compensates` points from a rollback/mitigation node to
-  // the effecting node it undoes; a node is "effecting" by inference (something
-  // compensates it). See GRAPH_ARCHITECTURE_PLAN.md "Compensation (saga)".
+  // the effecting node it undoes. A node is "effecting" either by inference
+  // (something compensates it) or by an explicit `effecting: true` flag — the
+  // latter lets the graph detect a *missing* compensation (Phase 3 attention).
+  // See GRAPH_ARCHITECTURE_PLAN.md "Compensation (saga)".
   compensatesKeys: string[];
+  // Explicit `effecting: true`: this node performs a side-effect that should be
+  // undone if its scope fails. Drives the undeclared-compensation attention.
+  effecting: boolean;
   nodeType: string | null;
   workflow: string | null;
   collapsed: boolean;
@@ -240,6 +246,9 @@ interface GraphNode {
   // (this node's effect is undone by these compensations).
   compensatesTargets: GraphNode[];
   compensatedBy: GraphNode[];
+  // Attention signal (Phase 3): a completed effecting node sits in a failed
+  // scope with no declared compensation — a cue to propose/declare one. Derived.
+  needsCompensation: boolean;
   // A compensation is out-of-band: it opts out of its parent's group fold and
   // the forward sequence (it is a failure-triggered branch, not a step).
   excludedFromFold: boolean;
@@ -343,7 +352,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.13.6";
+const GRAPH_BUILD_VERSION = "2026.06.13.8";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -370,6 +379,7 @@ const GRAPH_POSITION_PROPERTY_X = "graph_x";
 const GRAPH_POSITION_PROPERTY_Y = "graph_y";
 const GRAPH_COLLAPSED_PROPERTY = "graph_collapsed";
 const GRAPH_LOCKED_PROPERTY = "graph_locked";
+const GRAPH_EFFECTING_PROPERTY = "effecting";
 const CONFIG_KEY_GRAPH_VIEWPORT = "graphViewport";
 const CONFIG_KEY_GRAPH_WORLD = "graphWorld";
 const CONFIG_KEY_GRAPH_NODE_POSITIONS = "graphNodePositions";
@@ -1718,6 +1728,19 @@ export class GraphView extends BasesView {
         },
       });
       setIcon(mitigationEl, "lucide-undo-2");
+    }
+
+    // Attention badge (Phase 3): an effecting node with a live side-effect in a
+    // failed scope but no declared compensation — a cue to propose a rollback.
+    if (node.needsCompensation) {
+      const attentionEl = nodeEl.createSpan({
+        cls: "base-board-graph-attention",
+        attr: {
+          title:
+            "Unmitigated side-effect \u2014 this completed change has no declared compensation for the failure in its scope",
+        },
+      });
+      setIcon(attentionEl, "lucide-alert-triangle");
     }
 
     const titleEl = nodeEl.createDiv({
@@ -4821,6 +4844,7 @@ export class GraphView extends BasesView {
         status: "To Do",
         parent: this.getWikiLink(ringNode.file),
         dependsOn: [this.getWikiLink(previous)],
+        effecting: true,
         tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
         ...this.getTemplateChildPosition(origin, -0.5, 1),
       });
@@ -4833,6 +4857,21 @@ export class GraphView extends BasesView {
         dependsOn: [this.getWikiLink(enableFlag)],
         tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
         ...this.getTemplateChildPosition(origin, 0.5, 1),
+      });
+      // Compensation (saga): ship a dormant "disable feature flag" that
+      // undoes the enable. It is out-of-band (compensates only, no depends_on),
+      // so it stays hidden until a failure escalates through the ring, then
+      // derives active as a parallel mitigation. See GRAPH_ARCHITECTURE_PLAN.md
+      // "Compensation (saga)".
+      await this.createTemplateNode({
+        title: `${title} - disable feature flag`,
+        displayTitle: "disable feature flag",
+        type: "disable",
+        status: "To Do",
+        parent: this.getWikiLink(ringNode.file),
+        compensates: [this.getWikiLink(enableFlag)],
+        tags: sourceNode ? this.getTags(sourceNode.file) : this.getRootTags(),
+        ...this.getTemplateChildPosition(origin, -0.5, 2),
       });
     }
 
@@ -4867,6 +4906,7 @@ export class GraphView extends BasesView {
       restartsToKeys: [],
       rollupToKeys: [],
       compensatesKeys: [],
+      effecting: false,
       nodeType,
       workflow,
       collapsed: false,
@@ -4880,6 +4920,7 @@ export class GraphView extends BasesView {
       members: [],
       compensatesTargets: [],
       compensatedBy: [],
+      needsCompensation: false,
       excludedFromFold: false,
       kindExplicit: null,
       kind: "work",
@@ -4948,6 +4989,8 @@ export class GraphView extends BasesView {
     parent?: string;
     workflow?: string;
     dependsOn?: string[];
+    compensates?: string[];
+    effecting?: boolean;
     tags?: string[];
     locked?: boolean;
     x?: number;
@@ -4982,6 +5025,9 @@ export class GraphView extends BasesView {
     if (options.locked) {
       lines.push(`${GRAPH_LOCKED_PROPERTY}: true`);
     }
+    if (options.effecting) {
+      lines.push(`${GRAPH_EFFECTING_PROPERTY}: true`);
+    }
     if (options.parent) {
       lines.push(`parent: ${this.formatYamlScalar(options.parent)}`);
     }
@@ -4995,6 +5041,15 @@ export class GraphView extends BasesView {
       lines.push("depends_on:");
       for (const dependency of options.dependsOn) {
         lines.push(`  - ${this.formatYamlScalar(dependency)}`);
+      }
+    }
+    // Compensation (saga): a dormant rollback node links ONLY via `compensates`
+    // (what it undoes) — never `depends_on` — so it stays out-of-band and
+    // hidden until a failure escalates through its target's container.
+    if (options.compensates && options.compensates.length > 0) {
+      lines.push("compensates:");
+      for (const target of options.compensates) {
+        lines.push(`  - ${this.formatYamlScalar(target)}`);
       }
     }
     if (options.tags && options.tags.length > 0) {
@@ -5117,6 +5172,7 @@ export class GraphView extends BasesView {
         restartsToKeys: this.getRestartsToKeys(file),
         rollupToKeys: this.getRollupToKeys(file),
         compensatesKeys: this.getCompensatesKeys(file),
+        effecting: this.getGraphEffecting(file),
         nodeType: this.getNodeType(file),
         workflow: this.getWorkflow(file),
         collapsed: this.isGraphCollapsed(file),
@@ -5130,6 +5186,7 @@ export class GraphView extends BasesView {
         members: [],
         compensatesTargets: [],
         compensatedBy: [],
+        needsCompensation: false,
         excludedFromFold: false,
         kindExplicit: this.getGraphKind(file),
         kind: "work",
@@ -5541,7 +5598,9 @@ export class GraphView extends BasesView {
       nodes,
       (node) => parentByPath.get((node as GraphNode).file.path) ?? null,
     );
-    this.applyCompensationStates(nodes, parentByPath);
+    const brokenScopePaths = this.computeBrokenScopePaths(nodes, parentByPath);
+    this.applyCompensationStates(nodes, parentByPath, brokenScopePaths);
+    this.applyAttentionSignals(nodes, parentByPath, brokenScopePaths);
   }
 
   /** A node that undoes an effecting node (`compensates`). */
@@ -5565,8 +5624,8 @@ export class GraphView extends BasesView {
   private applyCompensationStates(
     nodes: GraphNode[],
     parentByPath: Map<string, GraphNode>,
+    brokenScopePaths: Set<string>,
   ): void {
-    const brokenScopePaths = this.computeBrokenScopePaths(nodes, parentByPath);
     for (const node of nodes) {
       if (!this.isCompensationNode(node)) continue;
       if (this.isCompletedStatus(node.status)) {
@@ -5616,6 +5675,46 @@ export class GraphView extends BasesView {
         ? brokenScopePaths.has(effectingParent.file.path)
         : false;
     });
+  }
+
+  /**
+   * Attention signal (Compensation Phase 3). Flags an effecting node whose live
+   * side-effect is now stranded by a failure but has **no declared compensation**
+   * — the graph cannot invent the domain rollback, so it raises a cue for a
+   * human/agent to propose one. Declared compensations are already handled by
+   * `applyCompensationStates`, so they never raise this. Pure recompute.
+   */
+  private applyAttentionSignals(
+    nodes: GraphNode[],
+    parentByPath: Map<string, GraphNode>,
+    brokenScopePaths: Set<string>,
+  ): void {
+    for (const node of nodes) {
+      node.needsCompensation = this.isUnmitigatedEffectingFailure(
+        node,
+        parentByPath,
+        brokenScopePaths,
+      );
+    }
+  }
+
+  /**
+   * True when an explicitly-`effecting` node has a live (completed) side-effect,
+   * a genuine failure has escalated through its container, and nothing is
+   * declared to undo it (`compensatedBy` empty). The absence of a `compensates`
+   * edge is exactly why this needs an explicit `effecting` flag — a missing
+   * compensation is otherwise indistinguishable from "no side-effect".
+   */
+  private isUnmitigatedEffectingFailure(
+    node: GraphNode,
+    parentByPath: Map<string, GraphNode>,
+    brokenScopePaths: Set<string>,
+  ): boolean {
+    if (!node.effecting) return false;
+    if (node.compensatedBy.length > 0) return false;
+    if (!this.isCompletedStatus(node.status)) return false;
+    const parent = parentByPath.get(node.file.path);
+    return parent ? brokenScopePaths.has(parent.file.path) : false;
   }
 
   /**
@@ -6714,6 +6813,11 @@ export class GraphView extends BasesView {
     if (value === true) return true;
     if (value === false) return false;
     return null;
+  }
+
+  /** Explicit `effecting: true` — this node performs an undoable side-effect. */
+  private getGraphEffecting(file: TFile): boolean {
+    return this.getFrontmatter(file)?.[GRAPH_EFFECTING_PROPERTY] === true;
   }
 
   private getDependsOnKeys(file: TFile): string[] {

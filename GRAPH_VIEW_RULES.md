@@ -426,7 +426,7 @@ canvas the full set is offered.
 | `iteration` | Iteration | `lucide-refresh-cw` | Iteration → dev, rollout |
 | `dev` | Dev | `lucide-code-2` | dev → design, implementation, review |
 | `rollout-repo` | Rollout repo | `lucide-radio-tower` | rollout → repo → stage, canary, pilot, broad |
-| `ring-flagged` | Flagged ring | `lucide-flag` | ring → await build rollout, enable feature flag, await feature flag rollout, verify |
+| `ring-flagged` | Flagged ring | `lucide-flag` | ring → await build rollout, enable feature flag, await feature flag rollout, verify, **disable feature flag** (dormant compensation: `compensates` the enable, hidden until a failure escalates through the ring) |
 | `ring-basic` | Basic ring | `lucide-check-circle-2` | ring → await build rollout, verify |
 
 ---

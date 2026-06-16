@@ -3076,6 +3076,27 @@
   height: 12px;
 }
 
+/* Attention badge (bottom-left): an effecting node whose live side-effect is
+   stranded by a failure with no declared compensation (Compensation Phase 3). */
+.base-board-graph-attention {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background-color: var(--background-primary);
+  color: var(--text-error, #e5534b);
+}
+
+.base-board-graph-attention svg {
+  width: 12px;
+  height: 12px;
+}
+
 .base-board-graph-node-title {
   padding-right: 24px;
   color: var(--text-normal);

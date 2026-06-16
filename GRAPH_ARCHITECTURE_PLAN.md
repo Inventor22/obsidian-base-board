@@ -384,8 +384,12 @@ judgment?* No → graph; yes → harness.
 - **Relation `compensates`** (list) on the rollback/mitigation node → the
   effecting node it undoes (e.g. `Disable flag` `compensates: [[Enable flag]]`).
   Matches the "responder declares" convention of `depends_on`/`breaks_to`.
-- **"Effecting" is inferred** — a node is effecting iff something compensates it
-  (no extra `effecting:` flag).
+- **"Effecting" is inferred for the *declared* case** — a node is effecting iff
+  something compensates it. But detecting a **missing** compensation needs a
+  positive signal (absence of `compensates` is indistinguishable from
+  "no side-effect"), so an explicit **`effecting: true`** flag marks a node that
+  performs an undoable side-effect. Templates set it (the enable-flag node);
+  it is what drives the Phase 3 attention signal.
 
 ### A compensation is out-of-band (not a forward step)
 
@@ -410,8 +414,8 @@ is derived out-of-band:
 |-------|------|--------|
 | 1 | `compensates` relation (parse + link + reverse `compensatedBy`); compensation is **out-of-band** — `excludedFromFold`, excluded from sibling-chains + execution partition; state derived **dormant(`idle`, hidden) / active(triggered) / completed** via `applyCompensationStates` + `computeBrokenScopePaths` (failure-in-scope), NOT via `depends_on`. | ✅ *done (build 2026.06.13.6)* |
 | 1.5 | Render: orange **rollback edge** (effecting → compensation) when triggered + mitigation **badge**; derived/non-editable. | ✅ *done (build 2026.06.13.6)* |
-| 2 | **Template-ify** — bake enable↔disable into the flagged-ring template so every flagged rollout ships a dormant disable that auto-activates. | pending |
-| 3 | **Attention signal** for an effecting failure with **no** declared compensation (agent's cue to propose one). | pending |
+| 2 | **Template-ify** — bake enable↔disable into the flagged-ring template so every flagged rollout ships a dormant disable that auto-activates. | ✅ *done (build 2026.06.13.7)* |
+| 3 | **Attention signal** for an effecting failure with **no** declared compensation (agent's cue to propose one). Explicit **`effecting: true`** flag; `needsCompensation` derived in `applyAttentionSignals` when a completed effecting node sits in a `computeBrokenScopePaths` scope with empty `compensatedBy`; red `lucide-alert-triangle` badge (bottom-left). | ✅ *done (build 2026.06.13.8)* |
 | 4 | Generalise into the **Step C** per-type signal scheduler; compensation handler = its first registered behaviour. | pending |
 
 Iteration spawn (fix-forward) stays a deliberate manual action for now; only the
