@@ -352,7 +352,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.13.8";
+const GRAPH_BUILD_VERSION = "2026.06.16.2";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -415,6 +415,31 @@ const GRAPH_NODE_ANCHOR_SLOTS: GraphNodeAnchorSlot[] = [
   { side: "left", xRatio: 0, yRatio: 1 / 3 },
   { side: "left", xRatio: 0, yRatio: 2 / 3 },
 ];
+
+// ---------------------------------------------------------------------------
+//  Signal scheduler (Step C). A failure at a leaf propagates up the containment
+//  hierarchy as a signal; each node kind applies a bounce policy (pass / absorb
+//  / transform) that decides how far the signal escalates. Registered handlers
+//  then react to the propagated scope — compensation is the first such
+//  behaviour, the undeclared-effecting attention cue the second. This
+//  generalises the M3 failure escalation into a pluggable mechanism.
+//  See GRAPH_ARCHITECTURE_PLAN.md "Boundaries, signals & lenses" (Step C).
+// ---------------------------------------------------------------------------
+type GraphSignalKind = "failure";
+type GraphSignalPolicy = "pass" | "absorb" | "transform";
+
+interface GraphSignalContext {
+  nodes: GraphNode[];
+  parentByPath: Map<string, GraphNode>;
+  // Paths reached by an escalating failure signal: every containment ancestor
+  // of a genuinely-failed leaf, up to the nearest absorbing boundary.
+  failureScope: Set<string>;
+}
+
+interface GraphSignalHandler {
+  readonly id: string;
+  apply(context: GraphSignalContext): void;
+}
 
 export class GraphView extends BasesView {
   type = "graph";
@@ -1650,7 +1675,7 @@ export class GraphView extends BasesView {
     this.positionRenderedGraphNodeEl(nodeEl, node);
     nodeEl.style.setProperty(
       "--graph-node-color",
-      getColumnColor(this.config, node.status),
+      getColumnColor(this.config, this.getNodeColorStatus(node)),
     );
     nodeEl.dataset.filePath = node.file.path;
     nodeEl.setAttr("role", "button");
@@ -5598,9 +5623,55 @@ export class GraphView extends BasesView {
       nodes,
       (node) => parentByPath.get((node as GraphNode).file.path) ?? null,
     );
-    const brokenScopePaths = this.computeBrokenScopePaths(nodes, parentByPath);
-    this.applyCompensationStates(nodes, parentByPath, brokenScopePaths);
-    this.applyAttentionSignals(nodes, parentByPath, brokenScopePaths);
+    this.runSignalScheduler(nodes, parentByPath);
+  }
+
+  /**
+   * Registered signal handlers, applied in order after a signal propagates.
+   * Compensation is the first behaviour (declared rollbacks activate); the
+   * attention cue is second (undeclared effecting failures raise a flag). New
+   * reactions (e.g. iteration spawn) register here rather than being wired
+   * directly into the state derivation. See GRAPH_ARCHITECTURE_PLAN.md Step C.
+   */
+  private readonly signalHandlers: ReadonlyArray<GraphSignalHandler> = [
+    {
+      id: "compensation",
+      apply: (context) =>
+        this.applyCompensationStates(
+          context.nodes,
+          context.parentByPath,
+          context.failureScope,
+        ),
+    },
+    {
+      id: "attention",
+      apply: (context) =>
+        this.applyAttentionSignals(
+          context.nodes,
+          context.parentByPath,
+          context.failureScope,
+        ),
+    },
+  ];
+
+  /**
+   * Step C signal scheduler. Propagates work signals through the containment
+   * hierarchy (currently only `failure`), then dispatches the resulting scope
+   * to each registered handler in order. This generalises the M3 failure
+   * escalation: propagation honours a per-kind bounce policy, and the
+   * compensation / attention reactions are pluggable handlers instead of
+   * hard-wired passes.
+   */
+  private runSignalScheduler(
+    nodes: GraphNode[],
+    parentByPath: Map<string, GraphNode>,
+  ): void {
+    const context: GraphSignalContext = {
+      nodes,
+      parentByPath,
+      failureScope: this.propagateFailureSignals(nodes, parentByPath),
+    };
+    for (const handler of this.signalHandlers) handler.apply(context);
   }
 
   /** A node that undoes an effecting node (`compensates`). */
@@ -5610,6 +5681,20 @@ export class GraphView extends BasesView {
 
   private isDormantCompensation(node: GraphNode): boolean {
     return this.isCompensationNode(node) && node.state === "idle";
+  }
+
+  /**
+   * Status used to derive a node's column colour. Normally the raw status, but
+   * a triggered compensation is `Planned` on disk while its derived state is
+   * `active` — colour it as active so the live rollback reads as frontier (blue)
+   * rather than dormant grey. The orange mitigation edge/badge still mark it as
+   * a rollback. See GRAPH_ARCHITECTURE_PLAN.md "Compensation (saga)".
+   */
+  private getNodeColorStatus(node: GraphNode): string | null {
+    if (this.isCompensationNode(node) && node.state === "active") {
+      return GRAPH_STATUS_ACTIVE;
+    }
+    return node.status;
   }
 
   /**
@@ -5644,23 +5729,50 @@ export class GraphView extends BasesView {
     }
   }
 
-  /** Paths of every containment ancestor of a genuinely-failed leaf. */
-  private computeBrokenScopePaths(
+  /**
+   * Propagates a `failure` signal from every genuinely-failed leaf up the
+   * containment chain, collecting the ancestors it reaches. Escalation stops at
+   * the first ancestor whose kind `absorb`s the signal (the aggregation
+   * boundary), so a failure stays contained within its group/scope instead of
+   * painting the whole portfolio as broken. The collected set is the "failure
+   * scope" consumed by the compensation and attention handlers.
+   */
+  private propagateFailureSignals(
     nodes: GraphNode[],
     parentByPath: Map<string, GraphNode>,
   ): Set<string> {
-    const broken = new Set<string>();
+    const scope = new Set<string>();
     for (const node of nodes) {
       if (!this.isGenuinelyFailedStatus(node.status)) continue;
       const seen = new Set<string>([node.file.path]);
       let current = parentByPath.get(node.file.path) ?? null;
       while (current && !seen.has(current.file.path)) {
         seen.add(current.file.path);
-        broken.add(current.file.path);
+        scope.add(current.file.path);
+        if (this.getSignalPolicy(current, "failure") === "absorb") break;
         current = parentByPath.get(current.file.path) ?? null;
       }
     }
-    return broken;
+    return scope;
+  }
+
+  /**
+   * Per-kind bounce policy for an escalating signal (Step C). A `group`
+   * (scope/aggregation) node `absorb`s a failure — its boundary contains the
+   * signal so it does not escalate into sibling portfolios — while every other
+   * kind lets it `pass` upward. `transform` is reserved for future reshaping
+   * (e.g. a failure becoming a retry at an iteration boundary).
+   */
+  private getSignalPolicy(
+    node: GraphNode,
+    kind: GraphSignalKind,
+  ): GraphSignalPolicy {
+    switch (kind) {
+      case "failure":
+        return node.kind === "group" ? "absorb" : "pass";
+      default:
+        return "pass";
+    }
   }
 
   private isCompensationTriggered(
