@@ -172,11 +172,7 @@ type TimelineCalendarUnit = "hour" | "day" | "week" | "month" | "year";
 type TimelineGridLineTier = "major" | "minor" | "subdivision";
 type TimelineLabelBandRow = "major" | "minor";
 type TimelineLabelFormat =
-  | "auto"
-  | "day-number"
-  | "month-day"
-  | "month-year"
-  | "weekday-day";
+  "auto" | "day-number" | "month-day" | "month-year" | "weekday-day";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -1482,8 +1478,7 @@ export class TimelineView extends BasesView {
 
   private getTaskTitle(entry: BasesEntry, file: TFile): string {
     const titleProp = this.config.get("cardTitleProperty") as
-      | string
-      | undefined;
+      string | undefined;
     if (titleProp) {
       const propId = titleProp.startsWith("note.")
         ? titleProp

@@ -32,6 +32,7 @@ export default defineConfig([
     },
     rules: {
       "@typescript-eslint/no-deprecated": "error",
+      "prettier/prettier": ["error", { endOfLine: "auto" }],
     },
   },
 ]);

@@ -48,6 +48,8 @@ export interface EngineNode {
   members: EngineNode[];
   predecessors: EngineNode[];
   rollupTargets: EngineNode[];
+  compensatesKeys?: string[];
+  compensatesTargets?: EngineNode[];
   // Out-of-band nodes (e.g. a dormant/triggered compensation) opt out of their
   // parent's group-state fold: they are not part of the normal forward rollup.
   excludedFromFold?: boolean;
@@ -151,15 +153,32 @@ export function isScopeNode(node: EngineNode): boolean {
   return node.kind === "group";
 }
 
+/** Impact nodes are observational: visible in the graph, inert to work flow. */
+export function isImpactNode(node: EngineNode): boolean {
+  return node.kind === "impact";
+}
+
+export function isCompensationNode(node: EngineNode): boolean {
+  return (
+    (node.compensatesKeys?.length ?? 0) > 0 ||
+    (node.compensatesTargets?.length ?? 0) > 0
+  );
+}
+
 /**
  * The set a node derives its group state from: containment `children` for
  * normal nodes, plus `members` (incoming `rollup_to`) for scope/aggregation
  * nodes. A scope thus rolls up the state of everything that belongs to it.
  */
 export function getAggregationChildren(node: EngineNode): EngineNode[] {
-  const children = node.children.filter((child) => !child.excludedFromFold);
+  const participates = (child: EngineNode): boolean =>
+    !child.excludedFromFold &&
+    !isCompensationNode(child) &&
+    !isImpactNode(child);
+  const children = node.children.filter(participates);
   if (isScopeNode(node)) {
-    return children.length > 0 ? [...children, ...node.members] : node.members;
+    const members = node.members.filter(participates);
+    return children.length > 0 ? [...children, ...members] : members;
   }
   return children;
 }
@@ -179,6 +198,50 @@ export function deriveStates(nodes: EngineNode[], parentOf: ParentOf): void {
   for (const node of nodes) {
     node.state = deriveNodeState(node, parentOf, memo, inProgress);
   }
+  const failureScope = getFailureScope(nodes, parentOf);
+  for (const node of nodes) {
+    if (isImpactNode(node) || !isCompensationNode(node)) continue;
+    if (isCompletedStatus(node.status)) {
+      node.state = "completed";
+    } else if (
+      isInterruptedStatus(node.status) ||
+      isBlockedStatus(node.status)
+    ) {
+      node.state = "interrupted";
+    } else {
+      const triggered = node.compensatesTargets?.some((target) => {
+        const parent = parentOf(target);
+        return (
+          target.state === "completed" &&
+          parent !== null &&
+          failureScope.has(parent)
+        );
+      });
+      node.state = triggered ? "active" : "idle";
+    }
+  }
+}
+
+export function getFailureScope(
+  nodes: EngineNode[],
+  parentOf: ParentOf,
+): Set<EngineNode> {
+  const scope = new Set<EngineNode>();
+  for (const node of nodes) {
+    if (isImpactNode(node)) continue;
+    if (!isInterruptedStatus(node.status) && !isBlockedStatus(node.status))
+      continue;
+    const seen = new Set<EngineNode>([node]);
+    let current = parentOf(node);
+    while (current && !seen.has(current)) {
+      if (isImpactNode(current)) break;
+      seen.add(current);
+      scope.add(current);
+      if (isScopeNode(current)) break;
+      current = parentOf(current);
+    }
+  }
+  return scope;
 }
 
 function deriveNodeState(
@@ -194,15 +257,18 @@ function deriveNodeState(
   if (inProgress.has(node)) return "idle";
   inProgress.add(node);
 
-  const aggregationChildren = getAggregationChildren(node);
-  const state =
-    aggregationChildren.length > 0
-      ? deriveGroupState(
-          aggregationChildren.map((child) =>
-            deriveNodeState(child, parentOf, memo, inProgress),
-          ),
-        )
-      : deriveLeafState(node, parentOf, memo, inProgress);
+  const state = isImpactNode(node)
+    ? "idle"
+    : (() => {
+        const aggregationChildren = getAggregationChildren(node);
+        return aggregationChildren.length > 0
+          ? deriveGroupState(
+              aggregationChildren.map((child) =>
+                deriveNodeState(child, parentOf, memo, inProgress),
+              ),
+            )
+          : deriveLeafState(node, parentOf, memo, inProgress);
+      })();
 
   inProgress.delete(node);
   memo.set(node, state);
@@ -288,6 +354,7 @@ function areGatingPrerequisitesTerminal(
   while (current && !seen.has(current)) {
     seen.add(current);
     for (const predecessor of current.predecessors) {
+      if (isImpactNode(predecessor)) continue;
       const state = deriveNodeState(predecessor, parentOf, memo, inProgress);
       if (!isTerminal(state)) return false;
     }
@@ -308,6 +375,7 @@ function areGatingPrerequisitesTerminal(
 export function isFrontierLeaf(node: EngineNode): boolean {
   if (node.children.length > 0) return false;
   if (node.kind === "group") return false;
+  if (isImpactNode(node)) return false;
   return (
     node.state === "active" ||
     node.state === "awaiting" ||
@@ -339,6 +407,32 @@ export function getNodeLineage(node: EngineNode, parentOf: ParentOf): string[] {
 }
 
 /**
+ * Every scope (`group`) node a node belongs to, reached upward through both
+ * containment (`parent`) and membership (`rollup_to`). This is what the lens
+ * picker uses to scope the frontier to a chosen portfolio: a leaf is "in" a
+ * scope iff that scope appears in its scope ancestors. Excludes the node
+ * itself. See GRAPH_ARCHITECTURE_PLAN.md "Lenses".
+ */
+export function getScopeAncestors(
+  node: EngineNode,
+  parentOf: ParentOf,
+): EngineNode[] {
+  const scopes = new Set<EngineNode>();
+  const seen = new Set<EngineNode>();
+  const stack: EngineNode[] = [node];
+  while (stack.length > 0) {
+    const current = stack.pop() as EngineNode;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    if (current !== node && current.kind === "group") scopes.add(current);
+    const parent = parentOf(current);
+    if (parent) stack.push(parent);
+    for (const scope of current.rollupTargets) stack.push(scope);
+  }
+  return [...scopes];
+}
+
+/**
  * Finds work/process nodes disconnected from the hierarchy: containment roots
  * that are not rolled up into any scope (e.g. leftover Kanban-era items).
  */
@@ -349,6 +443,7 @@ export function getHygiene(
   const items: HygieneItem[] = [];
   for (const node of nodes) {
     if (node.kind === "group") continue;
+    if (isImpactNode(node)) continue;
     if (parentOf(node)) continue; // placed under a parent
     if (node.rollupTargets.length > 0) continue; // rolled up into a scope
     items.push({
@@ -376,6 +471,7 @@ export interface FrontierRawNode {
   parentKey: string | null;
   dependsOnKeys: string[];
   rollupToKeys: string[];
+  compensatesKeys: string[];
 }
 
 export interface FrontierNode extends EngineNode {
@@ -385,11 +481,13 @@ export interface FrontierNode extends EngineNode {
   parentKey: string | null;
   dependsOnKeys: string[];
   rollupToKeys: string[];
+  compensatesKeys: string[];
   parent: FrontierNode | null;
   children: FrontierNode[];
   members: FrontierNode[];
   predecessors: FrontierNode[];
   rollupTargets: FrontierNode[];
+  compensatesTargets: FrontierNode[];
 }
 
 /**
@@ -407,6 +505,7 @@ export function buildFrontierGraph(raw: FrontierRawNode[]): FrontierNode[] {
     members: [],
     predecessors: [],
     rollupTargets: [],
+    compensatesTargets: [],
   }));
 
   const byIdentity = new Map<string, FrontierNode>();
@@ -432,6 +531,10 @@ export function buildFrontierGraph(raw: FrontierRawNode[]): FrontierNode[] {
         scope.members.push(node);
         node.rollupTargets.push(scope);
       }
+    }
+    for (const compensationKey of node.compensatesKeys) {
+      const target = byIdentity.get(compensationKey);
+      if (target && target !== node) node.compensatesTargets.push(target);
     }
   }
 

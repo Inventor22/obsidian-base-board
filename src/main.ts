@@ -5,6 +5,8 @@ import {
   QueryController,
   Setting,
   TFile,
+  TFolder,
+  TAbstractFile,
 } from "obsidian";
 import { KanbanView } from "./kanban-view";
 import { TimelineView } from "./timeline-view";
@@ -12,6 +14,13 @@ import { RolloutView } from "./rollout-view";
 import { GraphView } from "./graph-view";
 import { sanitizeFilename } from "./constants";
 import { CreateBoardModal, BoardConfig } from "./modals";
+import { updateBaseFolderReferences } from "./folder-rename";
+import {
+  parseGraphHistory,
+  recordGraphObservation,
+  type GraphHistory,
+  type GraphHistoryNode,
+} from "./graph-history";
 
 /** Per-base column configuration */
 export interface ColumnConfig {
@@ -31,6 +40,7 @@ export interface PluginData {
   columnConfigs: Record<string, ColumnConfig>;
   transitionHistory: TransitionHistorySettings;
   timeline: TimelineSettings;
+  graphHistories: Record<string, unknown>;
 }
 
 const DEFAULT_DATA: PluginData = {
@@ -42,6 +52,7 @@ const DEFAULT_DATA: PluginData = {
   timeline: {
     weekStartDay: 1,
   },
+  graphHistories: {},
 };
 
 // ---------------------------------------------------------------------------
@@ -50,6 +61,15 @@ const DEFAULT_DATA: PluginData = {
 
 export default class BaseBoardPlugin extends Plugin {
   data_: PluginData = DEFAULT_DATA;
+  private pluginDataWrites: Promise<void> = Promise.resolve();
+  private graphHistoryRevision = 0;
+  private savedGraphHistoryRevision = 0;
+
+  /** Folder rename mappings collected during one rename burst, pending flush. */
+  private pendingFolderRenames: Array<{ oldPath: string; newPath: string }> =
+    [];
+  /** Debounce timer that flushes pendingFolderRenames once the burst settles. */
+  private folderRenameFlushTimer: number | null = null;
 
   async onload() {
     await this.loadPluginData();
@@ -96,9 +116,84 @@ export default class BaseBoardPlugin extends Plugin {
         }).open();
       },
     });
+
+    // -- Keep board filters in sync when their folder is renamed/moved --------
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        this.handleFolderRename(file, oldPath);
+      }),
+    );
   }
 
-  onunload() {}
+  onunload() {
+    if (this.folderRenameFlushTimer !== null) {
+      window.clearTimeout(this.folderRenameFlushTimer);
+    }
+  }
+
+  // -- Folder rename sync -----------------------------------------------------
+
+  /**
+   * When a folder is renamed or moved, rewrite any .base board filter that
+   * pointed at the old path so the board keeps working without a manual edit.
+   *
+   * To avoid race condition, burst of renaming events are collected, and once
+   * a timeout is reached we flush and modify the path mappings in .base
+   */
+  private handleFolderRename(file: TAbstractFile, oldPath: string): void {
+    const timeOut = 250;
+
+    // Only folder moves change the folder a filter targets; ignore file renames.
+    if (!(file instanceof TFolder)) return;
+
+    const newPath = file.path;
+    if (newPath === oldPath) return;
+
+    this.pendingFolderRenames.push({ oldPath, newPath });
+
+    // Debounce: reset the timer on every event so the flush runs only after
+    // the rename burst has settled and Obsidian has finished moving files.
+    if (this.folderRenameFlushTimer !== null) {
+      window.clearTimeout(this.folderRenameFlushTimer);
+    }
+    this.folderRenameFlushTimer = window.setTimeout(() => {
+      this.folderRenameFlushTimer = null;
+      void this.flushFolderRenames();
+    }, timeOut);
+  }
+
+  /** Apply all pending folder-rename mappings to every .base file. */
+  private async flushFolderRenames(): Promise<void> {
+    const renames = this.pendingFolderRenames;
+    this.pendingFolderRenames = [];
+    if (renames.length === 0) return;
+
+    const baseFiles = this.app.vault
+      .getFiles()
+      .filter((f) => f.extension === "base");
+
+    for (const baseFile of baseFiles) {
+      try {
+        let content = await this.app.vault.read(baseFile);
+        let changed = false;
+        for (const { oldPath, newPath } of renames) {
+          const updated = updateBaseFolderReferences(content, oldPath, newPath);
+          if (updated !== null) {
+            content = updated;
+            changed = true;
+          }
+        }
+        if (changed) {
+          await this.app.vault.modify(baseFile, content);
+        }
+      } catch (err) {
+        console.error(
+          `Base Board: failed to update folder references in "${baseFile.path}"`,
+          err,
+        );
+      }
+    }
+  }
 
   // -- Board scaffolding ------------------------------------------------------
 
@@ -229,6 +324,59 @@ export default class BaseBoardPlugin extends Plugin {
 
   // -- Persistence ------------------------------------------------------------
 
+  getRecordedGraphHistory(id: string): GraphHistory | null {
+    if (!/^graph-[a-z0-9-]+$/.test(id))
+      throw new Error("Invalid graph recording identity");
+    if (
+      !this.data_.graphHistories ||
+      typeof this.data_.graphHistories !== "object" ||
+      Array.isArray(this.data_.graphHistories)
+    ) {
+      throw new Error("Unsupported graph recording store");
+    }
+    const saved = this.data_.graphHistories[id];
+    return saved === undefined ? null : parseGraphHistory(saved);
+  }
+
+  async recordGraphHistory(
+    id: string,
+    nodes: GraphHistoryNode[],
+    at: number,
+    session: string,
+  ): Promise<GraphHistory> {
+    const previous = this.getRecordedGraphHistory(id);
+    const result = recordGraphObservation(previous, nodes, at, session);
+    this.data_.graphHistories[id] = result.history;
+    if (result.changed) this.graphHistoryRevision += 1;
+    const revision = this.graphHistoryRevision;
+    if (this.savedGraphHistoryRevision < revision) {
+      await this.savePluginData();
+      this.savedGraphHistoryRevision = Math.max(
+        this.savedGraphHistoryRevision,
+        revision,
+      );
+    }
+    return result.history;
+  }
+
+  async finishGraphObservation(
+    id: string,
+    at: number,
+    session: string,
+  ): Promise<void> {
+    const history = this.getRecordedGraphHistory(id);
+    if (
+      !history ||
+      history.frames[history.frames.length - 1].session !== session
+    )
+      return;
+    this.data_.graphHistories[id] = {
+      ...history,
+      observedThrough: Math.max(history.observedThrough, at),
+    };
+    await this.savePluginData();
+  }
+
   async loadPluginData(): Promise<void> {
     const saved = (await this.loadData()) as PluginData | null | undefined;
     this.data_ = Object.assign({}, DEFAULT_DATA, saved ?? {});
@@ -243,10 +391,16 @@ export default class BaseBoardPlugin extends Plugin {
       DEFAULT_DATA.timeline,
       saved?.timeline ?? {},
     );
+    this.data_.graphHistories = saved?.graphHistories ?? {};
   }
 
   async savePluginData(): Promise<void> {
-    await this.saveData(this.data_);
+    const snapshot: unknown = JSON.parse(JSON.stringify(this.data_));
+    const write = this.pluginDataWrites
+      .catch(() => {})
+      .then(() => this.saveData(snapshot));
+    this.pluginDataWrites = write;
+    await write;
   }
 }
 

@@ -64,8 +64,7 @@ export class CardDetailModal extends Modal {
   private static forwardStack: CardModalSnapshot[] = [];
   private static forwardStackExpireTimer: number | null = null;
   private static stackMouseNavigationHandler:
-    | ((event: MouseEvent) => void)
-    | null = null;
+    ((event: MouseEvent) => void) | null = null;
   private static stackMouseNavigationTargets: Array<Document | Window> = [];
   private static stackLastMouseNavigationAt = 0;
   private static stackLastMouseNavigationButton: number | null = null;

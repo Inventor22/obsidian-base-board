@@ -3,10 +3,12 @@ import {
   BasesEntry,
   BasesEntryGroup,
   BasesAllOptions,
+  BooleanValue,
   HoverParent,
   HoverPopover,
-  QueryController,
+  NumberValue,
   NullValue,
+  QueryController,
   setIcon,
   TFile,
   WorkspaceLeaf,
@@ -17,12 +19,26 @@ import { ColumnManager } from "./column";
 import { CardManager } from "./card";
 import { Tags } from "./tags";
 import {
+  compareOrderValues,
+  generateOrderKeys,
+  isOrderKey,
+  OrderValue,
+  readOrderValue,
+} from "./order";
+import { coerceColumnValue, GroupByValueType } from "./value-utils";
+import {
   NO_VALUE_COLUMN,
   ORDER_PROPERTY,
   CONFIG_KEY_COLUMNS,
+  CONFIG_KEY_COLLAPSED_COLUMNS,
   CONFIG_KEY_OPEN_BEHAVIOR,
   CONFIG_KEY_BOARD_PROJECTION,
+  CONFIG_KEY_FRONTIER_SCOPE,
+  CONFIG_KEY_FRONTIER_PRIORITY,
   CONFIG_KEY_COLUMN_COLORS,
+  CONFIG_KEY_WIP_LIMITS,
+  CONFIG_KEY_COVER_PROPERTY,
+  CONFIG_KEY_ADD_TO_TOP,
 } from "./constants";
 import { getColumnColor } from "./status-colors";
 import {
@@ -33,12 +49,14 @@ import {
   buildFrontierGraph,
   getFrontierNodes,
   getFrontierLineage,
+  getScopeAncestors,
   normalizeReference,
   normalizeReferences,
   isCompletedStatus as engineIsCompletedStatus,
   isBlockedStatus as engineIsBlockedStatus,
   isActiveStatus as engineIsActiveStatus,
   ENGINE_NODE_KINDS,
+  type EngineNode,
   type EngineNodeKind,
   type FrontierNode,
   type FrontierRawNode,
@@ -54,14 +72,23 @@ const STACKED_COLUMN_GROUPS = [["Flighting", "Blocked"]];
 // --- Active-frontier projection (Step D) -----------------------------------
 // The frontier board is a derived projection of the graph: live columns are the
 // active frontier leaves bucketed by status; history columns read the event log.
-const PINNED_PROPERTY = "pinned";
 const FRONTIER_HISTORY_WINDOW_DAYS = 7;
+const FRONTIER_SCOPE_ALL = "all";
 const FRONTIER_LIVE_COLUMNS = [
   "To Do",
   "In Progress",
   "In Review",
   "Blocked",
 ] as const;
+
+/** A scope (`group`) node summarised for the lens picker (Step E). */
+interface FrontierScopeSummary {
+  key: string;
+  title: string;
+  depth: number;
+  frontierCount: number;
+  hasAttention: boolean;
+}
 
 /** A work card projected onto the frontier board. */
 interface FrontierCardModel {
@@ -73,7 +100,8 @@ interface FrontierCardModel {
   state: FrontierNode["state"];
   facets: { label: string; kind: string }[];
   tags: string[];
-  pinned: boolean;
+  /** 1-based rank in today's priority overlay for the active scope, else null. */
+  priorityRank: number | null;
   timestamp: Date | null;
 }
 
@@ -100,6 +128,12 @@ interface PlannedEntry {
 
 type BoardProjectionMode = "all" | "active-frontier";
 
+interface BoardScrollState {
+  boardLeft: number;
+  viewTop: number;
+  columnTops: Map<string, number>;
+}
+
 // ---------------------------------------------------------------------------
 //  Kanban View
 // ---------------------------------------------------------------------------
@@ -119,8 +153,8 @@ export class KanbanView extends BasesView implements HoverParent {
 
   /** Prevent re-renders while we batch-update frontmatter. */
   private isUpdating = false;
-  /** Track if Bases fired onDataUpdated while we were updating. */
-  private pendingRender = false;
+  /** Track if Bases delivered fresh query data while we were updating. */
+  private pendingDataRender = false;
   /** True until the first successful render completes. */
   private isFirstRender = true;
   /** Debounce timer for render calls. */
@@ -129,6 +163,13 @@ export class KanbanView extends BasesView implements HoverParent {
   private isArchiveExpanded = false;
   /** Whether the computed planned shelf is expanded. */
   private isPlannedExpanded = true;
+  /** Active frontier lens scope (Step E) for the current render. */
+  private activeFrontierScopeKey: string = FRONTIER_SCOPE_ALL;
+  /** Today's ordered priority overlay (file paths) for the active scope (Step F). */
+  private activeFrontierPriority: string[] = [];
+  /** Local drop intent retained until Bases publishes the matching groups. */
+  private optimisticMoves = new Map<string, string>();
+  private optimisticColumnOrders = new Map<string, string[]>();
   /** Label Manager for tags and filters */
   public tags: Tags;
   /** Currently selected card file paths (for batch operations) */
@@ -174,9 +215,10 @@ export class KanbanView extends BasesView implements HoverParent {
 
   public onDataUpdated(): void {
     if (this.isUpdating) {
-      this.pendingRender = true;
+      this.pendingDataRender = true;
       return;
     }
+    this.acknowledgeOptimisticMoves();
     this.scheduleRender();
   }
 
@@ -188,7 +230,7 @@ export class KanbanView extends BasesView implements HoverParent {
     updateFn: () => Promise<void> | void,
   ): Promise<void> {
     this.isUpdating = true;
-    this.pendingRender = false;
+    this.pendingDataRender = false;
 
     try {
       await updateFn();
@@ -197,8 +239,9 @@ export class KanbanView extends BasesView implements HoverParent {
     }
 
     // If Bases fired onDataUpdated during our batch, schedule a debounced render.
-    if (this.pendingRender) {
-      this.pendingRender = false;
+    if (this.pendingDataRender) {
+      this.pendingDataRender = false;
+      this.acknowledgeOptimisticMoves();
       this.scheduleRender();
     }
   }
@@ -235,9 +278,26 @@ export class KanbanView extends BasesView implements HoverParent {
               "active-frontier": "Active frontier",
             },
           },
+          {
+            key: CONFIG_KEY_COVER_PROPERTY,
+            type: "text" as const,
+            displayName: "Cover property",
+            default: "cover",
+            placeholder: "E.g. cover",
+          },
+          {
+            key: CONFIG_KEY_ADD_TO_TOP,
+            type: "toggle" as const,
+            displayName: "Add new cards to top",
+            default: false,
+          },
         ],
       },
     ];
+  }
+
+  public isAddNewCardsToTop(): boolean {
+    return !!this.config?.get(CONFIG_KEY_ADD_TO_TOP);
   }
 
   // ---------------------------------------------------------------------------
@@ -323,6 +383,51 @@ export class KanbanView extends BasesView implements HoverParent {
     return val === "active-frontier" ? "active-frontier" : "all";
   }
 
+  /** Persists the board mode (All cards / Active frontier) and re-renders. */
+  private setBoardProjectionMode(mode: BoardProjectionMode): void {
+    if (mode === this.getBoardProjectionMode()) return;
+    this.config?.set(CONFIG_KEY_BOARD_PROJECTION, mode);
+    this.scheduleRender();
+  }
+
+  /**
+   * Renders the segmented board-mode toggle at the top of the view, mirroring
+   * the "Show cards" view option but in-board for discoverability.
+   */
+  private renderBoardModeToggle(parentEl: HTMLElement): void {
+    const mode = this.getBoardProjectionMode();
+    const toggleEl = parentEl.createDiv({ cls: "base-board-mode-toggle" });
+    const addButton = (
+      value: BoardProjectionMode,
+      label: string,
+      icon: string,
+    ): void => {
+      const btn = toggleEl.createEl("button", {
+        cls:
+          value === mode
+            ? "base-board-mode-btn base-board-mode-btn--active"
+            : "base-board-mode-btn",
+        attr: { type: "button", "aria-pressed": String(value === mode) },
+      });
+      setIcon(btn.createSpan({ cls: "base-board-mode-btn-icon" }), icon);
+      btn.createSpan({ cls: "base-board-mode-btn-label", text: label });
+      btn.addEventListener("click", (event: MouseEvent) => {
+        event.preventDefault();
+        this.setBoardProjectionMode(value);
+      });
+    };
+    addButton("all", "All cards", "lucide-layout-grid");
+    addButton("active-frontier", "Active frontier", "lucide-target");
+  }
+
+  public getCardCoverProperty(): string | null {
+    const val = this.config?.get(CONFIG_KEY_COVER_PROPERTY);
+    if (val === undefined || val === null) {
+      return "cover";
+    }
+    return typeof val === "string" && val.trim() !== "" ? val.trim() : null;
+  }
+
   public isLeafAttached(leaf: WorkspaceLeaf): boolean {
     let found = false;
     this.app.workspace.iterateAllLeaves((l) => {
@@ -354,6 +459,34 @@ export class KanbanView extends BasesView implements HoverParent {
     this.scheduleRender();
   }
 
+  // ---------------------------------------------------------------------------
+  //  WIP Limits
+  // ---------------------------------------------------------------------------
+
+  public getWipLimits(): Record<string, number> {
+    const raw = this.config?.get(CONFIG_KEY_WIP_LIMITS);
+    return raw && typeof raw === "object"
+      ? (raw as Record<string, number>)
+      : {};
+  }
+
+  public getWipLimit(columnName: string): number | null {
+    const limits = this.getWipLimits();
+    const val = limits[columnName];
+    return typeof val === "number" && val > 0 ? val : null;
+  }
+
+  public setWipLimit(columnName: string, limit: number | null): void {
+    const limits = this.getWipLimits();
+    if (limit !== null && limit > 0) {
+      limits[columnName] = limit;
+    } else {
+      delete limits[columnName];
+    }
+    this.config?.set(CONFIG_KEY_WIP_LIMITS, limits);
+    this.scheduleRender();
+  }
+
   private getColumnName(key: unknown): string {
     if (key === undefined || key === null || key instanceof NullValue) {
       return NO_VALUE_COLUMN;
@@ -373,16 +506,107 @@ export class KanbanView extends BasesView implements HoverParent {
   }
 
   /**
+   * Infer the JS type of the groupBy property from the group keys that Bases
+   * actually produced. Bases exposes group keys as typed Value objects, so a
+   * checkbox-grouped board yields BooleanValue keys and a numeric one yields
+   * NumberValue keys. Booleans win outright so a mix of real checkboxes and
+   * already-corrupted "false" strings still resolves to "boolean".
+   */
+  private groupByValueType(): GroupByValueType {
+    for (const group of this.currentGroups) {
+      if (group.key instanceof BooleanValue) return "boolean";
+      if (group.key instanceof NumberValue) return "number";
+    }
+    return "other";
+  }
+
+  /**
+   * Write the groupBy property for a card into `fm`, preserving its real type.
+   *
+   * The "(No value)" column removes the property entirely; every other column
+   * stores a correctly-typed value so a checkbox `false` is never turned into
+   * the string "false" (which is truthy and breaks grouping).
+   */
+  public applyGroupByValue(
+    fm: Record<string, unknown>,
+    groupByProp: string,
+    columnName: string,
+  ): void {
+    if (columnName === NO_VALUE_COLUMN) {
+      delete fm[groupByProp];
+      return;
+    }
+    fm[groupByProp] = coerceColumnValue(columnName, this.groupByValueType());
+  }
+
+  /**
    * Read kanban_order from metadataCache (more reliable than entry.values
    * since the Bases engine may not expose all properties).
    */
-  public getFileOrder(filePath: string): number {
+  public getFileOrder(filePath: string): OrderValue {
     const file = this.app.vault.getAbstractFileByPath(filePath);
-    if (!file || !(file instanceof TFile)) return Infinity;
+    if (!file || !(file instanceof TFile)) return null;
     const cache = this.app.metadataCache.getFileCache(file);
-    const order: unknown = cache?.frontmatter?.[ORDER_PROPERTY];
-    if (typeof order === "number") return order;
-    return Infinity;
+    return readOrderValue(cache?.frontmatter?.[ORDER_PROPERTY]);
+  }
+
+  public compareFileOrder(pathA: string, pathB: string): number {
+    return compareOrderValues(
+      this.getFileOrder(pathA),
+      this.getFileOrder(pathB),
+    );
+  }
+
+  public compareCardOrder(
+    columnName: string,
+    pathA: string,
+    pathB: string,
+  ): number {
+    const optimisticOrder = this.optimisticColumnOrders.get(columnName);
+    if (optimisticOrder) {
+      const indexA = optimisticOrder.indexOf(pathA);
+      const indexB = optimisticOrder.indexOf(pathB);
+      if (indexA !== -1 || indexB !== -1) {
+        if (indexA === -1) return 1;
+        if (indexB === -1) return -1;
+        return indexA - indexB;
+      }
+    }
+    return this.compareFileOrder(pathA, pathB);
+  }
+
+  public getEntriesForColumn(
+    columnName: string,
+    group: BasesEntryGroup | null,
+  ): BasesEntry[] {
+    const entries = [...(group?.entries ?? [])].filter((entry) => {
+      const path = entry.file?.path;
+      const optimisticColumn = path ? this.optimisticMoves.get(path) : null;
+      return !optimisticColumn || optimisticColumn === columnName;
+    });
+    const present = new Set(entries.map((entry) => entry.file?.path));
+
+    for (const entry of this.data?.data ?? []) {
+      const path = entry.file?.path;
+      if (
+        path &&
+        this.optimisticMoves.get(path) === columnName &&
+        !present.has(path)
+      ) {
+        entries.push(entry);
+      }
+    }
+    return entries;
+  }
+
+  public getOrderedPathsForColumn(columnName: string): string[] {
+    const group = this.currentGroups.find(
+      (candidate) => this.getColumnName(candidate.key) === columnName,
+    );
+    const paths = (group?.entries ?? [])
+      .map((entry) => entry.file?.path)
+      .filter((path): path is string => typeof path === "string");
+    return paths.sort((a, b) => this.compareFileOrder(a, b));
   }
 
   public isArchivedEntry(entry: BasesEntry, columnName: string): boolean {
@@ -603,8 +827,7 @@ export class KanbanView extends BasesView implements HoverParent {
   public getColumns(): string[] {
     // 1. Try .base file config first (new preferred storage)
     const fromConfig = this.config?.get(CONFIG_KEY_COLUMNS) as
-      | string[]
-      | undefined;
+      string[] | undefined;
 
     // 2. Fallback: legacy plugin data.json
     const fromPlugin = this.plugin.getColumnConfig(this.getBaseId());
@@ -638,6 +861,32 @@ export class KanbanView extends BasesView implements HoverParent {
     return dataColumns;
   }
 
+  public getCollapsedColumns(): Record<string, boolean> {
+    const raw = this.config?.get(CONFIG_KEY_COLLAPSED_COLUMNS);
+    return raw && typeof raw === "object"
+      ? (raw as Record<string, boolean>)
+      : {};
+  }
+
+  public isColumnCollapsed(columnName: string): boolean {
+    return !!this.getCollapsedColumns()[columnName];
+  }
+
+  public setColumnCollapsed(columnName: string, collapsed: boolean): void {
+    const state = this.getCollapsedColumns();
+    if (collapsed) {
+      state[columnName] = true;
+    } else {
+      delete state[columnName];
+    }
+    this.config?.set(CONFIG_KEY_COLLAPSED_COLUMNS, state);
+    this.scheduleRender();
+  }
+
+  public toggleColumnCollapsed(columnName: string): void {
+    this.setColumnCollapsed(columnName, !this.isColumnCollapsed(columnName));
+  }
+
   private getGroupForColumn(columnName: string): BasesEntryGroup | null {
     for (const group of this.currentGroups) {
       if (this.getColumnName(group.key) === columnName) {
@@ -651,29 +900,61 @@ export class KanbanView extends BasesView implements HoverParent {
   //  Rendering
   // ---------------------------------------------------------------------------
 
+  /**
+   * Ensure `file.name` is present in the view's property `order:` configuration.
+   * This guarantees that Obsidian's database engine indexes card titles for search.
+   */
+  private ensureFileNameInOrder(): void {
+    if (!this.config) return;
+    const currentOrder =
+      (this.config.get("order") as string[] | undefined) ?? [];
+    if (
+      !currentOrder.includes("file.name") &&
+      !currentOrder.includes("file.file")
+    ) {
+      this.config.set("order", ["file.name", ...currentOrder]);
+    }
+  }
+
+  public cardElCache = new Map<string, HTMLElement>();
+  public columnElCache = new Map<string, HTMLElement>();
+
   public render(): void {
+    this.ensureFileNameInOrder();
     this.selectedCards.clear();
+    const scrollState = this.captureScrollState();
 
-    // Save scroll positions before destroying the DOM so we can restore
-    // them after rebuild.  Without this the board jumps back to 0 on every
-    // re-render (metadata update, drag hover, etc.).
-    const prevBoardEl = this.containerEl.querySelector(".base-board-board");
-    const savedScrollLeft = prevBoardEl?.scrollLeft ?? 0;
-    const savedScrollTop = this.scrollEl.scrollTop;
-
-    // Save per-column vertical scroll (each .base-board-cards has overflow-y)
-    const savedColumnScrolls: Record<string, number> = {};
-    if (prevBoardEl) {
-      prevBoardEl.querySelectorAll(".base-board-column").forEach((col) => {
-        const name = (col as HTMLElement).dataset.columnName;
-        const cardsEl = col.querySelector(".base-board-cards");
-        if (name && cardsEl) {
-          savedColumnScrolls[name] = cardsEl.scrollTop;
+    // Index stable DOM nodes before rebuilding the lightweight board shell.
+    // Columns are detached as complete subtrees, preserving their card lists,
+    // card descendants, scroll state, image elements, and event listeners.
+    this.cardElCache.clear();
+    this.containerEl
+      .querySelectorAll(".base-board-card[data-render-version]")
+      .forEach((el) => {
+        const path = (el as HTMLElement).dataset.filePath;
+        if (path) {
+          this.cardElCache.set(path, el as HTMLElement);
         }
       });
-    }
+
+    this.columnElCache.clear();
+    this.containerEl
+      .querySelectorAll<HTMLElement>(
+        ".base-board-board:not(.base-board-frontier-board) .base-board-column",
+      )
+      .forEach((el) => {
+        const name = el.dataset.columnName;
+        if (name) {
+          this.columnElCache.set(name, el);
+          el.remove();
+        }
+      });
 
     this.containerEl.empty();
+
+    // Board mode toggle (All cards / Active frontier) — rendered first so it
+    // pins to the top of the view for discoverability.
+    this.renderBoardModeToggle(this.containerEl);
 
     // Use the official API: this.data is a BasesQueryResult
     const groupedData: BasesEntryGroup[] = this.data?.groupedData ?? [];
@@ -693,7 +974,11 @@ export class KanbanView extends BasesView implements HoverParent {
     const shouldShowPlaceholder =
       !hasGroupBy && groupedData.length <= 1 && !hasStoredColumns;
 
-    if (shouldShowPlaceholder) {
+    if (
+      shouldShowPlaceholder &&
+      this.getBoardProjectionMode() !== "active-frontier"
+    ) {
+      this.dragDropManager.destroy();
       const msgEl = this.containerEl.createDiv({
         cls: "base-board-placeholder",
       });
@@ -723,14 +1008,10 @@ export class KanbanView extends BasesView implements HoverParent {
     // frontier (live work) + the event log (recent history), not raw status
     // grouping. The classic status board renders below in "all" mode.
     if (this.getBoardProjectionMode() === "active-frontier") {
+      this.dragDropManager.destroy();
       boardEl.addClass("base-board-frontier-board");
       this.renderFrontierBoard(boardEl);
-      if (savedScrollLeft > 0 || savedScrollTop > 0) {
-        window.requestAnimationFrame(() => {
-          boardEl.scrollLeft = savedScrollLeft;
-          this.scrollEl.scrollTop = savedScrollTop;
-        });
-      }
+      this.restoreScrollState(boardEl, scrollState);
       return;
     }
 
@@ -752,6 +1033,7 @@ export class KanbanView extends BasesView implements HoverParent {
             stackedColumnName,
             group,
             columns.indexOf(stackedColumnName),
+            this.columnElCache.get(stackedColumnName),
           );
         }
         return;
@@ -759,7 +1041,13 @@ export class KanbanView extends BasesView implements HoverParent {
 
       renderedColumns.add(columnName);
       const group = this.getGroupForColumn(columnName);
-      this.columnManager.renderColumn(boardEl, columnName, group, idx);
+      this.columnManager.renderColumn(
+        boardEl,
+        columnName,
+        group,
+        idx,
+        this.columnElCache.get(columnName),
+      );
     });
 
     this.columnManager.renderAddColumnButton(boardEl);
@@ -778,26 +1066,50 @@ export class KanbanView extends BasesView implements HoverParent {
         (shelfEl): shelfEl is HTMLElement => shelfEl !== null,
       ),
     );
+    this.restoreScrollState(boardEl, scrollState);
+  }
 
-    // Restore scroll positions after the browser has laid out the new DOM
-    const hasColumnScrolls = Object.keys(savedColumnScrolls).some(
-      (k) => savedColumnScrolls[k] > 0,
-    );
-    if (savedScrollLeft > 0 || savedScrollTop > 0 || hasColumnScrolls) {
-      window.requestAnimationFrame(() => {
-        boardEl.scrollLeft = savedScrollLeft;
-        this.scrollEl.scrollTop = savedScrollTop;
+  private captureScrollState(): BoardScrollState {
+    const boardEl =
+      this.containerEl.querySelector<HTMLElement>(".base-board-board");
+    const columnTops = new Map<string, number>();
 
-        boardEl.querySelectorAll(".base-board-column").forEach((col) => {
-          const name = (col as HTMLElement).dataset.columnName;
-          const cardsEl = col.querySelector(".base-board-cards");
-          const scroll = name ? savedColumnScrolls[name] : undefined;
-          if (cardsEl && scroll != null && scroll > 0) {
-            cardsEl.scrollTop = scroll;
-          }
-        });
+    boardEl
+      ?.querySelectorAll<HTMLElement>(".base-board-column")
+      .forEach((columnEl) => {
+        const name = columnEl.dataset.columnName;
+        const cardsEl =
+          columnEl.querySelector<HTMLElement>(".base-board-cards");
+        if (name && cardsEl) columnTops.set(name, cardsEl.scrollTop);
       });
-    }
+
+    return {
+      boardLeft: boardEl?.scrollLeft ?? 0,
+      viewTop: this.scrollEl.scrollTop,
+      columnTops,
+    };
+  }
+
+  private restoreScrollState(
+    boardEl: HTMLElement,
+    state: BoardScrollState,
+  ): void {
+    // All columns are attached, so these assignments restore against the final
+    // layout and cannot race a deferred callback from an earlier render.
+    boardEl.scrollLeft = state.boardLeft;
+    this.scrollEl.scrollTop = state.viewTop;
+
+    boardEl
+      .querySelectorAll<HTMLElement>(".base-board-column")
+      .forEach((columnEl) => {
+        const name = columnEl.dataset.columnName;
+        const cardsEl =
+          columnEl.querySelector<HTMLElement>(".base-board-cards");
+        const scrollTop = name ? state.columnTops.get(name) : undefined;
+        if (cardsEl && scrollTop !== undefined) {
+          cardsEl.scrollTop = scrollTop;
+        }
+      });
   }
 
   private renderPlannedSection(
@@ -1046,18 +1358,36 @@ export class KanbanView extends BasesView implements HoverParent {
     );
     const frontier = getFrontierNodes(graph);
 
+    // Lens scoping (Step E): the picker summarises the scope hierarchy and the
+    // chosen scope narrows the board to `frontier(scope)`.
+    const scopeSummaries = this.buildFrontierScopeSummaries(graph, frontier);
+    const activeScopeKey = this.resolveActiveFrontierScope(scopeSummaries);
+    this.activeFrontierScopeKey = activeScopeKey;
+    this.activeFrontierPriority = this.getFrontierPriorityList(activeScopeKey);
+    this.renderFrontierScopePicker(
+      boardEl,
+      scopeSummaries,
+      activeScopeKey,
+      frontier.length,
+    );
+    const inScope = (node: FrontierNode): boolean =>
+      this.isNodeInFrontierScope(node, activeScopeKey);
+
     const liveBuckets = new Map<string, FrontierCardModel[]>();
     for (const columnName of FRONTIER_LIVE_COLUMNS) {
       liveBuckets.set(columnName, []);
     }
+    let liveCount = 0;
     for (const node of frontier) {
       const ref = refByKey.get(node.key);
       if (!ref) continue;
+      if (!inScope(node)) continue;
       if (!this.entryMatchesActiveTagFilters(ref.entry)) continue;
       const columnName = this.frontierLiveColumn(node);
       liveBuckets
         .get(columnName)
         ?.push(this.buildFrontierCard(node, ref, null));
+      liveCount += 1;
     }
 
     const windowMs = FRONTIER_HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000;
@@ -1066,7 +1396,13 @@ export class KanbanView extends BasesView implements HoverParent {
     for (const [key, ref] of refByKey) {
       const node = nodeByKey.get(key);
       if (!node) continue;
-      if (node.children.length > 0 || node.kind === "group") continue; // leaves only
+      if (
+        node.children.length > 0 ||
+        node.kind === "group" ||
+        node.kind === "impact"
+      )
+        continue; // actionable/history leaves only
+      if (!inScope(node)) continue;
       if (!this.entryMatchesActiveTagFilters(ref.entry)) continue;
 
       if (node.state === "completed") {
@@ -1093,8 +1429,7 @@ export class KanbanView extends BasesView implements HoverParent {
       }
     }
 
-    const totalCards =
-      frontier.length + completed.length + recentlyBlocked.length;
+    const totalCards = liveCount + completed.length + recentlyBlocked.length;
     if (totalCards === 0) {
       const emptyEl = boardEl.createDiv({
         cls: "base-board-frontier-empty",
@@ -1104,7 +1439,10 @@ export class KanbanView extends BasesView implements HoverParent {
         "lucide-target",
       );
       emptyEl.createEl("p", {
-        text: "No active frontier work. Connect cards into a feature/work graph to populate the frontier.",
+        text:
+          activeScopeKey === FRONTIER_SCOPE_ALL
+            ? "No active frontier work. Connect cards into a feature/work graph to populate the frontier."
+            : "No active frontier work in this scope. Pick a different lens above.",
       });
       return;
     }
@@ -1128,6 +1466,126 @@ export class KanbanView extends BasesView implements HoverParent {
         true,
       );
     }
+  }
+
+  /**
+   * Lens picker (Step E): summarises every scope (`group`) node with its
+   * frontier count + a health flag, ordered by depth in the scope spine. Each
+   * frontier leaf contributes to every scope it belongs to (containment +
+   * membership), so nested portfolios (e.g. Msft → Career → Dustin) accumulate.
+   */
+  private buildFrontierScopeSummaries(
+    graph: FrontierNode[],
+    frontier: FrontierNode[],
+  ): FrontierScopeSummary[] {
+    const parentOf = (candidate: EngineNode): EngineNode | null =>
+      (candidate as FrontierNode).parent;
+    const byKey = new Map<string, FrontierScopeSummary>();
+    for (const node of graph) {
+      if (node.kind !== "group") continue;
+      byKey.set(node.key, {
+        key: node.key,
+        title: node.title,
+        depth: getScopeAncestors(node, parentOf).length,
+        frontierCount: 0,
+        hasAttention: false,
+      });
+    }
+    for (const leaf of frontier) {
+      const attention =
+        leaf.state === "blocked" || leaf.state === "interrupted";
+      for (const scope of getScopeAncestors(leaf, parentOf)) {
+        const summary = byKey.get((scope as FrontierNode).key);
+        if (!summary) continue;
+        summary.frontierCount += 1;
+        if (attention) summary.hasAttention = true;
+      }
+    }
+    return [...byKey.values()].sort(
+      (first, second) =>
+        first.depth - second.depth || first.title.localeCompare(second.title),
+    );
+  }
+
+  /** The persisted lens scope, or `all` when unset / pointing at a gone scope. */
+  private resolveActiveFrontierScope(
+    summaries: FrontierScopeSummary[],
+  ): string {
+    const raw = this.config?.get(CONFIG_KEY_FRONTIER_SCOPE);
+    if (typeof raw === "string" && summaries.some((s) => s.key === raw)) {
+      return raw;
+    }
+    return FRONTIER_SCOPE_ALL;
+  }
+
+  /** True when a leaf belongs to the active scope (or no scope is selected). */
+  private isNodeInFrontierScope(node: FrontierNode, scopeKey: string): boolean {
+    if (scopeKey === FRONTIER_SCOPE_ALL) return true;
+    return getScopeAncestors(
+      node,
+      (candidate: EngineNode) => (candidate as FrontierNode).parent,
+    ).some((scope) => (scope as FrontierNode).key === scopeKey);
+  }
+
+  /** Renders the clickable scope-hierarchy strip above the frontier board. */
+  private renderFrontierScopePicker(
+    boardEl: HTMLElement,
+    summaries: FrontierScopeSummary[],
+    activeScopeKey: string,
+    totalFrontier: number,
+  ): void {
+    if (summaries.length === 0) return; // no scopes — nothing to pick
+    const parent = boardEl.parentElement;
+    if (!parent) return;
+    const pickerEl = parent.createDiv({ cls: "base-board-frontier-scopes" });
+    parent.insertBefore(pickerEl, boardEl);
+
+    const addChip = (
+      key: string,
+      label: string,
+      count: number,
+      depth: number,
+      attention: boolean,
+    ): void => {
+      const chipEl = pickerEl.createEl("button", {
+        cls: "base-board-frontier-scope",
+        attr: { type: "button" },
+      });
+      if (key === activeScopeKey) {
+        chipEl.addClass("base-board-frontier-scope--active");
+      }
+      if (attention) chipEl.addClass("base-board-frontier-scope--attention");
+      if (depth > 0) chipEl.style.setProperty("--scope-depth", String(depth));
+      chipEl.createSpan({
+        cls: "base-board-frontier-scope-label",
+        text: label,
+      });
+      chipEl.createSpan({
+        cls: "base-board-frontier-scope-count",
+        text: String(count),
+      });
+      chipEl.addEventListener("click", (event: MouseEvent) => {
+        event.preventDefault();
+        this.setFrontierScope(key);
+      });
+    };
+
+    addChip(FRONTIER_SCOPE_ALL, "All work", totalFrontier, 0, false);
+    for (const summary of summaries) {
+      addChip(
+        summary.key,
+        summary.title,
+        summary.frontierCount,
+        summary.depth,
+        summary.hasAttention,
+      );
+    }
+  }
+
+  /** Persists the chosen lens scope and re-renders the board. */
+  private setFrontierScope(scopeKey: string): void {
+    this.config?.set(CONFIG_KEY_FRONTIER_SCOPE, scopeKey);
+    this.scheduleRender();
   }
 
   /** Buckets a live frontier leaf into a board column by its state + status. */
@@ -1179,6 +1637,7 @@ export class KanbanView extends BasesView implements HoverParent {
         parentKey: normalizeReference(frontmatter?.parent),
         dependsOnKeys: normalizeReferences(frontmatter?.depends_on),
         rollupToKeys: normalizeReferences(frontmatter?.rollup_to),
+        compensatesKeys: normalizeReferences(frontmatter?.compensates),
       });
       refByKey.set(file.path, { file, entry });
     }
@@ -1204,6 +1663,8 @@ export class KanbanView extends BasesView implements HoverParent {
     const kindLabel = this.normalizeStatus(frontmatter?.kind);
     if (kindLabel) facets.push({ label: kindLabel, kind: "kind" });
 
+    const rankIndex = this.activeFrontierPriority.indexOf(ref.file.path);
+
     return {
       file: ref.file,
       entry: ref.entry,
@@ -1213,7 +1674,7 @@ export class KanbanView extends BasesView implements HoverParent {
       state: node.state,
       facets,
       tags: this.tags.extractTagsFromFile(ref.file),
-      pinned: frontmatter?.[PINNED_PROPERTY] === true,
+      priorityRank: rankIndex >= 0 ? rankIndex + 1 : null,
       timestamp,
     };
   }
@@ -1225,7 +1686,15 @@ export class KanbanView extends BasesView implements HoverParent {
     isHistory: boolean,
   ): void {
     const sorted = [...cards].sort((first, second) => {
-      if (first.pinned !== second.pinned) return first.pinned ? -1 : 1;
+      // Priority overlay (Step F): explicitly ranked cards float to the top in
+      // rank order; everything else keeps the default ordering below.
+      if (first.priorityRank !== null || second.priorityRank !== null) {
+        if (first.priorityRank === null) return 1;
+        if (second.priorityRank === null) return -1;
+        if (first.priorityRank !== second.priorityRank) {
+          return first.priorityRank - second.priorityRank;
+        }
+      }
       if (isHistory) {
         const firstTime = first.timestamp?.getTime() ?? 0;
         const secondTime = second.timestamp?.getTime() ?? 0;
@@ -1270,7 +1739,8 @@ export class KanbanView extends BasesView implements HoverParent {
       cls: "base-board-card base-board-frontier-card",
     });
     cardEl.dataset.filePath = card.file.path;
-    if (card.pinned) cardEl.addClass("base-board-frontier-card--pinned");
+    const isPrioritized = card.priorityRank !== null;
+    if (isPrioritized) cardEl.addClass("base-board-frontier-card--pinned");
 
     // Work lineage breadcrumb (replaces the old hierarchy tags).
     if (card.lineage.length > 1) {
@@ -1292,25 +1762,31 @@ export class KanbanView extends BasesView implements HoverParent {
     }
 
     const titleRow = cardEl.createDiv({ cls: "base-board-frontier-title-row" });
+    if (isPrioritized) {
+      titleRow.createSpan({
+        cls: "base-board-frontier-rank",
+        text: String(card.priorityRank),
+      });
+    }
     titleRow.createSpan({
       cls: "base-board-frontier-leaf",
       text: card.title,
     });
     const pinBtn = titleRow.createEl("button", {
-      cls: card.pinned
+      cls: isPrioritized
         ? "base-board-frontier-pin base-board-frontier-pin--active"
         : "base-board-frontier-pin",
       attr: {
         type: "button",
-        "aria-label": card.pinned ? "Unpin card" : "Pin card",
-        title: card.pinned ? "Unpin card" : "Pin card",
+        "aria-label": isPrioritized ? "Remove priority" : "Pin to top",
+        title: isPrioritized ? "Remove priority" : "Pin to top",
       },
     });
     setIcon(pinBtn, "lucide-pin");
     pinBtn.addEventListener("click", (event: MouseEvent) => {
       event.preventDefault();
       event.stopPropagation();
-      void this.toggleFrontierPin(card.file, !card.pinned);
+      this.toggleFrontierPriority(card.file.path);
     });
 
     const metaRow = cardEl.createDiv({ cls: "base-board-frontier-meta" });
@@ -1348,18 +1824,70 @@ export class KanbanView extends BasesView implements HoverParent {
     });
   }
 
-  private async toggleFrontierPin(file: TFile, pinned: boolean): Promise<void> {
-    await this.app.fileManager.processFrontMatter(
-      file,
-      (frontmatter: Record<string, unknown>) => {
-        if (pinned) {
-          frontmatter[PINNED_PROPERTY] = true;
-        } else {
-          delete frontmatter[PINNED_PROPERTY];
-        }
-      },
-    );
+  /**
+   * Priority overlay (Step F): toggles a card in today's ordered priority list
+   * for the active scope. Pinning an unranked card promotes it to #1; clicking
+   * a ranked card removes it. The overlay is ephemeral per `(scope, day)` and
+   * lives in view config — it never touches durable `kanban_order`.
+   */
+  private toggleFrontierPriority(path: string): void {
+    const scopeKey = this.activeFrontierScopeKey;
+    const list = this.getFrontierPriorityList(scopeKey);
+    const next = list.includes(path)
+      ? list.filter((entry) => entry !== path)
+      : [path, ...list];
+    this.setFrontierPriority(scopeKey, next);
     this.scheduleRender();
+  }
+
+  /** Today's ordered priority paths for a scope (empty when unset). */
+  private getFrontierPriorityList(scopeKey: string): string[] {
+    const raw = this.config?.get(CONFIG_KEY_FRONTIER_PRIORITY);
+    if (!raw || typeof raw !== "object") return [];
+    const bucket = (raw as Record<string, unknown>)[
+      this.frontierPriorityBucketKey(scopeKey)
+    ];
+    return Array.isArray(bucket)
+      ? bucket.filter((entry): entry is string => typeof entry === "string")
+      : [];
+  }
+
+  /**
+   * Persists today's priority list for a scope, dropping every bucket from a
+   * previous day so the overlay stays ephemeral (per `(scope, day)`).
+   */
+  private setFrontierPriority(scopeKey: string, paths: string[]): void {
+    const raw = this.config?.get(CONFIG_KEY_FRONTIER_PRIORITY);
+    const today = this.getTodayKey();
+    const map: Record<string, string[]> = {};
+    if (raw && typeof raw === "object") {
+      const source = raw as Record<string, unknown>;
+      for (const key of Object.keys(source)) {
+        if (!key.endsWith(`::${today}`)) continue; // prune past days
+        const value = source[key];
+        if (Array.isArray(value)) {
+          map[key] = value.filter(
+            (entry): entry is string => typeof entry === "string",
+          );
+        }
+      }
+    }
+    const bucketKey = this.frontierPriorityBucketKey(scopeKey);
+    if (paths.length > 0) map[bucketKey] = paths;
+    else delete map[bucketKey];
+    this.config?.set(CONFIG_KEY_FRONTIER_PRIORITY, map);
+  }
+
+  private frontierPriorityBucketKey(scopeKey: string): string {
+    return `${scopeKey}::${this.getTodayKey()}`;
+  }
+
+  /** Local calendar day (YYYY-MM-DD) used to scope the priority overlay. */
+  private getTodayKey(): string {
+    const now = new Date();
+    const pad = (value: number): string =>
+      value < 10 ? `0${value}` : `${value}`;
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   }
 
   /**
@@ -1429,6 +1957,23 @@ export class KanbanView extends BasesView implements HoverParent {
     void this.plugin.saveColumnConfig(this.getBaseId(), { columns });
   }
 
+  public updateColumnPreferences(oldName: string, newName: string): void {
+    const collapsed = this.getCollapsedColumns();
+    if (collapsed[oldName]) {
+      delete collapsed[oldName];
+      collapsed[newName] = true;
+      this.config?.set(CONFIG_KEY_COLLAPSED_COLUMNS, collapsed);
+    }
+  }
+
+  public removeColumnPreferences(columnName: string): void {
+    const collapsed = this.getCollapsedColumns();
+    if (collapsed[columnName]) {
+      delete collapsed[columnName];
+      this.config?.set(CONFIG_KEY_COLLAPSED_COLUMNS, collapsed);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   //  Card drop handler (column move + reordering)
   // ---------------------------------------------------------------------------
@@ -1439,7 +1984,9 @@ export class KanbanView extends BasesView implements HoverParent {
     orderedPaths: string[],
   ): Promise<void> {
     const groupByProp = this.getGroupByProperty();
-    if (!groupByProp) return;
+    if (!groupByProp) {
+      throw new Error("Cannot move a card without a group by property");
+    }
     const isArchiveDrop = targetColumnName === ARCHIVE_DROP_COLUMN;
     const targetStatus = isArchiveDrop
       ? ARCHIVE_TARGET_STATUS
@@ -1461,65 +2008,128 @@ export class KanbanView extends BasesView implements HoverParent {
 
     // Insert co-selected cards right after the dragged card's position
     const fullOrderedPaths = [...orderedPaths];
+    if (!fullOrderedPaths.includes(filePath)) fullOrderedPaths.push(filePath);
     if (otherSelected.length > 0) {
       const dropIdx = fullOrderedPaths.indexOf(filePath);
       const insertAt = dropIdx !== -1 ? dropIdx + 1 : fullOrderedPaths.length;
       fullOrderedPaths.splice(insertAt, 0, ...otherSelected);
     }
 
-    await this.applyBatchUpdate(async () => {
-      // 1. Move all cards to the target column (dragged card + any co-selected)
-      const pathsToMove = isMultiDrag
-        ? [filePath, ...otherSelected]
-        : [filePath];
+    const pathsToMove = isMultiDrag ? [filePath, ...otherSelected] : [filePath];
+    for (const path of pathsToMove) {
+      this.optimisticMoves.set(path, targetStatus);
+    }
+    this.optimisticColumnOrders.set(targetStatus, fullOrderedPaths);
 
-      const movePromises = pathsToMove.map((fp) => {
-        const file = this.app.vault.getAbstractFileByPath(fp);
-        if (!file || !(file instanceof TFile)) return Promise.resolve();
-        const sourceColumn = this.getCardSourceColumn(fp);
-        return this.app.fileManager.processFrontMatter(
-          file,
-          (fm: Record<string, unknown>) => {
-            if (sourceColumn !== targetStatus) {
-              this.appendTransitionHistory(
-                fm,
-                groupByProp,
-                sourceColumn,
-                targetStatus,
-              );
-            }
-            if (targetStatus === NO_VALUE_COLUMN) {
-              delete fm[groupByProp];
-            } else {
-              fm[groupByProp] = targetStatus;
-            }
-            if (isArchiveDrop) {
-              fm[ARCHIVED_PROPERTY] = true;
-            } else {
-              delete fm[ARCHIVED_PROPERTY];
-            }
-          },
-        );
+    try {
+      await this.applyBatchUpdate(async () => {
+        // 1. Move all cards to the target column (dragged card + any co-selected)
+        const movePromises = pathsToMove.map((fp) => {
+          const file = this.app.vault.getAbstractFileByPath(fp);
+          if (!file || !(file instanceof TFile)) return Promise.resolve();
+          const sourceColumn = this.getCardSourceColumn(fp);
+          return this.app.fileManager.processFrontMatter(
+            file,
+            (fm: Record<string, unknown>) => {
+              if (sourceColumn !== targetStatus) {
+                this.appendTransitionHistory(
+                  fm,
+                  groupByProp,
+                  sourceColumn,
+                  targetStatus,
+                );
+              }
+              this.applyGroupByValue(fm, groupByProp, targetStatus);
+              if (isArchiveDrop) fm[ARCHIVED_PROPERTY] = true;
+              else delete fm[ARCHIVED_PROPERTY];
+            },
+          );
+        });
+        await Promise.all(movePromises);
+
+        // 2. Update only the moved cards when the column already uses string
+        // fractional keys. Numeric legacy columns are migrated once, in DOM order.
+        await this.writeCardOrder(fullOrderedPaths, pathsToMove);
       });
-      await Promise.all(movePromises);
+    } catch (error) {
+      this.clearOptimisticMoves(pathsToMove, targetStatus);
+      this.scheduleRender();
+      throw error;
+    }
 
-      // 2. Update kanban_order for all cards in the target column
-      const orderPromises = fullOrderedPaths.map((cardPath, i) => {
+    // The optimistic DOM move remains visible until Bases acknowledges the
+    // write through onDataUpdated(), which is the only fresh-data render path.
+  }
+
+  private acknowledgeOptimisticMoves(): void {
+    const confirmedPaths: string[] = [];
+    for (const [path, expectedColumn] of this.optimisticMoves) {
+      if (
+        this.findCardColumn(this.data?.groupedData ?? [], path) ===
+        expectedColumn
+      ) {
+        confirmedPaths.push(path);
+      }
+    }
+    for (const path of confirmedPaths) this.optimisticMoves.delete(path);
+
+    for (const [columnName, orderedPaths] of this.optimisticColumnOrders) {
+      if (orderedPaths.every((path) => !this.optimisticMoves.has(path))) {
+        this.optimisticColumnOrders.delete(columnName);
+      }
+    }
+  }
+
+  private clearOptimisticMoves(paths: string[], columnName: string): void {
+    for (const path of paths) this.optimisticMoves.delete(path);
+    this.optimisticColumnOrders.delete(columnName);
+  }
+
+  /** Persist a contiguous block within an ordered column. */
+  public async writeCardOrder(
+    orderedPaths: string[],
+    pathsToAssign: string[],
+  ): Promise<void> {
+    if (pathsToAssign.length === 0) return;
+
+    const startIdx = orderedPaths.indexOf(pathsToAssign[0]);
+    const prevPath = startIdx > 0 ? orderedPaths[startIdx - 1] : null;
+    const nextPath =
+      startIdx + pathsToAssign.length < orderedPaths.length
+        ? orderedPaths[startIdx + pathsToAssign.length]
+        : null;
+    const existingPaths = orderedPaths.filter(
+      (path) => !pathsToAssign.includes(path),
+    );
+    const hasLegacyOrder = existingPaths.some(
+      (path) => !isOrderKey(this.getFileOrder(path)),
+    );
+    const pathsToWrite = hasLegacyOrder ? orderedPaths : pathsToAssign;
+    const previousOrder = prevPath ? this.getFileOrder(prevPath) : null;
+    const followingOrder = nextPath ? this.getFileOrder(nextPath) : null;
+    const newOrders = hasLegacyOrder
+      ? generateOrderKeys(null, null, orderedPaths.length)
+      : generateOrderKeys(
+          isOrderKey(previousOrder) ? previousOrder : null,
+          isOrderKey(followingOrder) ? followingOrder : null,
+          pathsToAssign.length,
+        );
+
+    await Promise.all(
+      pathsToWrite.map((cardPath, index) => {
         const file = this.app.vault.getAbstractFileByPath(cardPath);
         if (!file || !(file instanceof TFile)) return Promise.resolve();
+        const orderVal = hasLegacyOrder
+          ? newOrders[index]
+          : newOrders[pathsToAssign.indexOf(cardPath)];
         return this.app.fileManager.processFrontMatter(
           file,
           (fm: Record<string, unknown>) => {
-            fm[ORDER_PROPERTY] = i;
+            fm[ORDER_PROPERTY] = orderVal;
           },
         );
-      });
-      await Promise.all(orderPromises);
-    });
-
-    // Always ensure a re-render, even if Bases hasn't fired onDataUpdated yet.
-    // The scheduleRender is debounced, so if Bases fires later it just coalesces.
-    this.scheduleRender();
+      }),
+    );
   }
 
   /** Debounced render — coalesces multiple calls into one. */
@@ -1532,7 +2142,14 @@ export class KanbanView extends BasesView implements HoverParent {
   }
 
   private getCardSourceColumn(filePath: string): string | null {
-    for (const group of this.currentGroups) {
+    return this.findCardColumn(this.currentGroups, filePath);
+  }
+
+  private findCardColumn(
+    groups: BasesEntryGroup[],
+    filePath: string,
+  ): string | null {
+    for (const group of groups) {
       for (const entry of group.entries) {
         if (entry.file?.path === filePath) {
           return this.getColumnName(group.key);

@@ -9,6 +9,11 @@
 
 **Base Board** is an interactive, property-driven Kanban board view for [Obsidian Bases](https://obsidian.md). It allows you to organize your notes into visual columns based on any property in your frontmatter, providing a seamless drag-and-drop experience for managing tasks and structured data.
 
+This development fork integrates upstream `2.5.1` and adds Timeline, Rollout,
+Graph, and active-frontier workflows. The community release described under
+Installation does not include these fork-specific extensions. The current
+implementation and remaining roadmap are tracked in [GRAPH_ARCHITECTURE_PLAN.md](GRAPH_ARCHITECTURE_PLAN.md).
+
 ![Base Board demo](demo.gif)
 
 ## Key Features
@@ -28,6 +33,10 @@
 - **Transition History**: Optionally append timestamped frontmatter entries when cards move between columns.
 - **Timeline View**: Visualize task lifecycle history as zoomable swimlanes grouped by parent task.
 - **Graph View**: Explore the full work graph with requirement and gated-successor relationships.
+- **Rollout View**: Track rollout rings independently from task status and Kanban order.
+- **WIP Limits**: Set per-column work-in-progress limits via the column header context menu. Columns that exceed their limit are highlighted in red.
+- **Collapsible Columns**: Collapse any column to save space; the state is remembered per board.
+- **Card Cover Images**: Display cover images at the top of cards by specifying an image frontmatter property (e.g., `cover: "[[image.png]]"` or a web URL). Defaults to the `cover` property.
 - **Data First**: All changes are written directly to your Markdown files.
 
 ## Usage
@@ -65,11 +74,11 @@ Moves into or out of the no-value column are recorded as `null`. Reordering card
 
 ### Column Colors
 
-Base Board assigns visually distinct default colors to common Kanban columns such as `To Do`, `In Progress`, `In Review`, `Flighting`, and `Completed`. Right-click a Kanban column header and choose **Change column color** to customize it. Timeline phase segments use the same column colors.
+Base Board assigns visually distinct default colors to common Kanban columns such as `To Do`, `In Progress`, `In Review`, `Flighting`, and `Completed`. Right-click a Kanban column header and choose **Change color** to customize it. Timeline phase segments use the same column colors.
 
 ### Timeline View
 
-Base Board also provides a `Timeline` Bases view for visualizing lifecycle history. Each task appears as a horizontal swimlane, and each lane is colored by the task phase recorded in `status_history`. The view includes preset range buttons for day, week, month, semester, year, and fit-to-data, plus the same tag filter pill pattern used by the Kanban view. Hold `Ctrl` or `Cmd` while scrolling over the timeline to zoom between presets.
+Base Board also provides a `Timeline` Bases view for visualizing lifecycle history. Each task appears as a horizontal swimlane, and each lane is colored by the task phase recorded in `status_history`. Day, Week, Month, and Year buttons are shortcuts into 22 zoom stops, with the same tag filter pattern used by the Kanban view. Hold `Ctrl` or `Cmd` while scrolling over the timeline to step through the zoom stops.
 
 The timeline uses the same group-by property as the board, so a board grouped by `status` will visualize status transitions. Tasks without transition history still appear as a single segment from the note creation time to now using the current group-by value.
 
@@ -87,13 +96,44 @@ Use a parent property for feature/subtask relationships instead of a tag. Tags a
 
 ### Active Frontier Kanban
 
-Kanban views can switch **Show cards** from **All cards** to **Active frontier**. In active frontier mode, parent cards stay in the hierarchy but are hidden from the board while they have an unfinished actionable child card. When the child reaches a completed status, the parent card appears again. Planned children do not hide their parent, so future gated work can remain captured without displacing the current work item.
+Use the **All cards / Active frontier** toggle to switch between the editable
+status board and a derived projection of actionable leaf work. The frontier
+shows active, awaiting, blocked, or failed leaves, plus recent completion and
+blocking history. Group containers and impact nodes do not become work cards.
 
-Use this mode when a feature decomposes into nested work, such as a rollout that temporarily drops into a bug-fix task before returning to the parent flighting workstream. Parallel sibling branches remain visible independently.
+Choose a scope to narrow the projection and pin cards into a daily priority
+order for that scope. Priorities live in view configuration, not task metadata.
+Compensations remain dormant until a completed effect needs rollback following
+a failure in its containing scope; missing targets do not make them ordinary work.
+The Graph and Kanban views use the same state derivation.
 
 ### Graph View
 
-Base Board also provides a `Graph` Bases view for seeing the whole structure of a feature or workstream. The graph renders two relationships from frontmatter:
+Graph opens inside a scope, with its ancestry shown as breadcrumbs rather than
+large cards. Workstreams are packed into readable columns. Click a container or
+its chevron to expand it locally; use the focus icon to enter that branch and
+the breadcrumbs to go back. The home icon shows All work. Loose items are kept
+in a visual **Unassigned** group, reachable through the inbox icon without
+changing note ownership.
+
+Collapsed workstreams show summaries, expanded processes become compact headings,
+and tasks remain small readable cards. Repeated single-child process layers fold
+into clickable title trails. The note icon opens a note without expanding it.
+Collapse-all and expand-all apply to the selected scope.
+
+Containers show completed/total work items and icon-based activity counts:
+a green circled check for completed, yellow clock for awaiting, red alert octagon
+for attention, blue circled right arrow for running, and teal play circle for
+ready work. Status words live in tooltips and accessible labels rather than
+repeating on each card. Hidden descendants still contribute to progress and attention.
+Impact nodes are excluded from completion counts; live rollbacks are reported
+separately. Only completed work fills the green progress bar: `0 / n` stays empty.
+Blocked work appears as an alert count in ancestors rather than coloring the
+whole portfolio red. Counts are not estimates of effort.
+
+Overview uses an automatic hierarchy layout and remembers expansion in the view
+settings, without changing notes or manual positions. **Free layout** retains
+the existing editable canvas and its saved camera. Its frontmatter relationships include:
 
 ```yaml
 parent: [[Stage Flighting]]
@@ -106,7 +146,90 @@ depends_on:
 
 `parent` creates a requirement relationship below the current node. `depends_on` creates a gated successor relationship to the right: the successor waits until its dependency is completed. The graph highlights active frontier nodes, muted completed nodes, waiting nodes, and blocked nodes using the same status colors as the Kanban board.
 
-Click a graph node to open its card detail modal. Right-click empty graph space to create a node or insert a top-level feature template. Right-click a node to create a child node, insert relevant downstream templates, or delete the node with graph reference cleanup. Hover near a node boundary to reveal a link anchor, then drag to another node to create a subprocess, dependency/gating, break, or restart link. New graph nodes are Markdown notes with normal task frontmatter, so they immediately participate in Kanban, Timeline, and Graph views.
+In **Free layout**, click a graph node to open its card detail modal. Right-click empty graph space to create a node or insert a top-level feature template. Right-click a node to create a child node, insert relevant downstream templates, or delete the node with graph reference cleanup. Hover near a node boundary to reveal a link anchor, then drag to another node to create a subprocess, dependency/gating, break, or restart link. New graph nodes are Markdown notes with normal task frontmatter, so they immediately participate in Kanban, Timeline, and Graph views.
+
+`rollup_to` adds scope membership, and `compensates` declares an out-of-band
+rollback. `kind: impact` keeps an observational node visible without making it
+participate in work execution. Layout positions and undoable Organize actions
+are stored in the view configuration.
+
+### Physics Experiment
+
+Select the orbit icon in Graph to try **Physics layout (experimental)**. Visible
+owning and execution links act as springs; cross-branch information links do not.
+Nodes repel one another, including terminal children and rollback tasks. Circles
+use state colors and numeric summaries without state badges.
+
+The Physics toolbar offers four layouts: **Workflow**, **Hanging** (downward),
+**Growing** (upward), and **Radial** (around the root). The configured root stays
+fixed, and each layout remembers its positions while the view remains open.
+Scope breadcrumbs and collapse controls remain available.
+
+Wheel or toolbar zoom can pull back to **0.01%** in any Graph presentation.
+**Zoom home** restores 100% and a readable frame around the current work/root.
+Shorter springs and tighter layout spacing keep connected circles closer together
+without shrinking nodes or changing their relationships.
+
+Drag a node to pull the layout; release it to let it settle. Pause freezes motion,
+resume restarts it, and reset rebuilds the current scope from its initial layout.
+Escape cancels a drag. Reduced-motion preference starts physics paused.
+A completed drag updates the node's layout guide, so redraws do not snap it back
+to its original slot. It still settles under the connected spring forces.
+
+The experiment does not change task notes or saved manual positions. Simulated
+positions are kept only while the view remains open; Overview and Free layout
+remain available. Historical browsing stays static and read-only. Physics motion
+does not represent work progress, and large graphs may still need panning.
+
+### Graph History
+
+The strip below Graph lets you scrub recorded history, step backward/forward by
+day, or jump between recorded changes. The radio icon returns to present.
+In Overview, activity markers and change jumps follow the selected scope, while
+the underlying journal still records the full graph. Changed branches are
+highlighted while existing positions and collapse choices stay stable. Historical
+focus changes do not replace your live focus, and an absent historical branch
+stays empty rather than showing unrelated work. Historical items open as read-only metadata snapshots, including
+items no longer in today's graph.
+
+Recording starts with the first Graph observation after installing this build.
+It records graph-relevant metadata while the view is open, not document contents
+or every action elsewhere in the vault. Closed intervals are marked as coverage
+gaps and show last-known state; earlier history is not invented. Ordinary note
+edits do not become progress events, and notes are not copied each day.
+
+Journals are stored in plugin data, so include plugin settings in your backups.
+Timelapse playback, document revision history, and focus/result tracking remain
+future work. The existing Timeline and `status_history` are unchanged.
+
+### Card Ordering
+
+Base Board uses manual drag order so cards remain exactly where you place them. This order is stored in each note's `kanban_order` property and overrides the native Bases **Sort by** setting.
+
+Reordering converts legacy numeric order to fractional string keys. Timeline
+and Rollout retain their independent ordering properties. Keep a vault backup
+before first using the integrated build on existing boards.
+
+### Default Card Properties (`newItemProperties`)
+
+You can set board-specific default frontmatter properties for new cards created from **"+ Add card"** using `newItemProperties` in your `.base` file:
+
+```yaml
+views:
+  - type: kanban
+    name: Frontend Board
+    newItemFolder: Tasks
+    newItemTemplate: Templates/task.md
+    newItemProperties:
+      team: frontend
+      category: alpha
+```
+
+This ensures new cards automatically receive required frontmatter fields, keeping them visible on filtered boards.
+
+New tasks retain the fork's default task metadata and page outline. Board
+defaults may override that metadata; the chosen destination column and order
+always take precedence over configured defaults.
 
 ## Installation
 
@@ -125,6 +248,18 @@ Search for **Base Board** in the Obsidian Community Plugins browser and click **
 1. Clone this repo.
 2. Run `npm install`.
 3. Run `npm run dev` to start the build process in watch mode.
+
+Run `npm test` for regression tests and `npm run build` for the production
+bundle. Deploy this fork with `npm run deploy -- "<vault path>"`, then reload the
+Base Board plugin in Obsidian.
+
+For an isolated renderer check, run `node tests/browser-fixture.mjs`; it prints a
+loopback URL and uses synthetic notes rather than a vault. Stop it with Ctrl+C.
+It is a test harness, not a replacement for Obsidian acceptance testing.
+
+On Windows, npm `10.9.2` can crash with `edgesOut` while resolving updated Vitest
+peers. A one-shot newer resolver avoids changing global tooling:
+`npm exec --yes --package=npm@11.6.0 -- npm install`.
 
 ## License
 

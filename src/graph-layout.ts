@@ -11,6 +11,8 @@
 // orientation maps (depth, cross) → (x, y). "Layered (a/b)" is just this engine
 // with gating sibling-order and the two orientations (they are transposes).
 
+import { compareOrderValues, type OrderValue } from "./order";
+
 export type LayoutOrientation = "top-down" | "left-right";
 export type LayoutSiblingOrder = "natural" | "gating";
 
@@ -21,7 +23,7 @@ export interface LayoutNode {
   /** Gating predecessor ids (`depends_on`); used only for `gating` ordering. */
   dependsOn: string[];
   /** Natural order key (graph_order / kanban_order); lower = earlier. */
-  order: number;
+  order: OrderValue;
   /** Tiebreaker for deterministic ordering. */
   title: string;
 }
@@ -47,7 +49,7 @@ interface InternalNode {
 }
 
 function compareNatural(a: LayoutNode, b: LayoutNode): number {
-  return a.order - b.order || a.title.localeCompare(b.title);
+  return compareOrderValues(a.order, b.order) || a.title.localeCompare(b.title);
 }
 
 /**

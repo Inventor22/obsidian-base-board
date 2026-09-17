@@ -276,13 +276,11 @@ export class ColorPickerModal extends Modal {
 
     new Setting(contentEl)
       .addButton((btn) => {
-        btn
-          .setButtonText("Reset to default")
-          .setWarning()
-          .onClick(() => {
-            this.onChange("");
-            this.close();
-          });
+        btn.setButtonText("Reset to default").onClick(() => {
+          this.onChange("");
+          this.close();
+        });
+        btn.buttonEl.classList.add("mod-warning");
       })
       .addButton((btn) => {
         btn

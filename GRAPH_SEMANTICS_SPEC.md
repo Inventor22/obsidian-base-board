@@ -58,15 +58,23 @@ and stay visually subordinate to the blue `Active` frontier leaf). Modeled like
 
 Links are colored by the states of the nodes they connect; never set directly.
 
-- **Containment return link** (terminal child → parent group): **green** iff the
-  parent group is `Completed`; **muted green** while the group is in progress /
-  not complete. (Case 1: `review → dev` green; `verify → stage` muted green;
-  `broad → repo` muted green.)
-- **Break link** (failed work node → its parent group): exists/red **only when
-  the source work node is `Failed`** and on the active failure path; it
-  *replaces* that group's canonical return link while active (re-homing), and
-  **escalates red up the containment chain**. When the failure is cleared, the
-  break link disappears and the canonical return link is restored.
+- **Completion return** retraces the declared dependency chain to its parent on
+  a parallel track. For `A -> B -> C -> D`, the return is `D -> C -> B -> A`.
+  All return segments are green when the terminal step's derived state is
+  `Completed`; otherwise they remain muted. Independent branches report their
+  own outcomes, so a successful branch can remain green beside a failed branch.
+- **Failure return** begins at a genuinely failed/blocked work node and
+  backtracks through same-parent dependency predecessors, then the owning parent.
+  If C fails, the return is `C -> B -> A`, not a direct C-to-A shortcut. The
+  completed predecessors keep their own successful states. Feedback continues
+  through enclosing workflow sequences, stopping at scope membership boundaries.
+  It replaces completion feedback along the failed path; a shared return segment
+  is red once rather than overlapping red/green. Clearing failure removes the
+  derived red trace and restores the ordinary return.
+- **Unexecuted forward links** into invalidated, cancelled, or waiting successors
+  are gray. They do not propagate red into work that did not execute. Rendering
+  does not write statuses or relationship metadata; failure operations invalidate
+  downstream work as described below.
 
 ## The unifying primitive: execution order ("before" / "after")
 
@@ -91,8 +99,8 @@ Given the execution-order partition relative to the acted-on work node `X`:
 - Links re-derive (Layer B).
 
 ### Set Failed(X)
-- `X` → `Failed`; a **red break link** is drawn `X → parent group` and escalates
-  red up the containment chain.
+- `X` → `Failed`; a **red failure return** backtracks from X through its dependency
+  predecessors to its parent, continuing through enclosing workflow sequences.
 - **Everything before `X`** → `Completed` (it ran).
 - **Everything after `X`** → `Invalidated` (unreachable: the rest of its ring AND
   all subsequent rings).

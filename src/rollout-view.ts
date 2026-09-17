@@ -191,7 +191,9 @@ export class RolloutView extends BasesView {
     cardEl.dataset.columnName = columnName;
 
     if (item.feature) {
-      const breadcrumbEl = cardEl.createDiv({ cls: "base-board-card-hierarchy" });
+      const breadcrumbEl = cardEl.createDiv({
+        cls: "base-board-card-hierarchy",
+      });
       const iconEl = breadcrumbEl.createSpan({
         cls: "base-board-card-hierarchy-icon",
       });
@@ -219,7 +221,11 @@ export class RolloutView extends BasesView {
     });
   }
 
-  private renderChip(parentEl: HTMLElement, label: string, value: string): void {
+  private renderChip(
+    parentEl: HTMLElement,
+    label: string,
+    value: string,
+  ): void {
     const chipEl = parentEl.createSpan({ cls: "base-board-card-chip" });
     chipEl.createSpan({ cls: "base-board-chip-label", text: label });
     chipEl.createSpan({ cls: "base-board-chip-value", text: value });
@@ -266,7 +272,7 @@ export class RolloutView extends BasesView {
           if (!(orderedFile instanceof TFile)) return Promise.resolve();
           return this.app.fileManager.processFrontMatter(
             orderedFile,
-            (frontmatter) => {
+            (frontmatter: Record<string, unknown>) => {
               frontmatter[ROLLOUT_ORDER_PROPERTY] = order;
             },
           );
@@ -277,31 +283,39 @@ export class RolloutView extends BasesView {
     this.render();
   }
 
-  private async updateRolloutRing(file: TFile, nextRing: string): Promise<void> {
-    await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-      const previousRing = this.normalizeRing(frontmatter[ROLLOUT_RING_PROPERTY]);
-      if (previousRing === nextRing) return;
+  private async updateRolloutRing(
+    file: TFile,
+    nextRing: string,
+  ): Promise<void> {
+    await this.app.fileManager.processFrontMatter(
+      file,
+      (frontmatter: Record<string, unknown>) => {
+        const previousRing = this.normalizeRing(
+          frontmatter[ROLLOUT_RING_PROPERTY],
+        );
+        if (previousRing === nextRing) return;
 
-      frontmatter[ROLLOUT_ENABLED_PROPERTY] = true;
-      frontmatter[ROLLOUT_RING_PROPERTY] = nextRing;
-      const history = Array.isArray(frontmatter[ROLLOUT_HISTORY_PROPERTY])
-        ? (frontmatter[ROLLOUT_HISTORY_PROPERTY] as unknown[])
-        : [];
-      const record: RolloutHistoryEntry = {
-        from: previousRing === "None" ? null : previousRing,
-        to: nextRing === "None" ? null : nextRing,
-        at: new Date().toISOString(),
-        property: ROLLOUT_RING_PROPERTY,
-        source: "baseboard-rollout-board",
-      };
-      frontmatter[ROLLOUT_HISTORY_PROPERTY] = [...history, record];
-    });
+        frontmatter[ROLLOUT_ENABLED_PROPERTY] = true;
+        frontmatter[ROLLOUT_RING_PROPERTY] = nextRing;
+        const history = Array.isArray(frontmatter[ROLLOUT_HISTORY_PROPERTY])
+          ? (frontmatter[ROLLOUT_HISTORY_PROPERTY] as unknown[])
+          : [];
+        const record: RolloutHistoryEntry = {
+          from: previousRing === "None" ? null : previousRing,
+          to: nextRing === "None" ? null : nextRing,
+          at: new Date().toISOString(),
+          property: ROLLOUT_RING_PROPERTY,
+          source: "baseboard-rollout-board",
+        };
+        frontmatter[ROLLOUT_HISTORY_PROPERTY] = [...history, record];
+      },
+    );
   }
 
   private getFrontmatter(file: TFile): Record<string, unknown> | undefined {
     const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
     return frontmatter && typeof frontmatter === "object"
-      ? (frontmatter as Record<string, unknown>)
+      ? frontmatter
       : undefined;
   }
 

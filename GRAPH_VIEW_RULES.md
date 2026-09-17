@@ -13,9 +13,240 @@
 
 ---
 
+## 0. Hierarchical overview (build 2026.09.16.2)
+
+Graph defaults to **Overview**, a desktop presentation for monitoring concurrent
+work without keeping every thread in working memory. **Free layout** retains the
+existing editable canvas, manual positions, and detailed relationship types.
+
+- Overview follows both containment (`parent`) and scope membership (`rollup_to`).
+  A single top-level scope chain is followed to its deepest unambiguous scope;
+  ancestors appear as breadcrumbs, not full-size canvas cards. The canvas shows
+  the selected scope's immediate workstreams, initially collapsed.
+  Click a container or its chevron to toggle it; Enter/Space does the same.
+  Nested expansion choices are retained. An explicit note button opens a container
+  note without expanding it. Leaves still open their note.
+- The focus icon or **Focus this branch** menu enters a container's immediate
+  children. Breadcrumbs navigate upward; the home icon opens **All work**. A
+  scope/workstream picker supports direct navigation. `graphOverviewFocus` stores
+  the selected stable recording key, or `@all`/`@unassigned`, in view config.
+- Disconnected leaf items are collected in an **Unassigned** summary at All work
+  and remain reachable from an inbox/count button in scoped views. Opening it
+  packs those items into readable columns. This is a visual-only group: it adds
+  no parent, scope, note, or journal record, and never guesses task ownership.
+- Collapse-all and expand-all operate within the selected scope.
+  Expansion is stored in view config `graphOverviewExpanded`, never in notes.
+  `graphPresentation` selects the mode. Existing `graph_collapsed` continues to
+  control Free layout, not Overview.
+- Each summary counts unique descendant work leaves once, including shared
+  members only once within that summary. Impact nodes and containers are not work
+  units. Compensation tasks are outside the completion denominator; live rollbacks
+  are counted separately as attention. The progress bar is a count of work items,
+  not an effort-weighted estimate. Only completed items fill the bar, in green;
+  `0 / n` has no fill. Running/awaiting/ready/blocked work is shown by separate
+  colored numeric counts with tooltips. Abandoned items are not counted as completed.
+- Leaves retain their semantic state colors, including red blocked/failed work.
+  Container fill summarizes running (blue), awaiting (yellow), ready (teal), or
+  completed (green) work, otherwise neutral. Blocked descendants and live rollback
+  remain visible as alert counts without painting every ancestor red. None of
+  these presentation rules changes execution state or writes task statuses.
+- Collapse changes only the rendered projection. Full relationships, frontier,
+  and progress are retained, including updates from hidden descendants. A shared
+  node remains visible through another expanded path. Overview draws a single
+  deterministic hierarchy parent per visible node to avoid duplicate branches;
+  full cross-links remain available in Free layout. Cycles retain a visible root.
+- Independent workstreams are packed into viewport-sized columns. An expanded
+  branch uses compact indented headings and task cards within its own column;
+  expansion moves later work in that column, not neighboring columns. Single-child
+  intermediate process wrappers compress into a focusable title trail. Collapse
+  shows a 136px-high summary; expanded headings use 64px and tasks 88px, with a
+  20px allowance for a compressed trail. Node width remains 220px.
+- All graph presentations support zoom from 0.01% to 225%. Wheel and toolbar
+  zoom remain proportional at tiny scales; the positive floor prevents invalid
+  camera math. Zoom home restores 100% and frames the current graph: the top of
+  packed workstreams in Overview, or the configured root in Physics.
+  Desktop resizing repacks columns. Layout never writes `graphNodePositions` or note positions.
+  Overview is read-only for structure and positioning; edit those in Free layout.
+- Overview and Free layout have independent cameras. Overview uses
+  `graphOverviewViewport`/`graphOverviewWorld`. Expansion anchors the clicked
+  heading in screen space even when its height changes. Camera initialization waits for a laid-out viewport, including
+  settings-triggered rerenders, so the first frame and repeated toggles do not drift.
+
+The detailed link/status-editing rules below apply to **Free layout**. The
+underlying state model remains shared by all presentations.
+
+### 0.1 Visual status language
+
+Prefer visual information over redundant text. All presentations use the same
+state colors, defined by `getGraphStateVisual` in `src/graph-overview.ts`.
+The symbols below remain in toolbar totals, not on graph nodes:
+
+| Meaning | Icon | Color |
+|---------|------|-------|
+| Completed | `lucide-circle-check` | Green |
+| Awaiting | `lucide-clock` | Yellow |
+| Needs attention / failed | `lucide-octagon-alert` | Red |
+| In progress | `lucide-circle-arrow-right` | Blue |
+| Ready | `lucide-circle-play` | Teal |
+| Gated waiting | `lucide-lock` | Neutral |
+
+- No visible status chips such as "Needs attention" or "In progress" on graph
+  nodes. Nodes use their colors, titles, and numeric summaries without passive
+  status, agency, rollback, or root-pin icons. Tooltips and accessible names retain
+  state/ownership details, and action controls retain icons.
+- Completion is a green completed/total fraction. Other node summary counts use
+  state colors with descriptive tooltips. Toolbar totals retain symbols and
+  numbers; ready and running totals remain distinct.
+- Overview/Free layout/Physics mode buttons are icon-only with tooltips and pressed state.
+  Titles and custom workflow labels remain textual because they identify the
+  work rather than repeat its status. Node and control dimensions remain fixed.
+
+### 0.2 Recorded graph browsing
+
+- The timeline below Graph records an initial metadata baseline and subsequent
+  observed changes. A view's `graphRecordingId` selects its journal in plugin
+  data (`graphHistories`); no daily notes or copied task files are created.
+- The range input scrubs continuously. Day arrows move by local calendar days;
+  skip arrows jump recorded changes in the selected scope. With the timeline focused, left/right step
+  days, Shift-left/right step changes, Home selects the baseline, and End returns
+  to present. The radio button also returns to present. Wheel events over the
+  history strip change time, not canvas zoom.
+- Scope filtering applies to markers, change comparisons, counts, and jumps, not
+  to recording: the full graph journal is preserved. Unrelated branch changes
+  do not generate activity marks in a focused workstream. Moves into or out of
+  the scope are still recorded as arrivals/departures, and coverage gaps remain.
+  Free layout browses graph-wide history.
+- Event ticks indicate metadata observations, not effort or guaranteed progress.
+  Recording is limited to an open Graph view. Closed-session intervals are
+  hatched and flagged; those dates show last-known state. Dates before the first
+  baseline are unavailable. An item leaving the graph is not asserted to be deleted
+  from the vault, since changing filters can have the same effect.
+- Historical snapshots reconstruct their own titles, statuses, relationships,
+  kind, and agency. They do not combine old statuses with today's hierarchy.
+  Current work continues to be recorded while a historical date is selected.
+- Historical mode is read-only Overview: structure editing and Free layout are
+  unavailable. Opening any node shows recorded graph metadata, not an editable
+  live document. Removed nodes can still be inspected. Note content revisions
+  are not captured by this first implementation.
+- Expansion and camera changes during historical browsing are ephemeral. Existing
+  node positions remain stable within each browsed scope; newly encountered nodes
+  use unoccupied slots. Historical focus changes do not overwrite live focus.
+  A selected branch absent at a past date shows an empty scoped view, never an
+  unrelated whole-graph fallback. Returning to present restores live focus,
+  settings, and camera.
+- Added/updated/removed indicators compare with the previously displayed graph.
+  Highlighting propagates through old and new ancestry so collapsed containers
+  show changes below them. The slider is retained across graph redraws.
+- Save/corruption errors expose a warning and retry control. Return-to-present
+  remains available even during recording errors. No failed/unsupported journal
+  is silently replaced. Playback animation is not implemented yet.
+
+### 0.3 Experimental physics presentation
+
+- The orbit icon selects **Physics layout (experimental)**, stored as
+  `graphPresentation: physics`. It is opt-in; Overview remains the default.
+  Physics uses the selected scope, collapse state, Unassigned grouping, focus
+  navigation and state colors from Overview, but renders 144px circular work
+  nodes and 160px circular summaries. Overview and Free layout retain their cards.
+- Collapsed nodes with children show two rings total: the node border plus one
+  thin, state-colored outer ring. The
+  same indicator follows the card outline in Overview and Free layout. Expanded
+  nodes, leaves, and navigation-only ancestry nodes do not show the rings. This
+  uses the existing `aria-expanded` state, adds no pointer targets, and does not
+  change node dimensions, physics collision sizes, or stored positions.
+- The Physics toolbar offers **Workflow**, **Hanging**, **Growing**, and **Radial**
+  layouts, stored as `graphPhysicsLayout` (`workflow`, `hanging`, `growing`, `radial`).
+  Workflow remains the default. Positions, guides, and cooling state are cached
+  separately for each scope/layout; changing layouts never changes work metadata.
+- Workflow uses Dagre for a compact left-to-right starting arrangement
+  within each independent workflow, then packs those groups into rows. Membership
+  orders the groups without forcing all workstreams into one set of ranks.
+  `d3-force` provides short springs, repulsion, circular
+  collision bounds, damping, and a gentle guide toward that arrangement.
+- Live and initial simulations share the compact spacing preset: an 8px spring
+  gap beyond collision radii, repulsion 120, and Workflow guide strength 0.08.
+  Workflow ranks use 12px gaps and independent groups use 32px gaps. Rooted
+  depth targets use 164px rather than 190px. Node sizes and collision clearance
+  stay unchanged; actual link lengths can grow to accommodate crowded branches.
+- Hanging pulls branches down from the root; Growing pulls them upward; Radial
+  balances them around root-relative depth rings. These layouts have directional
+  or radial guides, not fixed per-node slots. Their initial tree follows actual
+  spring connectivity and is pre-settled with bounded ticks so paused views start
+  with usable spacing, preserving the configured root at world `(0, 0)`.
+- Execution links, owning parent/child associations, each parentless node's primary
+  visible scope membership, and same-branch compensation links create springs.
+  Terminal children therefore participate, including observations and rollbacks.
+  Cross-branch information/secondary membership links and failure feedback do not
+  exert attraction. Explicit cross-branch execution dependencies remain springs.
+- If a visible component has no physical route through the existing flow links,
+  its owning parent supplies a derived association spring. This does not invent
+  an execution dependency or rewrite ownership. Real ownership islands are not
+  silently assigned a fictional parent. Duplicate unordered endpoint pairs
+  contribute one spring; hidden/self links contribute none.
+- Physics and Free layout share the canonical workflow edge builder: a parent
+  starts each dependency chain, steps follow their declared dependencies, and the
+  return retraces the dependency links to that parent. For `A -> B -> C -> D`,
+  completion returns `D -> C -> B -> A`. All segments are muted until that
+  terminal step completes, then green. If C fails, red feedback follows
+  `C -> B -> A`, without a direct C-to-A shortcut or recoloring completed B.
+  The feedback continues through enclosing workflow sequences, but not scope
+  membership. Hidden failures still surface through visible subprocesses.
+- Unexecuted downstream nodes keep their invalidated/cancelled states and gray
+  incoming edges; they do not become additional failures. An independent completed
+  branch retains its green return. Where branches share a return segment, red
+  takes precedence without duplicate red/green lines. Authored ancestor shortcuts
+  are superseded by backtracking; explicit links to other recovery nodes remain.
+  Impact nodes and pure scope associations are not executable chains.
+- Forward edges and arrowheads show completed green, running blue, awaiting amber,
+  ready teal, and failure red. Backtracking returns follow a close parallel track
+  with endpoints on the circle perimeter; routes try to avoid intervening nodes.
+  These outcome tracks are derived and read-only. Hover/focus
+  highlights incident paths. Dense or non-planar graphs can still have crossings.
+  Physics does not expose structural link-editing handles.
+- The simulation starts from the ordered layout or its per-scope in-memory cache.
+  It animates on requestAnimationFrame and cools to rest. An unchanged metadata
+  rerender preserves a cooled simulation; structure changes reheat it. Pause stops
+  motion and frame scheduling; resume reheats; reset discards this scope's cached
+  positions and starts again. Reduced-motion preference starts it paused, while
+  explicit resume/reset permits motion.
+- Dragging a node temporarily pins it to the pointer; release lets it settle.
+  A successful drop rebases that node's Workflow guide to the drop position and
+  caches it across redraws, instead of snapping back to the original Dagre slot.
+  Spring forces still act after release; this is not a permanent pin.
+  Dragging also works when paused. Escape or window blur cancels the drag and
+  restores its original point and guide. Data refreshes are deferred during dragging so
+  they cannot detach the active gesture. Camera panning and zooming remain usable.
+- Positions, cooling energy, and the physics camera/world are view-session memory
+  only. Ticks and drags never write note properties, `graphNodePositions`, undo
+  history, or graph observation events. Scope/collapse choices remain ordinary
+  view preferences. There is no save-physics-layout command in this experiment.
+- The pin control chooses a per-view `graphRoot` reference, preferably the note's
+  stable `id`. Choosing a root does not rewrite any note relationships. The root
+  becomes the default focus when no focus was saved and stays available in scope
+  navigation. Clear fixed root removes this preference.
+- In Physics, the configured root is a pinned summary at world `(0, 0)`, including
+  after reheat, reset, collapse, scope changes, and view reconstruction. It cannot
+  be dragged. Scope entry and Zoom home frame compact workflows beside the root
+  when they fit. Hanging frames the root near the top, Growing near the bottom,
+  and Radial near the center. Deliberate panning is
+  preserved until the next navigation or Home command. Focused views retain the
+  root and the real containment/membership
+  ancestry needed to connect the visible work, without showing unrelated siblings
+  or inventing links for disconnected nodes. Ancestry summaries navigate on click.
+- Historical navigation resolves the root from the recorded snapshot only; it
+  never injects a current note into an earlier snapshot. Root selection is disabled
+  during historical browsing, which remains static Overview.
+- Switching presentation, rebuilding the graph, or unloading stops the prior
+  simulation and frame loop. History always uses static read-only Overview; the
+  Physics button is disabled there and returning to present restores the selected
+  live presentation. Force settling is not temporal replay or work progress.
+- Large expanded graphs may still require panning. This experiment explores
+  spatial relationships; the packed Overview remains available for dense scanning.
+
 ## 1. Nodes
 
-Each node is one Obsidian note. A node has **two independent visual dimensions**:
+Each work node is one Obsidian note. The visual Unassigned grouping has no note
+and does not participate in the work engine or journal. A work node has **two independent visual dimensions**:
 
 1. **Accent color** — driven by status/column.
 2. **State** — a computed overlay that sets border style, tint, opacity, and a
@@ -23,7 +254,7 @@ Each node is one Obsidian note. A node has **two independent visual dimensions**
 
 ### 1.1 Node accent color
 
-- The node's left border and `--graph-node-color` come from
+- In Free layout, the node's left border and `--graph-node-color` come from
   `getColumnColor(this.config, node.status)`.
 - This is the **same color as that status's Kanban column**.
 - Accent color is **not** derived from node type.
@@ -42,14 +273,14 @@ Each node is one Obsidian note. A node has **two independent visual dimensions**
 | Priority | State | Trigger | Badge icon |
 |----------|-------|---------|------------|
 | 1 | `invalidated` | status is `invalidated` or `skipped` | `lucide-circle-off` |
-| 2 | `cancelled` | status is `cancelled`/`canceled` | `lucide-x-circle` |
-| 3 | `interrupted` | status is `interrupted` or `failed` | `lucide-ban` |
-| 4 | `active` | status is `in progress`, `doing`, or `active` | `lucide-play` |
-| 5 | `awaiting` | status is `awaiting` (live but parked, waiting on something external) | `lucide-hourglass` |
-| 6 | `completed` | status is `completed` or `done` | `lucide-check` |
+| 2 | `cancelled` | status is `cancelled`/`canceled` | `lucide-circle-x` |
+| 3 | `interrupted` | status is `interrupted` or `failed` | `lucide-octagon-alert` |
+| 4 | `active` | status is `in progress`, `doing`, or `active` | `lucide-circle-arrow-right` |
+| 5 | `awaiting` | status is `awaiting` (live but parked, waiting on something external) | `lucide-clock` |
+| 6 | `completed` | status is `completed` or `done` | `lucide-circle-check` |
 | 7 | `blocked` | status is `blocked` | `lucide-octagon-alert` |
 | 8 | `waiting` | own `depends_on` deps OR any ancestor's deps are not all terminal (by DERIVED state) | `lucide-lock` |
-| 9 | `active` (computed) | ready leaf: gating prerequisites satisfied | `lucide-play` |
+| 9 | `active` (computed) | ready leaf: gating prerequisites satisfied | `lucide-circle-play` |
 
 **Group (container) state** — derived fold over children's derived states
 (`deriveGroupState`), precedence `In Progress > Completed > Cancelled/Invalidated > Planned`:
@@ -66,14 +297,14 @@ Each node is one Obsidian note. A node has **two independent visual dimensions**
 Notes:
 - **`in-progress` (purple)** is the derived "this container spans the active
   frontier" state — distinct from the blue `active` leaf and from `completed`.
-  It stays visually subordinate to the blue frontier (`lucide-circle-dot` badge).
+  The state badge uses the shared blue circled-arrow symbol.
 - **No explicit-active override for containers.** Groups are never read from
   their own stored status, so a stale `In Progress` on a container has no effect
   — its state derives purely from its children.
 - **`invalidated` vs `cancelled`:** `invalidated` is work sequenced *after* a
   failed/pruned point that can no longer run; `cancelled` is a deliberately
   pruned sub-graph (`reason: pruned-manual` in the event log).
-- **`awaiting` (amber, `lucide-hourglass`)** is a live-but-parked leaf state:
+- **`awaiting` (yellow, `lucide-clock`)** is a live-but-parked leaf state:
   the work has reached this node and is waiting on something external (a rollout
   to propagate, an agent awaiting input/verification). It is **non-terminal**
   (downstream stays gated/`waiting`) and counts as **live** in the group fold
@@ -84,6 +315,20 @@ Notes:
   resolve correctly even though groups carry no live stored status.
 
 ### 1.2.1 Work-node operations (execution-order partition)
+
+**Shared compensation rule (build `2026.09.15.1`):** Graph and active-frontier
+Kanban both use `graph-engine.ts` for compensation state and failure boundaries.
+A declared `compensates` relationship makes a rollback out-of-band even when its
+target is filtered out. Rollbacks do not participate in containment or membership
+rollups. They are dormant unless a completed target's parent is in the propagated
+failure/blocked scope; scope groups absorb propagation. A triggered rollback is
+active, a completed rollback stays completed, and a failed/blocked rollback is
+interrupted. Dormant rollbacks are hidden in Graph and excluded from Kanban's live
+frontier. Graph retains its orange compensation edges and attention badges.
+
+**Ordering compatibility:** Graph layout and natural node order accept upstream
+fractional Kanban keys as well as numeric order. Explicit `graph_order` remains
+independent; new graph-created task notes append compatible Kanban keys.
 
 Group nodes are **not directly actionable**. The right-click menu offers the
 three work-node operations only on **leaf** nodes, and **Prune** only on groups.
@@ -132,6 +377,11 @@ A node is classified on three **independent** axes (see
 derive state by **rolling up their members** (`rollup_to`) via the group fold,
 get no work-node/Prune/agency actions, and the work engine never follows
 `rollup_to`, so a scope can never read `Failed` — the boundary is automatic.
+
+**Impact nodes** (`kind === "impact"`) are observational and inert. They remain
+visible and linkable in the graph, but derive `idle`, never appear on the active
+frontier, never contribute to parent/scope rollups, are skipped by status-writing
+execution partitions and failure escalation, and expose no work/agency actions.
 
 The **Add node** modal picks a **Kind** (Work item / Subprocess / Group) plus an
 optional free **Label**; the template-internal labels come from **Add template**.
@@ -249,9 +499,9 @@ failed**, **Create link**, **Delete link**, and **Rewire link**.
 - Undo restores the **before** content of every file in the entry (recreating a
   file whose before-state was "did not exist" → deletes it; e.g. the iteration
   auto-created by Mark-as-failed); redo restores **after**.
-- Node **drag** (`graph_x`/`graph_y`) and **collapse** (`graph_collapsed`) are
-  intentionally NOT tracked (high-frequency, low-value), so they don't pollute
-  the history stack.
+- Free-layout node drags and Organize commands use dedicated position-map undo
+  entries in view config. Collapse is a display preference and does not create
+  an undo entry. Overview expansion never changes note files or layout history.
 - A new action clears the redo stack. Stack depth is capped at
   `GRAPH_HISTORY_LIMIT` (50).
 
@@ -263,8 +513,9 @@ failed**, **Create link**, **Delete link**, and **Rewire link**.
   **Subprocess** link. The child gets a `parent` wikilink to the source.
 - The plugin treats `feature` / `parent_task` similarly to `parent` for
   hierarchy (see repo workflow conventions).
-- A node can be **collapsed** (`graph_collapsed` frontmatter), which hides its
-  descendant subprocess tree.
+- A node can be **collapsed**, hiding descendants reached through containment
+  and scope membership. Free layout uses `graph_collapsed` frontmatter; Overview
+  uses its own expansion settings as described above.
 - `getMovableSubgraph` (children + successors) defines what moves when dragging
   a node; collapsing/insertion respect this subtree.
 

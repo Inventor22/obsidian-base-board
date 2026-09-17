@@ -2,11 +2,352 @@
 
 Trigger phrase for a future Copilot chat: **Evolve the graph architecture**.
 
-> **Status:** Design only. Nothing here is built yet. This is the *foundational
-> substrate* that the agent layer (`GRAPH_AGENT_MCP_PLAN.md`) builds on. Captures
-> the architecture decisions from the design conversation so they are durable and
-> sequenced. Build it in independently-testable sections (see "Incremental build
-> strategy").
+> **Status:** Partially implemented. Milestones 1-4 and 6 are implemented;
+> milestone 5 has agency metadata but no skill bindings. Milestone 7 has recorded
+> graph browsing; animated replay and the MCP milestones remain planned. Stored leaf status is still authoritative; the
+> event-log projection is diagnostic. The milestone tables below distinguish
+> shipped behavior from future architecture.
+
+## Deep zoom and spacing (build 2026.09.16.7)
+
+- All Graph presentations now allow 0.01%-225% zoom. Removing the absolute
+  small-change threshold keeps wheel and button zoom responsive at tiny scales;
+  Home restores 100% and the usual scope/root framing. A positive floor avoids
+  division by zero instead of claiming mathematically infinite zoom.
+- A shared compact physics preset reduces spring gap 24px to 8px, repulsion
+  240 to 120, and Workflow guide strength 0.12 to 0.08. Layout rank/group gaps
+  and rooted depth targets are reduced too, so the guides do not fight shorter
+  springs. Circle sizes, collision bounds, branch ownership, and history remain
+  unchanged. Focused tests compare actual settled link gaps in all four layouts.
+
+## Rooted physics layouts (build 2026.09.16.6)
+
+- The physical graph now follows owning relationships as well as execution flow.
+  Primary scope membership connects branches back to the configured root; terminal
+  observations and same-branch rollback links participate. Cross-branch information
+  remains non-physical. Disconnected flow components attach via their existing
+  owning parent, without creating execution dependencies or modifying notes.
+- Four per-view layouts share the same topology: Workflow, Hanging, Growing, and
+  Radial. D3 supplies directional/radial forces for the new modes; Dagre supplies
+  deterministic initial positions. Each scope/layout has its own transient cache.
+- Workflow drag release rebases the old positional guide and retains it through
+  redraws; cancellation preserves the old guide. Nodes can settle under springs
+  without being forced back to their original slots. Dustin remains the fixed root.
+- Nodes retain colors, titles, numeric summaries, accessible names, and tooltips,
+  but omit passive status/agency/rollback/root icons. Action controls remain.
+- The read-only fixture option `node tests/browser-fixture.mjs --vault <vault>`
+  loads selected graph metadata only, never note bodies. Its in-memory write mocks
+  cannot modify vault files. The actual 72-note graph was verified as one physical
+  component with 71 springs, including the Disable RTPv4 node; no note repairs or
+  extra grouping notes were necessary.
+
+Verification: 130 regression tests pass, with zero lint errors and the existing
+12 advisory warnings. The real-vault metadata fixture verified all 72 nodes are
+spring-connected, all three new layouts settle without node overlaps, and the
+rollback drop survives refresh without returning to its old slot. Desktop
+1440x900/1100x760 checks cover color-only nodes, directional framing, compact
+paused starts, cancellation, and exact live-position restoration from history.
+
+## Backtracking returns (build 2026.09.16.5)
+
+- Outcome feedback follows the executed dependency route on a close parallel
+  track. A failure at C in `A -> B -> C -> D` returns `C -> B -> A`; successful
+  predecessors remain green, while invalidated D and its incoming link are gray.
+- Completion also retraces the chain. A terminal outcome controls the whole
+  return, preventing partially completed prefixes from reporting success early.
+  Independent successful branches stay green; red wins on shared return segments.
+- Nested/hidden failures continue through their enclosing workflow sequences.
+  Membership does not transmit failure or gain springs. Superseded ancestor
+  shortcuts no longer compete with the trace; explicit recovery links remain.
+- Physics and Free layout share this derivation. Feedback is read-only, and
+  renderer updates do not rewrite leaf states, historical records, or note links.
+
+## Circular workflow physics (build 2026.09.16.4)
+
+- Physics now uses compact 144px work circles and 160px summary circles, with
+  correctly matched collision geometry and perimeter edge endpoints. Overview
+  and Free layout keep their existing card presentations.
+- The canonical Free-layout workflow builder also supplies Physics: parent to
+  first step, declared dependency sequence, and terminal return to parent. Green
+  completion returns and red failure escalation are retained instead of replacing
+  the workflow with a parent-to-every-child Overview fan-out.
+- Execution start/dependency/return/restart links are springs. Scope membership,
+  inert observations, derived failure feedback, and compensation annotations are
+  not. No relationships or work statuses are changed by layout.
+- Dagre seeds left-to-right order and reduces crossings; D3 uses shorter springs,
+  smaller circular collision bounds, and gentle positional guides. Independent
+  workflows are packed into rows instead of a single tall global ranking. Curved return
+  lanes and node-aware routing separate feedback from the forward path. Hover
+  highlights connected edges; arbitrary dense graphs may still contain crossings.
+- The configured fixed root, per-scope caches, pause/drag behavior, and read-only
+  temporal browsing remain in place. Compact workflows are framed beside the root
+  when they fit; large views still require panning or branch focus.
+
+## Fixed graph root (build 2026.09.16.3)
+
+- A per-view `graphRoot` reference selects a stable note identity without
+  hardcoding a person's name in the plugin. The pin picker is disabled in history.
+- Physics keeps the root at world `(0, 0)` across forces, drag cleanup, reset,
+  scope changes, and reconstruction. Scope entry and Home center it; panning
+  remains under user control. The root is a summary, not an executable task.
+- Focused physics projections retain real containment/membership ancestry back
+  to the root, without unrelated siblings or fabricated ownership. Historical
+  navigation uses recorded identities and never inserts today's missing root.
+- The live vault repair added 17 parents and 2 scope memberships across 19 notes.
+  All 72 graph-eligible notes now reach Dustin; the independent A workflow remains
+  a separate branch. Status, lifecycle history, dependencies, and bodies were
+  preserved and the original 73 graph files were archived before editing.
+- `scripts/audit-graph-root.mjs <vault> <root-note-path> --check --summary` checks
+  the live query using the production hierarchy engine, including unresolved or
+  ambiguous ownership links, cycles, and root reachability.
+
+Verification: 100 regression tests and affected-test typechecking pass. Desktop
+browser checks at 1440x900 and 1100x760 verified root selection, fixed coordinates,
+root framing, real ancestry, no settled card overlaps, paused dragging and Escape
+with a concurrent refresh, static history, and exact live-position restoration.
+No physics or navigation action wrote note metadata or manual layout positions.
+Large branches still require panning; general per-node pinning is not implemented.
+
+## Physics experiment (build 2026.09.16.2)
+
+Implemented the user's spring-and-repulsion experiment as an opt-in **Physics**
+presentation alongside Overview and Free layout. It does not replace the packed
+overview or commit a new manual arrangement.
+
+- `d3-force` supplies link springs, many-body repulsion, conservative collision
+  avoidance based on card dimensions, damping, and gentle centering. The small
+  `GraphPhysics` adapter keeps the engine timer stopped; Graph drives explicit
+  ticks on requestAnimationFrame and stops scheduling when paused or settled.
+- Scoped visible nodes preserve hierarchy/status summaries; visible relationships
+  become straight directed edges, with duplicate endpoint pairs contributing only
+  one physical spring. No workflow or ownership relationships are invented.
+- Pause/resume, reset, and pointer dragging are implemented. Dragging temporarily
+  pins one node; Escape/blur restores the original position. Data refreshes do not
+  detach a drag. Reduced-motion preference starts the experiment paused.
+- Per-scope positions and cooling state are memory-only, as are its camera/world.
+  Unchanged rerenders do not restart a settled graph. No tick or drag alters notes,
+  manual positions, undo history, or recorded progress. Historical browsing stops
+  physics and remains static/read-only; leaving the view cleans up its frame loop.
+
+Verification: 95 tests, project type/lint gate (zero errors, 12 existing warnings),
+and affected-test typecheck pass. Desktop browser checks at 1440x900 and 1100x760
+verified actual node/edge motion, pause, resume, reset, settling, pointer dragging,
+Escape cancellation, mid-drag refresh, static history, reduced-motion handling,
+and no note/layout/journal changes. The 85-note fixture's expanded 50-node scope
+with 40 springs settled with no overlaps. A small connected/disconnected graph
+fits the smaller desktop viewport at normal card size after centering.
+
+The production build and deployment succeeded with Graph marker `2026.09.16.2`;
+all three installed artifact hashes match the build output. Previous plugin
+files and settings were backed up before deployment.
+
+This is a spatial experiment, not playback of historical growth. Physics controls
+for force tuning, general per-node pins, and saving an arrangement are not included yet.
+Native Obsidian acceptance still requires reloading the plugin and trying it in
+the user's own graph.
+
+## Scoped overview (build 2026.09.16.1)
+
+Implemented following the user's screenshot showing an unreadably wide row of
+disconnected roots and a long expanded scope spine. These improvements change
+Overview itself; they do not add another presentation mode.
+
+- Scope breadcrumbs replace large ancestor cards. A unique scope spine opens at
+  its deepest unambiguous scope; home/picker navigation exposes the rest. Focus
+  icons and the node menu enter any workstream, with breadcrumb navigation back.
+- Disconnected leaf items live in a collapsed visual **Unassigned** group at All
+  work, also reachable by an inbox/count control in a scoped view. No note data,
+  ownership relationship, or history record is synthesized for the group.
+- Readable 220px-wide workstreams wrap into multiple desktop columns instead of
+  one enormous root row. Expanding a branch allocates space inside its column.
+  Expanded processes are compact headings; leaf tasks are smaller cards; expanded
+  single-child scaffolding compresses into a navigable title trail. Zoom is at
+  least 80%; initial and home views start at the top, not the middle of a huge graph.
+- Completion bars fill only for completed work. State icons/counts describe the
+  remaining work. Blocked leaves are red; ancestors display alert counts without
+  turning the entire portfolio into a red blocked item. Execution semantics are
+  unchanged.
+- History comparison, activity ticks, and change stepping follow the selected
+  scope while the recording retains the whole graph. Scope identity and positions
+  stay stable through time; absent historical scopes do not silently widen the
+  view. Historical focus remains ephemeral, and present restores live focus and
+  camera. Free-layout history remains graph-wide.
+
+Verification: 83 automated tests, source lint/typecheck (zero errors; 12 existing
+API warnings), and separate affected-test typecheck pass. The desktop fixture now
+includes 85 notes, a three-scope spine, 12 uneven workstreams, 28 disconnected
+items, and nested single-child wrappers. At 1440x960 and 1100x760 the overview
+uses four/three readable columns. Expanded scope testing covered 50 rendered nodes
+without overlap or overflow, unchanged neighboring columns, focus/keyboard/trail
+navigation, empty zero-completion bars, scope-local history, unchanged notes and
+manual positions, and restored live/free-layout cameras. Light and dark desktop
+views were inspected. Native vault acceptance remains a user reload check.
+
+The production build and deployment succeeded with Graph marker `2026.09.16.1`;
+all three installed artifact hashes match the build output. Previous plugin
+files and settings were backed up before deployment.
+
+The previous overview/temporal delivery notes below describe their original
+milestones; this section supersedes the former all-roots-row and ancestor-card
+presentation rules.
+
+## Recorded temporal graph (build 2026.09.15.4)
+
+The first temporal implementation keeps one persistent graph and reconstructs
+its observed metadata at a selected time. It does not duplicate notes each day.
+
+- **Observation journal:** `src/graph-history.ts` stores one initial baseline,
+  then changed-node upserts and keys that left the graph. Captured fields include
+  title, identity, status, parent, dependencies, memberships, compensation links,
+  kind, agency, lock metadata, and order. Derived states are recomputed using the
+  shared engine. Rendering or the passage of a day does not produce change events.
+- **Persistence:** each view has a `graphRecordingId`; journals live under
+  `graphHistories` in plugin data, separate from note files. Saves are serialized
+  with settings writes. A failed save stays retryable; damaged/unsupported history
+  is surfaced without replacing it with an empty baseline. Stable note IDs and
+  recorded paths preserve identity through observed renames and ID backfills.
+- **Coverage:** recording begins on the first Graph query observation and runs
+  while that view is open. Changes are timestamped when observed, not when an
+  unobserved action might have happened. Reopening starts a new observation session
+  and marks the closed interval as a gap. Gap dates show last-known state with a
+  warning, not claimed exact history. Nothing is backfilled before the baseline.
+  Leaving a query can mean a filter change, not necessarily deletion of the note.
+- **Navigation:** a persistent bottom range control supports continuous scrubbing
+  and wheel/trackpad time navigation. Buttons step one local-calendar day or jump
+  to the preceding/following recorded change. Left/right keys step days when the
+  timeline is focused; Shift-left/right jump changes; Home selects the baseline;
+  End or the radio icon returns to present. Canvas scrolling keeps its graph role.
+- **Read-only history:** past states use Overview and captured graph metadata.
+  Historical node opening displays a read-only metadata snapshot, including nodes
+  absent from today's query. History expansion and camera changes stay local to
+  browsing; return-to-present restores the live presentation, camera, and settings.
+  Live observations continue while the user is inspecting the past.
+- **Changes and layout:** highlights compare with the previously displayed
+  snapshot, including affected ancestry on both sides of reparenting. Added,
+  changed, and removed counts use icons. Existing positions are retained during a
+  browsing session; newly encountered historical nodes receive unoccupied slots.
+  The timeline control stays mounted during redraws so dragging is uninterrupted.
+
+Verification: 72 tests, source type/lint gate, and separate history-test typecheck
+pass. Desktop fixture checks at 1440x900 and 1100x760 cover stepping, native slider
+dragging, wheel routing, removed-item opening, gap disclosure, concurrent live
+updates, save-error recovery, and restoring the live/free-layout camera without
+note or layout-setting writes. These are synthetic-host checks, not a native
+Obsidian acceptance run.
+
+The production build and deployment succeeded; all three installed artifact
+hashes match the build output and the deployed Graph marker is `2026.09.15.4`.
+The previous plugin files and settings were backed up before deployment.
+
+**Deferred:** play/pause timelapse, time-scaled event/trajectory layout, focus and
+intermediate-result events, document content revisions, historical editing/restore,
+and cross-device journal merging. This is a local observation journal, not yet
+event sourcing for the entire vault. Back up plugin data along with the vault;
+history is not automatically pruned. Existing `status_history` remains unchanged.
+
+## Working-memory overview (2026-09-15)
+
+**Product direction:** the graph is the primary way to digest everything on the
+user's plate hierarchically while many human/agent threads run concurrently.
+Show a manageable set of workstreams, let the user expand detail on demand, and
+keep progress and problems visible when children are hidden. Desktop only.
+
+Implemented in Graph build `2026.09.15.2`:
+
+- Default Overview + preserved Free layout presentations. Scope membership and
+  containment both participate in collapse; expansion is a per-view preference.
+- Compact top-down layout and sparse hierarchy links, without changing saved
+  canvas positions or note structure. Nested expansion, collapse-all, expand-all,
+  keyboard activation, and explicit note-opening controls.
+- Unique-leaf completion bars plus running/awaiting/blocked/ready/rollback counts.
+  Semantic colors surface hidden problems and distinguish running threads from
+  ready work. Progress measures work-item counts, not effort.
+- Full work graph retained independently from its rendered projection. Separate
+  cameras, initialized after layout; clicking to expand preserves screen position.
+- Regression coverage for scope/multi-membership/cycle behavior, visibility,
+  state summaries, layout, note immutability, and saved free-layout positions.
+  All 48 tests pass. Desktop browser checks at 1440x900 and 1100x760 cover real
+  clicks, keyboard controls, state updates under collapse, no overlapping nodes,
+  unchanged notes/positions, and zero measured anchor drift across repeated toggles.
+
+The existing prototype/manual-canvas interaction remains in Free layout. This
+does not add an agent execution runtime or change the work-state semantics.
+See `GRAPH_VIEW_RULES.md` section 0 for the as-built presentation contract.
+
+Visual refinement in Graph build `2026.09.15.3`: standard status words are
+replaced by a green circled check, yellow clock, red alert octagon, and blue
+circled right arrow. Summary and toolbar counts use icons plus numbers; mode
+buttons and ownership use icons. Tooltips and accessible names retain meanings,
+while work titles and custom labels remain visible. The engine is unchanged.
+All 53 tests pass; real Lucide SVGs were checked in the desktop fixture at
+1440x900 and 1100x760, including expansion, mode switching, labels, and spacing.
+
+## Stabilization and upstream integration (2026-09-15)
+
+Integrate upstream `2.5.1` while preserving the fork's Kanban, Timeline, Rollout,
+Graph, transition history, scopes, priorities, and impact-node behavior.
+
+**Current scope: desktop only.** Do not add phone/tablet layouts or mobile-only
+features, and validate desktop viewports only. Preserve existing behavior for
+narrow desktop Obsidian panes. This follows the user's September 15 clarification.
+
+- [x] Preserve the starting HEAD archive and working-tree patch outside the repo.
+- [x] Put compensation state derivation in the shared graph engine and make the
+  Graph and active-frontier Kanban use the same result. Cover dormant, triggered,
+  completed, failed, and scope-isolated rollbacks; retain Awaiting and impact
+  semantics.
+- [x] Integrate upstream correctness and interaction changes, including typed
+  group-by writes, rename fixes, fractional ordering, collapsed columns, WIP
+  limits, cover images, rich formulas, and default new-card properties.
+- [x] Preserve existing numeric order when migrating to fractional keys. Verify
+  transition history and all custom views against the updated shared APIs.
+- [x] Add automated regression coverage and run tests, lint, and production build.
+- [x] Update the implementation documentation and identifiable build marker.
+- [x] Deploy to the verified local vault and compare deployed artifact hashes.
+
+The user is unavailable for Git approval: keep changes uncommitted, do not push,
+and do not create a branch. Upstream code integration will not by itself record
+merge ancestry; a reviewed Git merge/checkpoint remains a separate action.
+Live Obsidian acceptance checks must be identified separately from headless tests.
+
+### Implementation snapshot
+
+- Final gates: clean `npm ci`, 36 passing tests, lint with zero errors and 12
+  advisory Obsidian API warnings, production build successful, dependency audit
+  with zero vulnerabilities. Deployment to the configured local vault succeeded;
+  SHA-256 hashes of all three deployed artifacts match the build output.
+- Upstream source through `d7defc7` (`2.5.1`) is integrated as fork build
+  `2.5.1-dev.1`; Graph marker is `2026.09.15.1`.
+- `graph-engine.ts` owns compensation identity, state, forward-rollup exclusion,
+  and failure-scope boundaries. The Graph's view-level scheduler now handles
+  attention rendering only. Both views keep unresolved compensation declarations
+  dormant, rather than offering a rollback as ordinary work.
+- Fractional ordering is shared by Kanban and graph layout. Numeric columns
+  migrate on reorder; new graph-created cards respect fractional keys. Timeline
+  and Rollout retain independent ordering properties.
+- Card reuse includes hierarchy/outline state in its render signature and does
+  not reuse frontier/archive rows as ordinary cards. Archive drops retain real
+  `Completed` status, the archive flag, and canonical transition history.
+- Vitest coverage includes the shared engine, upstream ordering/value utilities,
+  and real Kanban/Rollout persistence methods with an in-memory host fixture.
+  The release workflow now runs the regression suite.
+- Browser fixture checks passed for native dragging and its history event,
+  preserved scroll/image identity, hierarchy toggles and child-state refresh,
+  mode/scope/priority controls, collapsed columns, covers, and rich formulas.
+  Desktop Timeline stops `1w`, `1mo`, `3mo`, `6mo`, `1y`, and `5y` had no
+  overlapping labels. Mobile layouts are not an implementation or acceptance
+  target; the upstream phone/tablet-specific edit-button override was omitted.
+- These are synthetic-host checks, not live Obsidian certification. Obsidian
+  was not running during verification. Reload the plugin and smoke-test a
+  backed-up board before relying on the integrated build for daily work.
+
+Run `node tests/browser-fixture.mjs` to inspect the real renderers against
+synthetic notes on a loopback-only URL. It never reads or modifies vault notes.
+The original HEAD archive, working patch, and previous deployed plugin artifacts
+were preserved under the OS temp directory with prefix
+`base-board-before-upstream-5d5550c411bb492abeb1fcc0b95826e7`.
+Historical milestone delivery notes below are superseded by this snapshot where
+they describe the former view-local compensation scheduler or older pin model.
 
 ## Why this document exists
 
@@ -175,8 +516,8 @@ Each = one focused commit/PR with its own test pass and (per repo convention) a
 | 3 | **Scheduler + handlers (no-op refactor)** ✅ *done (build 2026.06.11.8)* — reframed by `GRAPH_SEMANTICS_SPEC.md` into a model-correcting **pure recompute**: leaf statuses are the only truth; group states (Layer A, with new derived `in-progress`/purple state) and break/return link colors (Layer B) are derived on render; the three work ops (Active/Failed/Completed) + group **Prune** write only leaf statuses via the execution-order partition. Removed the imperative break re-homing / parallel cancellation / iteration spawning. | 1 | **Model-correcting** (per spec) | Run the 5 worked cases in `GRAPH_SEMANTICS_SPEC.md`. |
 | 4 | **`Awaiting` state** ✅ *done (build 2026.06.11.11)* — added a first-class `awaiting` leaf state (status `Awaiting`): node-state + amber CSS (live, not dimmed) + `lucide-hourglass` badge, `isAwaitingStatus` predicate, derivation in `deriveLeafState`, counts as "live" in `deriveGroupState` (container reads `in-progress`), **non-terminal** so downstream stays gated, and a `markNodeAwaiting` work op + "Set as awaiting" context-menu item mirroring Set Active. Event log already maps `awaiting`. | 3 | New state only | Set a node Awaiting; verify color/badge; frontier treats it distinctly. |
 | 5 | **`agent:` capability block + autonomy field** ✅ *partial (build 2026.06.12.5)* — agency axis added: `executor` (human/agent/mixed) + `autonomy` (propose/execute/autopilot), parsed + inherited down containment, agency badge + Run-by/Autonomy menu cycles. Also split `type` → `kind`/`label`. (Full `agent:` capability block — skill bindings — still TBD.) | 3 | None (data only) | Add `agent:` to a node; confirm parsed/exposed; dry-run lifecycle manually. |
-| 6 | **Impact node type (inert handler)** — first non-participating type as a real test of the handler model. | 3 | New type, inert | Branch an impact node off a ring; fail the ring; confirm impact node is untouched. |
-| 7 | **Replay + timeline integration** — play events over time; timeline shows node state. | 2 | New view feature | Scrub a time range; node states reflect the log at each point. |
+| 6 | **Impact node type (inert handler)** ✅ *done (build 2026.08.20.1)* — `kind: impact` is a visible observational node that derives `idle`, is excluded from parent/scope rollups, active-frontier projection, status-writing execution partitions, failure escalation/break rendering, and work/agency context-menu actions. | 3 | New type, inert | Branch an impact node off a ring; fail the ring; confirm impact node is untouched. |
+| 7 | **Replay + timeline integration** — partial in build `2026.09.15.4`: baseline/delta graph observation journal, read-only time scrubbing, day/change stepping, highlights, and return-to-present. Animated playback and the time-scaled trajectory view remain planned. | 2 | New view feature | Reconstruct recorded metadata and structure; verify coverage gaps, removed items, immutable live notes, and restored camera. |
 | 8 | **MCP read server** — `GRAPH_AGENT_MCP_PLAN.md` step 3. | 1,5 | External, read-only | Point Spark at it in advisor mode; verify `get_node_context`. |
 | 9 | **MCP guarded writes (`execute`)** — `GRAPH_AGENT_MCP_PLAN.md` step 4. | 3,5,8 | Agent can transition→Awaiting | One skill end-to-end, parks at Awaiting. |
 | 10 | **Autopilot (`complete_with_verify`)** — `GRAPH_AGENT_MCP_PLAN.md` step 5. | 9 | Agent self-completes | Promote one verified skill; frontier chains. |
@@ -334,8 +675,8 @@ The Kanban gains: a **lens picker** = the clickable summarised scope hierarchy
 | B | **Editability gate** — lock structural edges, membership editable | behaviour | ✅ *done (build 2026.06.12.2)* — `graph_locked` subgraph lock (inherited, nearest-explicit-wins); templates insert locked; lock badge + Lock/Unlock toggle; freezes add-node / structural link create+delete+rewire inside a locked subtree; membership + reposition stay free |
 | C | **Signal scheduler + per-type policy** (`pass`/`absorb`/`transform`) | refactor | ✅ *done (build 2026.06.16.1)* — `runSignalScheduler` propagates a `failure` signal up containment via `propagateFailureSignals`, honouring a per-kind bounce policy (`getSignalPolicy`: `group`/scope `absorb`s, all else `pass`; `transform` reserved). Registered `signalHandlers` (compensation first, attention second) consume the propagated `failureScope`. Generalises the M3 escalation; new reactions register as handlers. |
 | D | **`frontier(scope)` query + scoped/frontier Kanban mode** | new view | ✅ *done (build 2026.06.13.2)* — the shared **`src/graph-engine.ts`** now owns the single frontier derivation (state recompute, kind inference, `isFrontierLeaf`/`getFrontier`/`getNodeLineage`/`getHygiene`, status predicates, reference normalization, plus `buildFrontierGraph`/`getFrontierNodes`/`getFrontierLineage`); the Graph view delegates to it (no duplicated logic). The Kanban's **Active frontier** mode (`Show cards` dropdown) renders a derived board: **live columns** = active frontier leaves bucketed by status (To Do / In Progress / In Review=`Awaiting` / Blocked), **history columns** = event-log window (Completed + Recently blocked, last 7 days from `status_history`). Each card shows the **work lineage breadcrumb** (replacing hierarchy tags), keeps facet chips (people/repo/kind) + note tags, and has a **pin** toggle (`pinned` frontmatter → sorts to top). Scope is the whole graph (lens scoping is Step E). The classic status board stays as the "All cards" mode. |
-| E | **Lens object + clickable scope-hierarchy picker** | new view | |
-| F | **Schedule suggestion + priority overlay (pin #1)** | sugar | last |
+| E | **Lens object + clickable scope-hierarchy picker** | new view | ✅ *done (build 2026.06.16.3)* — the Active-frontier Kanban gains a **scope picker** strip above the board: an "All work" chip plus one chip per `kind:group` scope (indented by depth in the scope spine), each showing its **frontier count** and a red badge when the scope holds blocked/interrupted work. Selecting a scope narrows the board to `frontier(scope)` via the new engine helper `getScopeAncestors` (walks containment `parent` + membership `rollup_to` upward). The choice persists in view config (`frontierScope`). A lens is currently just `{ scope }`; filters/schedule/priority are Step F. |
+| F | **Schedule suggestion + priority overlay (pin #1)** | sugar | ⚠️ *priority overlay done (build 2026.06.16.4); schedule deferred* — each frontier card has a **pin** that toggles it into an ordered **priority overlay** (pin → rank #1, click a ranked card to remove); ranked cards float to the top with a numeric rank badge. The overlay is **ephemeral per `(scope, day)`**, stored in view config (`frontierPriority`, bucket key `<scope>::<YYYY-MM-DD>`, past days pruned on write) — distinct from durable `kanban_order`. Replaces the old durable `pinned` frontmatter toggle. **Schedule suggestion** (per-scope active-hours that *highlight* a lens by time of day) is **not built** — it needs per-lens schedule config UI that does not exist yet; deferred until lenses become first-class editable objects. |
 
 ### Open decisions (to confirm)
 
@@ -480,6 +821,9 @@ the hierarchy) and **gating** (`depends_on`, the execution sequence).
    top-down ↔ left-to-right. Cheap; one undoable transform each.
 
 ### Temporal layout (the unifying fifth mode)
+
+This remains the proposed trajectory layout. The implemented first step is
+recorded snapshot browsing above, not this time-scaled layout or animated replay.
 
 `X = real time` (sourced from the event log — `status_history`'s `activated`/
 `completed` timestamps). The **Now line** is a vertical seam (≈¾ across the

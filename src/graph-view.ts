@@ -18,8 +18,25 @@ import type BaseBoardPlugin from "./main";
 import { CardDetailModal } from "./card-detail-modal";
 import { InputModal } from "./modals";
 import { ORDER_PROPERTY, sanitizeFilename } from "./constants";
+import {
+  compareOrderValues,
+  generateOrderKey,
+  isOrderKey,
+  readOrderValue,
+  type OrderValue,
+} from "./order";
 import { getColumnColor } from "./status-colors";
 import { buildTransitionEvent } from "./transition-history";
+import {
+  GraphPhysics,
+  GRAPH_PHYSICS_LAYOUTS,
+  GRAPH_PHYSICS_SPACING,
+  isGraphSpringEdge,
+  layoutGraphPhysics,
+  routeGraphPhysicsEdge,
+  type GraphPhysicsNode,
+  type GraphPhysicsLayout,
+} from "./graph-physics";
 import {
   type EngineNodeState,
   type EngineNodeKind,
@@ -28,6 +45,9 @@ import {
   isFrontierLeaf as engineIsFrontierLeaf,
   getNodeLineage as engineGetNodeLineage,
   getHygiene as engineGetHygiene,
+  getFailureScope as engineGetFailureScope,
+  isCompensationNode as engineIsCompensationNode,
+  isImpactNode as engineIsImpactNode,
   isScopeNode as engineIsScopeNode,
   isCompletedStatus as engineIsCompletedStatus,
   isInterruptedStatus as engineIsInterruptedStatus,
@@ -48,13 +68,44 @@ import {
   type LayoutSiblingOrder,
   type PositionMap,
 } from "./graph-layout";
+import {
+  connectOverviewToRoot,
+  getGraphStateVisual,
+  getOverviewCompletion,
+  getOverviewSummaryState,
+  getOverviewDescendants,
+  layoutOverviewClusters,
+  projectOverview,
+  selectOverviewScope,
+  summarizeGraphWork,
+  type GraphWorkSummary,
+  type OverviewClusterItem,
+} from "./graph-overview";
+import {
+  adjacentGraphHistoryChange,
+  changedGraphHistoryKeys,
+  compareGraphSnapshots,
+  graphAtTime,
+  isGraphHistoryGap,
+  scopeGraphHistory,
+  scopeGraphSnapshot,
+  stepGraphHistoryDay,
+  type GraphHistory,
+  type GraphHistoryNode,
+} from "./graph-history";
+
+type GraphPresentation = "overview" | "canvas" | "physics";
+
+interface GraphPhysicsCache {
+  positions: Map<string, { x: number; y: number }>;
+  guides: Map<string, { x: number; y: number }>;
+  signature: string;
+  energy: number;
+}
 
 type GraphRelationKind = "requirement" | "successor";
 type GraphLinkCreationKind =
-  | GraphRelationKind
-  | "break"
-  | "restart"
-  | "membership";
+  GraphRelationKind | "break" | "restart" | "membership";
 // State + kind unions are owned by the shared engine (graph-engine.ts) so the
 // Graph and Kanban views derive frontier state from one source of truth.
 type GraphNodeState = EngineNodeState;
@@ -64,7 +115,8 @@ type GraphFlowEdgeKind =
   | "break"
   | "restart"
   | "membership"
-  | "compensation";
+  | "compensation"
+  | "association";
 type GraphWorkflowTemplate =
   | "feature-simple"
   | "feature-detailed"
@@ -76,11 +128,7 @@ type GraphWorkflowTemplate =
 type GraphAnchorSide = "top" | "right" | "bottom" | "left";
 type GraphEdgeEndpoint = "from" | "to";
 type GraphReferenceListKind =
-  | "depends_on"
-  | "breaks_to"
-  | "restarts_to"
-  | "rollup_to"
-  | "compensates";
+  "depends_on" | "breaks_to" | "restarts_to" | "rollup_to" | "compensates";
 // Node model axes (see GRAPH_ARCHITECTURE_PLAN.md "Node model — three axes").
 // Kind = behaviour (the only axis the engine branches on); `type` = open label;
 // agency = who executes the work and how autonomously.
@@ -131,6 +179,7 @@ const GRAPH_ADD_NODE_KIND_OPTIONS: { value: GraphNodeKind; label: string }[] = [
   { value: "work", label: "Work item" },
   { value: "process", label: "Subprocess" },
   { value: "group", label: "Group / scope" },
+  { value: "impact", label: "Impact / metric" },
 ];
 
 const GRAPH_TEMPLATE_DEFINITIONS: GraphTemplateDefinition[] = [
@@ -212,7 +261,7 @@ const GRAPH_TEMPLATE_DEFINITIONS: GraphTemplateDefinition[] = [
 ];
 
 interface GraphNode {
-  entry: BasesEntry;
+  entry: BasesEntry | null;
   file: TFile;
   title: string;
   status: string | null;
@@ -278,6 +327,9 @@ interface GraphEdge {
   from: GraphNode;
   to: GraphNode;
   kind: GraphFlowEdgeKind;
+  backtrack?: boolean;
+  returnState?: "completed" | "cancelled" | "waiting";
+  spring?: boolean;
 }
 
 // A single active-frontier item, projected for the read-only frontier panel
@@ -352,7 +404,7 @@ interface GraphCanvasBounds {
   height: number;
 }
 
-const GRAPH_BUILD_VERSION = "2026.06.16.2";
+const GRAPH_BUILD_VERSION = "2026.09.16.9";
 const GRAPH_HISTORY_LIMIT = 50;
 const GRAPH_STATUS_ACTIVE = "In Progress";
 const GRAPH_STATUS_COMPLETED = "Completed";
@@ -363,12 +415,19 @@ const GRAPH_STATUS_CANCELLED = "Cancelled";
 const GRAPH_STATUS_AWAITING = "Awaiting";
 const NODE_WIDTH = 220;
 const NODE_MIN_HEIGHT = 92;
+const OVERVIEW_NODE_HEIGHT = 136;
+const OVERVIEW_HEADING_HEIGHT = 64;
+const OVERVIEW_TASK_HEIGHT = 88;
+const PHYSICS_NODE_DIAMETER = 144;
+const PHYSICS_SUMMARY_DIAMETER = 160;
+const OVERVIEW_ALL = "@all";
+const OVERVIEW_UNASSIGNED = "@unassigned";
 const X_STEP = 300;
 const Y_STEP = 172;
 const ROOT_GAP = 220;
 const EDGE_MARGIN = 18;
 const NODE_GAP_X = X_STEP - NODE_WIDTH;
-const GRAPH_MIN_ZOOM = 0.35;
+const GRAPH_MIN_ZOOM = 0.0001;
 const GRAPH_MAX_ZOOM = 2.25;
 const GRAPH_ZOOM_STEP = 0.0018;
 const GRAPH_ZOOM_BUTTON_FACTOR = 1.2;
@@ -383,6 +442,14 @@ const GRAPH_EFFECTING_PROPERTY = "effecting";
 const CONFIG_KEY_GRAPH_VIEWPORT = "graphViewport";
 const CONFIG_KEY_GRAPH_WORLD = "graphWorld";
 const CONFIG_KEY_GRAPH_NODE_POSITIONS = "graphNodePositions";
+const CONFIG_KEY_GRAPH_PRESENTATION = "graphPresentation";
+const CONFIG_KEY_GRAPH_PHYSICS_LAYOUT = "graphPhysicsLayout";
+const CONFIG_KEY_GRAPH_ROOT = "graphRoot";
+const CONFIG_KEY_GRAPH_OVERVIEW_EXPANDED = "graphOverviewExpanded";
+const CONFIG_KEY_GRAPH_OVERVIEW_VIEWPORT = "graphOverviewViewport";
+const CONFIG_KEY_GRAPH_OVERVIEW_WORLD = "graphOverviewWorld";
+const CONFIG_KEY_GRAPH_OVERVIEW_FOCUS = "graphOverviewFocus";
+const CONFIG_KEY_GRAPH_RECORDING = "graphRecordingId";
 const GRAPH_EDGE_HANDLE_RADIUS = 7;
 const GRAPH_LINK_HANDLE_PROXIMITY_PX = 14;
 // While dragging a link endpoint, reveal a node's anchor slots when the cursor
@@ -425,8 +492,6 @@ const GRAPH_NODE_ANCHOR_SLOTS: GraphNodeAnchorSlot[] = [
 //  generalises the M3 failure escalation into a pluggable mechanism.
 //  See GRAPH_ARCHITECTURE_PLAN.md "Boundaries, signals & lenses" (Step C).
 // ---------------------------------------------------------------------------
-type GraphSignalKind = "failure";
-type GraphSignalPolicy = "pass" | "absorb" | "transform";
 
 interface GraphSignalContext {
   nodes: GraphNode[];
@@ -447,8 +512,83 @@ export class GraphView extends BasesView {
   private plugin: BaseBoardPlugin;
   private scrollEl: HTMLElement;
   private containerEl: HTMLElement;
+  private graphContentEl: HTMLElement | null = null;
+  private temporalBarEl: HTMLElement | null = null;
+  private temporalRangeEl: HTMLInputElement | null = null;
+  private temporalDateEl: HTMLTimeElement | null = null;
+  private temporalEventsEl: HTMLElement | null = null;
+  private temporalStatusEl: HTMLElement | null = null;
+  private temporalChangesEl: HTMLElement | null = null;
+  private temporalControls = new Map<string, HTMLButtonElement>();
+  private temporalHistory: GraphHistory | null = null;
+  private temporalCursor: number | null = null;
+  private temporalRenderedCursor: number | null = null;
+  private temporalRecordingId: string | null = null;
+  private temporalSession = crypto.randomUUID();
+  private temporalRecordingEnabled = false;
+  private temporalRecordingError: string | null = null;
+  private temporalDisposed = false;
+  private temporalFileKeys = new Map<TFile, string>();
+  private temporalSnapshots = new Map<string, GraphHistoryNode>();
+  private temporalLiveNodes: GraphHistoryNode[] = [];
+  private temporalChangedKeys = new Set<string>();
+  private temporalAddedKeys = new Set<string>();
+  private temporalUpdatedCount = 0;
+  private temporalRemovedNodes: GraphHistoryNode[] = [];
+  private temporalExpandedKeys = new Set<string>();
+  private temporalScopeKey: string | null = null;
+  private temporalReturnScopeKey = OVERVIEW_ALL;
+  private temporalScopeCache: {
+    source: GraphHistory;
+    key: string;
+    history: GraphHistory;
+  } | null = null;
+  private temporalPositionScopes = new Map<
+    string,
+    Map<string, { x: number; y: number }>
+  >();
+  private temporalPositions = new Map<string, { x: number; y: number }>();
+  private temporalReturnCamera: GraphViewportState | null = null;
+  private temporalRestoreCamera: GraphViewportState | null = null;
+  private temporalRenderFrame: number | null = null;
   private visibleNodes: GraphNode[] = [];
+  private graphNodes: GraphNode[] = [];
+  private overviewScopeKey = OVERVIEW_ALL;
+  private overviewScopeNodes: GraphNode[] = [];
+  private overviewBreadcrumbs: { key: string; title: string }[] = [];
+  private overviewUnassigned: GraphNode[] = [];
+  private overviewItems = new Map<string, OverviewClusterItem<GraphNode>>();
+  private overviewEdges: GraphEdge[] = [];
+  private overviewMissingScope = false;
+  private overviewResetCamera = false;
+  private overviewFirstLayout = true;
+  private overviewResizeObserver: ResizeObserver | null = null;
+  private overviewResizeFrame: number | null = null;
+  private overviewMeasuredWidth = 0;
+  private graphWorkSummaries = new Map<string, GraphWorkSummary>();
+  private renderedPresentation: GraphPresentation | null = null;
+  private overviewAnchor: { path: string; x: number; y: number } | null = null;
   private graphZoom = 1;
+  private physicsSimulation: GraphPhysics | null = null;
+  private physicsFrame: number | null = null;
+  private physicsPaused = false;
+  private physicsToggleEl: HTMLButtonElement | null = null;
+  private physicsRootKey: string | null = null;
+  private physicsContextPaths = new Set<string>();
+  private physicsCaches = new Map<string, GraphPhysicsCache>();
+  private physicsActiveCache: GraphPhysicsCache | null = null;
+  private physicsElements = new Map<string, HTMLElement>();
+  private physicsNodes = new Map<string, GraphNode>();
+  private physicsSizes = new Map<string, { width: number; height: number }>();
+  private physicsLayoutAnchors = new Map<string, { x: number; y: number }>();
+  private physicsDepths = new Map<string, number>();
+  private physicsRouteNodes: GraphPhysicsNode[] = [];
+  private physicsViewportEl: HTMLElement | null = null;
+  private physicsCamera: GraphViewportState | null = null;
+  private physicsWorld: GraphWorldBounds | null = null;
+  private physicsDraggingId: string | null = null;
+  private physicsDragCleanup: ((cancelled: boolean) => void) | null = null;
+  private physicsRenderPending = false;
   private suppressNextNodeClick = false;
   private renderedGraphEdges: GraphEdge[] = [];
   private renderedGraphEdgeEls: SVGPathElement[] = [];
@@ -489,6 +629,26 @@ export class GraphView extends BasesView {
     this.plugin = plugin;
     this.scrollEl = scrollEl;
     this.containerEl = scrollEl.createDiv({ cls: "base-board-graph" });
+    this.physicsPaused =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+    if (typeof ResizeObserver !== "undefined") {
+      this.overviewResizeObserver = new ResizeObserver((entries) => {
+        const width = Math.round(entries[0]?.contentRect.width ?? 0);
+        if (width === this.overviewMeasuredWidth || width === 0) return;
+        this.overviewMeasuredWidth = width;
+        if (!this.visibleNodes.length || !this.isGraphOverview()) return;
+        if (this.overviewResizeFrame !== null)
+          window.cancelAnimationFrame(this.overviewResizeFrame);
+        this.overviewResizeFrame = window.requestAnimationFrame(() => {
+          this.overviewResizeFrame = null;
+          if (this.temporalDisposed) return;
+          if (this.graphPanActive) this.graphPanRenderPending = true;
+          else this.render();
+        });
+      });
+      this.overviewResizeObserver.observe(this.containerEl);
+    }
   }
 
   static getViewOptions(): never[] {
@@ -500,6 +660,8 @@ export class GraphView extends BasesView {
   }
 
   public onDataUpdated(): void {
+    this.temporalRecordingEnabled =
+      this.data !== undefined && this.data !== null;
     // A full re-render empties containerEl and detaches the live viewport. If
     // that happens mid-pan, the in-flight pan gesture is orphaned (the camera
     // freezes or runs away while the button is still held). Defer the render
@@ -511,32 +673,124 @@ export class GraphView extends BasesView {
     this.render();
   }
 
+  onunload(): void {
+    this.temporalDisposed = true;
+    this.physicsDragCleanup?.(true);
+    this.stopGraphPhysics();
+    this.overviewResizeObserver?.disconnect();
+    if (this.overviewResizeFrame !== null)
+      window.cancelAnimationFrame(this.overviewResizeFrame);
+    if (this.temporalRenderFrame !== null)
+      window.cancelAnimationFrame(this.temporalRenderFrame);
+    if (this.graphViewportPersistTimer)
+      window.clearTimeout(this.graphViewportPersistTimer);
+    if (this.temporalRecordingId && !this.temporalRecordingError) {
+      void this.plugin
+        .finishGraphObservation(
+          this.temporalRecordingId,
+          Date.now(),
+          this.temporalSession,
+        )
+        .catch((error: unknown) => {
+          console.error(
+            "Base Board: graph recording could not be saved",
+            error,
+          );
+          new Notice(
+            "Graph history could not be saved. Check the console for details.",
+          );
+        });
+    }
+  }
+
+  private getGraphContentEl(): HTMLElement {
+    if (!this.graphContentEl) {
+      this.graphContentEl = this.containerEl.createDiv({
+        cls: "base-board-graph-content",
+      });
+    }
+    return this.graphContentEl;
+  }
+
   public render(): void {
-    const previousViewportEl = this.containerEl.querySelector<HTMLElement>(
-      ".base-board-graph-viewport",
-    );
+    if (this.physicsDraggingId) {
+      this.physicsRenderPending = true;
+      return;
+    }
+    this.stopGraphPhysics();
+    const presentation = this.getGraphPresentation();
+    const modeChanged = presentation !== this.renderedPresentation;
+    if (modeChanged) {
+      if (this.graphViewportPersistTimer)
+        window.clearTimeout(this.graphViewportPersistTimer);
+      this.graphViewportPersistTimer = null;
+      this.graphViewportState =
+        this.temporalRestoreCamera ?? this.getSavedGraphViewportState();
+      this.temporalRestoreCamera = null;
+      this.graphWorldBounds = this.getSavedGraphWorldBounds();
+      this.graphZoom = this.graphViewportState?.zoom ?? 1;
+      this.renderedPresentation = presentation;
+    }
+    const previousViewportEl = modeChanged
+      ? null
+      : this.containerEl.querySelector<HTMLElement>(
+          ".base-board-graph-viewport",
+        );
+    const previousCameraReady =
+      previousViewportEl?.dataset.graphCameraReady === "true";
     const previousWorldBounds = this.graphWorldBounds;
-    const viewportState = previousViewportEl
-      ? this.getGraphViewportState(previousViewportEl)
-      : (this.graphViewportState ?? this.getSavedGraphViewportState());
-    if (previousViewportEl) {
+    const viewportState =
+      previousViewportEl && previousCameraReady
+        ? this.getGraphViewportState(previousViewportEl)
+        : (this.graphViewportState ?? this.getSavedGraphViewportState());
+    if (previousViewportEl && previousCameraReady) {
       this.graphViewportState = viewportState;
     }
     if (viewportState) {
       this.graphZoom = this.clampGraphZoom(viewportState.zoom);
     }
 
-    this.containerEl.empty();
+    this.getGraphContentEl().empty();
+    this.containerEl.toggleClass(
+      "base-board-graph--overview",
+      this.isGraphOverview(),
+    );
+    this.containerEl.toggleClass(
+      "base-board-graph--physics",
+      this.isGraphPhysics(),
+    );
     const nodes = this.getGraphNodes();
     this.visibleNodes = nodes;
+    this.temporalRenderedCursor = this.temporalCursor;
+    this.containerEl.toggleClass(
+      "base-board-graph--historical",
+      this.temporalCursor !== null,
+    );
     if (nodes.length === 0) {
-      this.renderPlaceholder("No graph nodes found for this view.");
+      this.renderToolbar(nodes);
+      if (this.isGraphOverview()) this.renderOverviewNavigation();
+      this.renderPlaceholder(
+        this.overviewMissingScope
+          ? "This branch is not present in this graph snapshot."
+          : this.isGraphOverview()
+            ? "No work in this scope."
+            : this.temporalCursor === null
+              ? "No graph nodes found for this view."
+              : "No items in this recorded graph.",
+      );
+      this.renderTemporalNavigation();
       return;
     }
 
-    const edges = this.layoutGraph(nodes);
+    const edges = this.isGraphPhysics()
+      ? this.layoutPhysicsGraph(nodes)
+      : this.isGraphOverview()
+        ? this.layoutOverview()
+        : this.layoutGraph(nodes);
     this.renderToolbar(nodes);
+    if (this.isGraphOverview()) this.renderOverviewNavigation();
     const viewportEl = this.renderCanvas(nodes, edges);
+    this.renderTemporalNavigation();
     const restoredViewportState = this.getViewportStateForWorldChange(
       viewportState,
       previousWorldBounds,
@@ -544,7 +798,46 @@ export class GraphView extends BasesView {
     );
 
     window.requestAnimationFrame(() => {
-      if (restoredViewportState) {
+      if (!viewportEl.isConnected) return;
+      const zoomContentEl = viewportEl.querySelector<HTMLElement>(
+        ".base-board-graph-zoom-content",
+      );
+      const canvasEl = viewportEl.querySelector<HTMLElement>(
+        ".base-board-graph-canvas",
+      );
+      if (zoomContentEl && canvasEl) {
+        this.applyGraphZoom(
+          zoomContentEl,
+          canvasEl,
+          this.getCurrentGraphCanvasBounds(),
+        );
+      }
+      const anchor = this.overviewAnchor;
+      this.overviewAnchor = null;
+      const anchorNode = anchor
+        ? nodes.find((node) => node.file.path === anchor.path)
+        : null;
+      if (this.overviewResetCamera) {
+        this.overviewResetCamera = false;
+        this.graphZoom = 1;
+        if (zoomContentEl && canvasEl)
+          this.applyGraphZoom(
+            zoomContentEl,
+            canvasEl,
+            this.getCurrentGraphCanvasBounds(),
+          );
+        this.centerGraphCameraOnNodes(viewportEl, nodes);
+      } else if (anchor && anchorNode) {
+        this.scrollViewportToWorldPoint(
+          viewportEl,
+          {
+            x: anchorNode.x + NODE_WIDTH / 2,
+            y: anchorNode.y + 16,
+          },
+          anchor.x,
+          anchor.y,
+        );
+      } else if (restoredViewportState) {
         if (
           restoredViewportState.centerX !== undefined &&
           restoredViewportState.centerY !== undefined
@@ -565,12 +858,15 @@ export class GraphView extends BasesView {
       } else {
         this.centerGraphCameraOnNodes(viewportEl, nodes);
       }
+      viewportEl.dataset.graphCameraReady = "true";
       this.graphViewportState = this.getGraphViewportState(viewportEl);
+      if (this.isGraphPhysics())
+        this.startGraphPhysics(viewportEl, nodes, edges);
     });
   }
 
   private renderPlaceholder(text: string): void {
-    const placeholderEl = this.containerEl.createDiv({
+    const placeholderEl = this.getGraphContentEl().createDiv({
       cls: "base-board-placeholder",
     });
     setIcon(
@@ -581,28 +877,952 @@ export class GraphView extends BasesView {
   }
 
   private renderToolbar(nodes: GraphNode[]): void {
-    const activeCount = nodes.filter((node) => node.state === "active").length;
-    const waitingCount = nodes.filter(
-      (node) => node.state === "waiting",
+    const work = (
+      this.isGraphOverview() ? this.overviewScopeNodes : this.graphNodes
+    ).filter((node) => node.kind === "work" && node.children.length === 0);
+    const activeCount = work.filter(
+      (node) => this.graphWorkSummaries.get(node.file.path)?.active === 1,
     ).length;
-    const completedCount = nodes.filter(
+    const readyCount = work.filter(
+      (node) => this.graphWorkSummaries.get(node.file.path)?.ready === 1,
+    ).length;
+    const waitingCount = work.filter(
+      (node) => node.state === "awaiting",
+    ).length;
+    const blockedCount = work.filter(
+      (node) => node.state === "blocked" || node.state === "interrupted",
+    ).length;
+    const completedCount = work.filter(
       (node) => node.state === "completed",
     ).length;
 
-    const toolbarEl = this.containerEl.createDiv({
+    const toolbarEl = this.getGraphContentEl().createDiv({
       cls: "base-board-graph-toolbar",
     });
     toolbarEl.createSpan({ cls: "base-board-graph-title", text: "Graph" });
-    this.renderToolbarStat(toolbarEl, "Active", activeCount, "active");
-    this.renderToolbarStat(toolbarEl, "Waiting", waitingCount, "waiting");
+    this.renderGraphPresentationControls(toolbarEl);
+    this.renderToolbarStat(
+      toolbarEl,
+      "In progress",
+      activeCount,
+      "in-progress",
+    );
+    if (readyCount > 0)
+      this.renderToolbarStat(toolbarEl, "Ready", readyCount, "active");
+    this.renderToolbarStat(toolbarEl, "Awaiting", waitingCount, "awaiting");
+    this.renderToolbarStat(toolbarEl, "Blocked", blockedCount, "blocked");
     this.renderToolbarStat(toolbarEl, "Completed", completedCount, "completed");
     this.renderGraphFrontierButton(toolbarEl);
-    this.renderGraphHistoryControls(toolbarEl);
+    if (!this.isGraphOverview()) this.renderGraphHistoryControls(toolbarEl);
+    if (this.isGraphPhysics()) this.renderPhysicsControls(toolbarEl);
     this.renderGraphZoomControls(toolbarEl);
     toolbarEl.createSpan({
       cls: "base-board-graph-version",
       text: `v${GRAPH_BUILD_VERSION}`,
     });
+  }
+
+  private getGraphPresentation(): GraphPresentation {
+    if (this.temporalCursor !== null) return "overview";
+    const mode = this.config?.get(CONFIG_KEY_GRAPH_PRESENTATION);
+    return mode === "canvas" || mode === "physics" ? mode : "overview";
+  }
+
+  private isGraphOverview(): boolean {
+    return this.getGraphPresentation() !== "canvas";
+  }
+
+  private isGraphPhysics(): boolean {
+    return this.getGraphPresentation() === "physics";
+  }
+
+  private getConfiguredGraphRoot(nodes = this.graphNodes): GraphNode | null {
+    const reference = this.normalizeReference(
+      this.config?.get(CONFIG_KEY_GRAPH_ROOT),
+    );
+    return reference
+      ? (nodes.find((node) =>
+          this.getNodeIdentities(node).includes(reference),
+        ) ?? null)
+      : null;
+  }
+
+  private setGraphRoot(node: GraphNode | null): void {
+    if (this.temporalCursor !== null) return;
+    const id = node ? this.getFrontmatter(node.file)?.id : null;
+    this.config?.set(
+      CONFIG_KEY_GRAPH_ROOT,
+      node
+        ? typeof id === "string" && id.trim()
+          ? id
+          : node.file.path.replace(/\.md$/i, "")
+        : null,
+    );
+    this.physicsCaches.clear();
+    this.overviewResetCamera = true;
+    this.overviewAnchor = null;
+    if (node)
+      this.config?.set(
+        CONFIG_KEY_GRAPH_OVERVIEW_FOCUS,
+        this.getTemporalNodeKey(node),
+      );
+    this.render();
+  }
+
+  private renderGraphPresentationControls(toolbarEl: HTMLElement): void {
+    const modes = toolbarEl.createDiv({ cls: "base-board-graph-presentation" });
+    for (const [mode, label, icon] of [
+      ["overview", "Overview", "lucide-network"],
+      ["canvas", "Free layout", "lucide-move"],
+      ["physics", "Physics layout (experimental)", "lucide-orbit"],
+    ] as const) {
+      const button = this.renderGraphIconButton(modes, icon, label, () => {
+        if (this.getGraphPresentation() === mode) return;
+        this.persistGraphViewportState(this.graphViewportState);
+        this.overviewAnchor = null;
+        this.config?.set(CONFIG_KEY_GRAPH_PRESENTATION, mode);
+        this.render();
+      });
+      button.setAttribute(
+        "aria-pressed",
+        String(this.getGraphPresentation() === mode),
+      );
+      if (this.temporalCursor !== null && mode !== "overview")
+        button.disabled = true;
+    }
+    if (this.isGraphOverview()) {
+      const levels = toolbarEl.createDiv({
+        cls: "base-board-graph-zoom-controls",
+      });
+      this.renderGraphIconButton(
+        levels,
+        "lucide-fold-vertical",
+        "Collapse all workstreams",
+        () => {
+          const paths = new Set(
+            this.overviewScopeNodes.map((node) => node.file.path),
+          );
+          if (this.temporalCursor !== null) {
+            for (const node of this.overviewScopeNodes)
+              this.temporalExpandedKeys.delete(this.getTemporalNodeKey(node));
+          } else {
+            const expanded = this.graphNodes.filter(
+              (node) => !node.collapsed && !paths.has(node.file.path),
+            );
+            this.config?.set(
+              CONFIG_KEY_GRAPH_OVERVIEW_EXPANDED,
+              expanded.map((node) => node.file.path),
+            );
+          }
+          this.render();
+          this.resetGraphCamera();
+        },
+      );
+      this.renderGraphIconButton(
+        levels,
+        "lucide-unfold-vertical",
+        "Expand all workstreams",
+        () => {
+          const containers = this.overviewScopeNodes.filter(
+            (node) => node.descendantCount > 0,
+          );
+          if (this.temporalCursor !== null) {
+            for (const node of containers)
+              this.temporalExpandedKeys.add(this.getTemporalNodeKey(node));
+          } else {
+            this.config?.set(CONFIG_KEY_GRAPH_OVERVIEW_EXPANDED, [
+              ...new Set(
+                [
+                  ...this.graphNodes.filter((node) => !node.collapsed),
+                  ...containers,
+                ].map((node) => node.file.path),
+              ),
+            ]);
+          }
+          this.render();
+        },
+      );
+    }
+  }
+
+  private layoutOverview(): GraphEdge[] {
+    for (const item of this.overviewItems.values()) {
+      const node = item.node;
+      let point = { x: item.x, y: item.y };
+      if (this.temporalCursor !== null) {
+        const key = this.getTemporalNodeKey(node);
+        const previous = this.temporalPositions.get(key);
+        if (previous) point = previous;
+        else {
+          const occupied = [...this.temporalPositions.values()];
+          while (
+            occupied.some(
+              (other) =>
+                Math.abs(other.x - point.x) < NODE_WIDTH + 24 &&
+                Math.abs(other.y - point.y) < OVERVIEW_NODE_HEIGHT + 44,
+            )
+          )
+            point.y += OVERVIEW_NODE_HEIGHT + 64;
+          this.temporalPositions.set(key, point);
+        }
+      }
+      node.x = point.x;
+      node.y = point.y;
+    }
+    return this.overviewEdges;
+  }
+
+  private layoutPhysicsGraph(nodes: GraphNode[]): GraphEdge[] {
+    const edges = this.buildPhysicsEdges(nodes);
+    const mode = this.getGraphPhysicsLayout();
+    const seeded = layoutGraphPhysics(
+      nodes.map((node) => ({
+        id: this.getTemporalNodeKey(node),
+        x: 0,
+        y: 0,
+        ...this.getPhysicsNodeSize(node),
+        shape: "circle",
+        fixed: this.getTemporalNodeKey(node) === this.physicsRootKey,
+      })),
+      edges.map((edge) => ({
+        source: this.getTemporalNodeKey(edge.from),
+        target: this.getTemporalNodeKey(edge.to),
+        kind: edge.kind,
+        spring: edge.spring,
+      })),
+      (this.containerEl.clientWidth || this.scrollEl.clientWidth || 1440) - 48,
+      mode,
+    );
+    this.physicsLayoutAnchors = new Map(
+      seeded.map((node) => [node.id, { x: node.x, y: node.y }]),
+    );
+    this.physicsDepths = new Map(
+      seeded.map((node) => [node.id, node.depth ?? 0]),
+    );
+    const cacheKey = this.getPhysicsCacheKey();
+    const cache = this.physicsCaches.get(cacheKey) ?? {
+      positions: new Map<string, { x: number; y: number }>(),
+      guides: new Map<string, { x: number; y: number }>(),
+      signature: "",
+      energy: 1,
+    };
+    this.physicsCaches.set(cacheKey, cache);
+    this.physicsActiveCache = cache;
+    for (const node of nodes) {
+      const key = this.getTemporalNodeKey(node);
+      if (key === this.physicsRootKey) {
+        node.x = 0;
+        node.y = 0;
+        continue;
+      }
+      const previous = cache.positions.get(key);
+      const guide = cache.guides.get(key);
+      if (guide) this.physicsLayoutAnchors.set(key, guide);
+      const point = previous ?? this.physicsLayoutAnchors.get(key);
+      if (point) {
+        node.x = point.x;
+        node.y = point.y;
+      }
+    }
+    return edges;
+  }
+
+  private getGraphPhysicsLayout(): GraphPhysicsLayout {
+    const saved = this.config?.get(CONFIG_KEY_GRAPH_PHYSICS_LAYOUT);
+    return GRAPH_PHYSICS_LAYOUTS.find((mode) => mode === saved) ?? "workflow";
+  }
+
+  private getPhysicsCacheKey(): string {
+    const mode = this.getGraphPhysicsLayout();
+    return mode === "workflow"
+      ? this.overviewScopeKey
+      : `${mode}:${this.overviewScopeKey}`;
+  }
+
+  private setGraphPhysicsLayout(mode: GraphPhysicsLayout): void {
+    if (this.temporalCursor !== null || mode === this.getGraphPhysicsLayout())
+      return;
+    this.stopGraphPhysics();
+    this.physicsCamera = null;
+    this.physicsWorld = null;
+    this.overviewAnchor = null;
+    this.overviewResetCamera = true;
+    this.config?.set(CONFIG_KEY_GRAPH_PHYSICS_LAYOUT, mode);
+    this.render();
+  }
+
+  private buildPhysicsEdges(nodes: GraphNode[]): GraphEdge[] {
+    const edges = this.buildGraphFlowEdges(nodes);
+    const visible = new Map(nodes.map((node) => [node.file.path, node]));
+    const parents = this.getResolvedParentsByPath(this.graphNodes);
+    const root = this.getConfiguredGraphRoot(nodes);
+    const owners = new Map<string, GraphNode>();
+    for (const node of nodes) {
+      if (node === root) continue;
+      const parent = parents.get(node.file.path);
+      const owner =
+        parent ??
+        node.rollupTargets.find((scope) => visible.has(scope.file.path));
+      if (
+        owner &&
+        visible.has(owner.file.path) &&
+        owner.file.path !== node.file.path
+      )
+        owners.set(node.file.path, visible.get(owner.file.path)!);
+    }
+    const adjacency = new Map(
+      nodes.map((node) => [node.file.path, new Set<string>()]),
+    );
+    const connect = (edge: GraphEdge): void => {
+      adjacency.get(edge.from.file.path)?.add(edge.to.file.path);
+      adjacency.get(edge.to.file.path)?.add(edge.from.file.path);
+    };
+    for (const edge of edges) {
+      const fromOwner = owners.get(edge.from.file.path);
+      const toOwner = owners.get(edge.to.file.path);
+      const owning =
+        fromOwner?.file.path === edge.to.file.path ||
+        toOwner?.file.path === edge.from.file.path;
+      const sameBranch =
+        fromOwner !== undefined && fromOwner.file.path === toOwner?.file.path;
+      edge.spring =
+        isGraphSpringEdge(edge.kind) ||
+        ((edge.kind === "membership" || edge.kind === "association") &&
+          owning) ||
+        (edge.kind === "compensation" && (owning || sameBranch));
+      if (edge.spring) connect(edge);
+    }
+    const reached = new Set<string>();
+    const visit = (path: string): void => {
+      if (reached.has(path)) return;
+      reached.add(path);
+      for (const neighbor of adjacency.get(path) ?? []) visit(neighbor);
+    };
+    if (root) visit(root.file.path);
+    else
+      for (const node of nodes)
+        if (!owners.has(node.file.path)) visit(node.file.path);
+    let attached = true;
+    while (attached) {
+      attached = false;
+      for (const node of nodes) {
+        const owner = owners.get(node.file.path);
+        if (
+          reached.has(node.file.path) ||
+          !owner ||
+          !reached.has(owner.file.path)
+        )
+          continue;
+        const edge: GraphEdge = {
+          from: owner,
+          to: node,
+          kind: "association",
+          spring: true,
+        };
+        edges.push(edge);
+        connect(edge);
+        visit(node.file.path);
+        attached = true;
+      }
+    }
+    return edges;
+  }
+
+  private getPhysicsNodeSize(node: GraphNode): {
+    width: number;
+    height: number;
+  } {
+    const diameter =
+      node.kind === "group" || node.descendantCount > 0
+        ? PHYSICS_SUMMARY_DIAMETER
+        : PHYSICS_NODE_DIAMETER;
+    return { width: diameter, height: diameter };
+  }
+
+  private renderPhysicsControls(toolbarEl: HTMLElement): void {
+    const layouts = toolbarEl.createDiv({
+      cls: "base-board-graph-presentation base-board-graph-physics-layouts",
+      attr: { role: "group", "aria-label": "Physics layout" },
+    });
+    const selected = this.getGraphPhysicsLayout();
+    this.containerEl.dataset.physicsLayout = selected;
+    for (const [mode, label, icon] of [
+      ["workflow", "Workflow layout", "lucide-git-branch"],
+      ["hanging", "Hanging layout", "lucide-arrow-down"],
+      ["growing", "Growing layout", "lucide-sprout"],
+      ["radial", "Radial layout", "lucide-orbit"],
+    ] as const) {
+      const button = this.renderGraphIconButton(layouts, icon, label, () =>
+        this.setGraphPhysicsLayout(mode),
+      );
+      button.setAttribute("aria-pressed", String(mode === selected));
+    }
+    const controls = toolbarEl.createDiv({
+      cls: "base-board-graph-zoom-controls base-board-graph-physics-controls",
+    });
+    this.physicsToggleEl = this.renderGraphIconButton(
+      controls,
+      "lucide-pause",
+      "Pause physics",
+      () => {
+        if (
+          !this.physicsPaused &&
+          this.physicsSimulation &&
+          !this.physicsSimulation.settled
+        ) {
+          this.physicsPaused = true;
+          this.cancelPhysicsFrame();
+        } else {
+          this.physicsPaused = false;
+          this.physicsSimulation?.reheat();
+          this.animateGraphPhysics();
+        }
+        this.updatePhysicsControls();
+      },
+    );
+    this.renderGraphIconButton(
+      controls,
+      "lucide-rotate-ccw",
+      "Reset physics layout",
+      () => {
+        this.stopGraphPhysics();
+        this.physicsCaches.delete(this.getPhysicsCacheKey());
+        this.physicsPaused = false;
+        this.overviewResetCamera = true;
+        this.render();
+      },
+    );
+    this.updatePhysicsControls();
+  }
+
+  private updatePhysicsControls(): void {
+    const running =
+      !this.physicsPaused &&
+      this.physicsSimulation !== null &&
+      !this.physicsSimulation.settled;
+    this.containerEl.dataset.physicsState = this.physicsPaused
+      ? "paused"
+      : running
+        ? "running"
+        : "settled";
+    const label = running ? "Pause physics" : "Resume physics";
+    if (this.physicsToggleEl) {
+      setIcon(this.physicsToggleEl, running ? "lucide-pause" : "lucide-play");
+      this.physicsToggleEl.setAttribute("aria-label", label);
+      this.physicsToggleEl.setAttribute("title", label);
+      this.physicsToggleEl.disabled = this.visibleNodes.length === 0;
+      setTooltip(this.physicsToggleEl, label);
+    }
+  }
+
+  private startGraphPhysics(
+    viewport: HTMLElement,
+    nodes: GraphNode[],
+    edges: GraphEdge[],
+  ): void {
+    if (
+      !this.isGraphPhysics() ||
+      this.temporalDisposed ||
+      !viewport.isConnected
+    )
+      return;
+    const cache = this.physicsActiveCache;
+    if (!cache) return;
+    const mode = this.getGraphPhysicsLayout();
+    const bodies = nodes.map((node): GraphPhysicsNode => ({
+      id: this.getTemporalNodeKey(node),
+      x: node.x,
+      y: node.y,
+      ...this.getPhysicsNodeSize(node),
+      shape: "circle",
+      anchor:
+        mode === "workflow"
+          ? this.physicsLayoutAnchors.get(this.getTemporalNodeKey(node))
+          : undefined,
+      depth: this.physicsDepths.get(this.getTemporalNodeKey(node)),
+      fixed: this.getTemporalNodeKey(node) === this.physicsRootKey,
+    }));
+    const links = edges
+      .filter((edge) => edge.spring)
+      .map((edge) => ({
+        source: this.getTemporalNodeKey(edge.from),
+        target: this.getTemporalNodeKey(edge.to),
+        kind: edge.kind,
+        spring: true,
+      }));
+    const signature = JSON.stringify({
+      layout: mode,
+      nodes: bodies
+        .map((node) => [
+          node.id,
+          node.width,
+          node.height,
+          node.fixed,
+          node.depth,
+        ])
+        .sort(),
+      links: links.map((link) => [link.source, link.target, link.kind]).sort(),
+    });
+    if (signature !== cache.signature) cache.energy = 1;
+    cache.signature = signature;
+    this.physicsNodes = new Map(
+      nodes.map((node) => [this.getTemporalNodeKey(node), node]),
+    );
+    this.physicsSizes = new Map(
+      nodes.map((node) => [node.file.path, this.getPhysicsNodeSize(node)]),
+    );
+    const elements = new Map(
+      [...viewport.querySelectorAll<HTMLElement>(".base-board-graph-node")].map(
+        (element) => [element.dataset.filePath, element],
+      ),
+    );
+    this.physicsElements.clear();
+    for (const node of nodes) {
+      const element = elements.get(node.file.path);
+      if (element)
+        this.physicsElements.set(this.getTemporalNodeKey(node), element);
+    }
+    this.physicsViewportEl = viewport;
+    this.physicsSimulation = new GraphPhysics(bodies, links, {
+      ...GRAPH_PHYSICS_SPACING,
+      energy: cache.energy,
+      layout: mode,
+    });
+    this.animateGraphPhysics();
+    this.updatePhysicsControls();
+  }
+
+  private applyPhysicsPositions(positions: GraphPhysicsNode[]): void {
+    for (const position of positions) {
+      const node = this.physicsNodes.get(position.id);
+      if (!node) continue;
+      node.x = position.x;
+      node.y = position.y;
+      this.physicsActiveCache?.positions.set(position.id, {
+        x: node.x,
+        y: node.y,
+      });
+      if (position.anchor)
+        this.physicsActiveCache?.guides.set(position.id, {
+          ...position.anchor,
+        });
+    }
+    const viewport = this.physicsViewportEl;
+    if (viewport)
+      this.expandGraphWorldForRect(
+        this.getNodesWorldBounds([...this.physicsNodes.values()]),
+        viewport,
+      );
+    for (const [id, node] of this.physicsNodes) {
+      const element = this.physicsElements.get(id);
+      if (element) this.positionRenderedGraphNodeEl(element, node);
+    }
+    this.syncRenderedGraphEdges();
+    if (this.physicsSimulation && this.physicsActiveCache)
+      this.physicsActiveCache.energy = this.physicsSimulation.energy;
+  }
+
+  private animateGraphPhysics(): void {
+    if (
+      this.physicsFrame !== null ||
+      this.physicsPaused ||
+      !this.physicsSimulation ||
+      this.physicsSimulation.settled
+    )
+      return;
+    const simulation = this.physicsSimulation;
+    const advance = (): void => {
+      this.physicsFrame = null;
+      if (
+        this.temporalDisposed ||
+        this.physicsPaused ||
+        this.physicsSimulation !== simulation ||
+        !this.isGraphPhysics() ||
+        !this.physicsViewportEl?.isConnected
+      )
+        return;
+      this.applyPhysicsPositions(simulation.tick());
+      if (!simulation.settled)
+        this.physicsFrame = window.requestAnimationFrame(advance);
+      else this.updatePhysicsControls();
+    };
+    this.physicsFrame = window.requestAnimationFrame(advance);
+  }
+
+  private cancelPhysicsFrame(): void {
+    if (this.physicsFrame !== null)
+      window.cancelAnimationFrame(this.physicsFrame);
+    this.physicsFrame = null;
+  }
+
+  private stopGraphPhysics(): void {
+    this.cancelPhysicsFrame();
+    this.containerEl.removeClass("base-board-graph--tracing");
+    if (this.physicsSimulation && this.physicsActiveCache)
+      this.physicsActiveCache.energy = this.physicsSimulation.energy;
+    this.physicsSimulation?.stop();
+    this.physicsSimulation = null;
+    this.physicsActiveCache = null;
+    this.physicsViewportEl = null;
+    this.physicsToggleEl = null;
+    this.physicsElements.clear();
+    this.physicsNodes.clear();
+    this.physicsSizes.clear();
+    this.physicsDepths.clear();
+    this.physicsRouteNodes = [];
+  }
+
+  private prepareScopedOverview(nodes: GraphNode[]): GraphNode[] {
+    const root = this.getConfiguredGraphRoot(nodes);
+    const saved = this.config?.get(CONFIG_KEY_GRAPH_OVERVIEW_FOCUS);
+    const requested =
+      this.temporalCursor !== null
+        ? this.temporalScopeKey
+        : typeof saved === "string"
+          ? saved
+          : root
+            ? this.getTemporalNodeKey(root)
+            : undefined;
+    const target =
+      typeof requested === "string" &&
+      requested !== OVERVIEW_ALL &&
+      requested !== OVERVIEW_UNASSIGNED
+        ? nodes.find((node) => this.getTemporalNodeKey(node) === requested)
+        : undefined;
+    this.overviewMissingScope =
+      typeof requested === "string" &&
+      requested !== OVERVIEW_ALL &&
+      requested !== OVERVIEW_UNASSIGNED &&
+      !target;
+    const context = selectOverviewScope(
+      nodes,
+      requested === undefined ? undefined : (target ?? null),
+    );
+    const scopeKey =
+      requested ??
+      (context.focus ? this.getTemporalNodeKey(context.focus) : OVERVIEW_ALL);
+    if (this.overviewFirstLayout && this.temporalCursor === null) {
+      this.overviewFirstLayout = false;
+      this.overviewResetCamera = true;
+    }
+    if (scopeKey !== this.overviewScopeKey && this.temporalCursor === null)
+      this.overviewResetCamera = true;
+    this.overviewScopeKey = scopeKey;
+    this.overviewUnassigned = context.unassigned;
+    if (!this.overviewMissingScope) {
+      this.overviewBreadcrumbs =
+        scopeKey === OVERVIEW_UNASSIGNED
+          ? [{ key: OVERVIEW_UNASSIGNED, title: "Unassigned" }]
+          : context.breadcrumbs.map((node) => ({
+              key: this.getTemporalNodeKey(node),
+              title: node.title,
+            }));
+    } else if (
+      !this.overviewBreadcrumbs.some((entry) => entry.key === scopeKey)
+    ) {
+      const record = this.temporalLiveNodes.find(
+        (node) => node.key === scopeKey,
+      );
+      this.overviewBreadcrumbs = [
+        { key: scopeKey, title: record?.title ?? "Unavailable branch" },
+      ];
+    }
+    this.overviewScopeNodes = this.overviewMissingScope
+      ? []
+      : scopeKey === OVERVIEW_UNASSIGNED
+        ? context.unassigned
+        : context.included;
+    let roots = this.overviewMissingScope
+      ? []
+      : scopeKey === OVERVIEW_UNASSIGNED
+        ? context.unassigned
+        : context.roots;
+    let available = [...this.overviewScopeNodes];
+    if (target && roots.length === 0 && !this.overviewMissingScope)
+      roots = [target];
+    if (scopeKey === OVERVIEW_ALL && context.unassigned.length > 0) {
+      const virtual = this.createUnassignedOverviewNode(context.unassigned);
+      this.graphWorkSummaries.set(
+        virtual.file.path,
+        summarizeGraphWork(virtual),
+      );
+      roots = [...roots, virtual];
+      available.push(virtual);
+    }
+    const layout = layoutOverviewClusters(
+      roots,
+      available,
+      new Set(available.filter((node) => node.collapsed)),
+      {
+        viewportWidth: Math.max(
+          320,
+          (this.containerEl.clientWidth || this.scrollEl.clientWidth || 1100) -
+            48,
+        ),
+        width: NODE_WIDTH,
+        summaryHeight: OVERVIEW_NODE_HEIGHT,
+        headingHeight: OVERVIEW_HEADING_HEIGHT,
+        taskHeight: OVERVIEW_TASK_HEIGHT,
+        compress: !this.isGraphPhysics(),
+      },
+    );
+    this.overviewItems = new Map(
+      layout.items.map((item) => [item.node.file.path, item]),
+    );
+    this.overviewEdges = layout.edges.map(({ from, to }) => ({
+      from,
+      to,
+      kind: "requirement-start",
+    }));
+    this.physicsRootKey = null;
+    this.physicsContextPaths.clear();
+    const physicsOrigin = root ?? context.focus;
+    if (this.isGraphPhysics() && physicsOrigin && !this.overviewMissingScope) {
+      this.physicsRootKey = root ? this.getTemporalNodeKey(root) : null;
+      const anchored = connectOverviewToRoot(
+        nodes,
+        layout.items.map((item) => item.node),
+        physicsOrigin,
+      );
+      const connectors = anchored.nodes.filter(
+        (node) =>
+          node === physicsOrigin || !this.overviewItems.has(node.file.path),
+      );
+      for (const item of this.overviewItems.values()) {
+        item.x += NODE_WIDTH + 100;
+        if (item.trail.length) {
+          item.height -= 20;
+          item.trail = [];
+        }
+      }
+      let connectorIndex = 1;
+      for (const node of connectors) {
+        this.physicsContextPaths.add(node.file.path);
+        this.overviewItems.set(node.file.path, {
+          node,
+          trail: [],
+          role: node === physicsOrigin ? "summary" : "heading",
+          x: 0,
+          y:
+            node === physicsOrigin
+              ? 0
+              : OVERVIEW_NODE_HEIGHT +
+                connectorIndex++ * (OVERVIEW_HEADING_HEIGHT + 80),
+          height:
+            node === physicsOrigin
+              ? OVERVIEW_NODE_HEIGHT
+              : OVERVIEW_HEADING_HEIGHT,
+        });
+      }
+      this.overviewEdges = anchored.edges.map(({ from, to }) =>
+        from.children.includes(to)
+          ? { from, to, kind: "requirement-start" }
+          : { from: to, to: from, kind: "membership" },
+      );
+      return anchored.nodes;
+    }
+    return layout.items.map((item) => item.node);
+  }
+
+  private createUnassignedOverviewNode(unassigned: GraphNode[]): GraphNode {
+    const file = new TFile();
+    file.path = OVERVIEW_UNASSIGNED;
+    file.name = "Unassigned";
+    file.basename = "Unassigned";
+    file.extension = "";
+    file.stat = { ctime: 0, mtime: 0, size: 0 };
+    return {
+      ...unassigned[0],
+      entry: null,
+      file,
+      title: "Unassigned",
+      status: null,
+      parentKey: null,
+      parentValue: null,
+      dependsOnKeys: [],
+      breaksToKeys: [],
+      restartsToKeys: [],
+      rollupToKeys: [],
+      compensatesKeys: [],
+      effecting: false,
+      nodeType: null,
+      workflow: null,
+      collapsed: true,
+      descendantCount: unassigned.length,
+      children: unassigned,
+      members: [],
+      successors: [],
+      predecessors: [],
+      breakTargets: [],
+      restartTargets: [],
+      rollupTargets: [],
+      compensatesTargets: [],
+      compensatedBy: [],
+      needsCompensation: false,
+      excludedFromFold: false,
+      kindExplicit: "group",
+      kind: "group",
+      executorExplicit: null,
+      executor: "human",
+      autonomyExplicit: null,
+      autonomy: "propose",
+      lockedExplicit: null,
+      effectiveLocked: false,
+      x: 0,
+      y: 0,
+      savedX: null,
+      savedY: null,
+      state: "idle",
+    };
+  }
+
+  private focusOverview(key: string): void {
+    if (this.overviewScopeKey === key) return;
+    if (this.graphViewportPersistTimer)
+      window.clearTimeout(this.graphViewportPersistTimer);
+    this.graphViewportPersistTimer = null;
+    this.overviewResetCamera = true;
+    this.overviewAnchor = null;
+    if (this.temporalCursor !== null) {
+      this.temporalPositionScopes.set(
+        this.overviewScopeKey,
+        this.temporalPositions,
+      );
+      this.temporalPositions =
+        this.temporalPositionScopes.get(key) ??
+        new Map<string, { x: number; y: number }>();
+      this.temporalScopeKey = key;
+    } else this.config?.set(CONFIG_KEY_GRAPH_OVERVIEW_FOCUS, key);
+    this.temporalChangedKeys.clear();
+    this.temporalAddedKeys.clear();
+    this.temporalUpdatedCount = 0;
+    this.temporalRemovedNodes = [];
+    this.render();
+  }
+
+  private renderOverviewNavigation(): void {
+    const navigation = this.getGraphContentEl().createEl("nav", {
+      cls: "base-board-graph-breadcrumbs",
+      attr: { "aria-label": "Graph scope" },
+    });
+    const all = this.renderGraphIconButton(
+      navigation,
+      "lucide-house",
+      "All work",
+      () => this.focusOverview(OVERVIEW_ALL),
+    );
+    if (this.overviewScopeKey === OVERVIEW_ALL)
+      all.setAttribute("aria-current", "page");
+    const root = this.getConfiguredGraphRoot();
+    const rootKey = root ? this.getTemporalNodeKey(root) : null;
+    const breadcrumbs = root
+      ? [
+          { key: rootKey!, title: root.title },
+          ...this.overviewBreadcrumbs.filter((crumb) => crumb.key !== rootKey),
+        ]
+      : this.overviewBreadcrumbs;
+    for (const crumb of breadcrumbs) {
+      const separator = navigation.createSpan({
+        cls: "base-board-graph-breadcrumb-separator",
+        attr: { "aria-hidden": "true" },
+      });
+      setIcon(separator, "lucide-chevron-right");
+      const button = navigation.createEl("button", {
+        cls: "base-board-graph-breadcrumb",
+        text: crumb.title,
+        attr: { type: "button", title: crumb.title },
+      });
+      if (crumb.key === this.overviewScopeKey)
+        button.setAttribute("aria-current", "page");
+      if (crumb.key === rootKey) {
+        button.setAttribute("aria-label", `${crumb.title}, graph root`);
+        const mark = button.createSpan({
+          cls: "base-board-graph-root-mark",
+          attr: { "aria-hidden": "true" },
+        });
+        setIcon(mark, "lucide-pin");
+        button.prepend(mark);
+      }
+      button.addEventListener("click", () => this.focusOverview(crumb.key));
+    }
+    const branches = this.renderGraphIconButton(
+      navigation,
+      "lucide-list-tree",
+      "Choose scope or workstream",
+      () => {
+        const menu = new Menu();
+        for (const node of this.graphNodes.filter(
+          (candidate) =>
+            candidate.kind === "group" || candidate.descendantCount > 0,
+        )) {
+          menu.addItem((item) =>
+            item
+              .setTitle(node.title)
+              .setIcon(
+                node.kind === "group" ? "lucide-folder" : "lucide-git-branch",
+              )
+              .onClick(() => this.focusOverview(this.getTemporalNodeKey(node))),
+          );
+        }
+        const bounds = branches.getBoundingClientRect();
+        menu.showAtPosition({ x: bounds.left, y: bounds.bottom });
+      },
+    );
+    const rootPicker = this.renderGraphIconButton(
+      navigation,
+      "lucide-pin",
+      "Choose graph root",
+      () => {
+        const menu = new Menu();
+        for (const node of this.graphNodes.filter(
+          (candidate) =>
+            candidate.kind === "group" || candidate.descendantCount > 0,
+        )) {
+          menu.addItem((item) =>
+            item
+              .setTitle(node.title)
+              .setIcon("lucide-pin")
+              .setChecked(node === root)
+              .onClick(() => this.setGraphRoot(node)),
+          );
+        }
+        menu.addSeparator();
+        menu.addItem((item) =>
+          item
+            .setTitle("Clear fixed root")
+            .setIcon("lucide-pin-off")
+            .onClick(() => this.setGraphRoot(null)),
+        );
+        const bounds = rootPicker.getBoundingClientRect();
+        menu.showAtPosition({ x: bounds.left, y: bounds.bottom });
+      },
+    );
+    rootPicker.disabled = this.temporalCursor !== null;
+    if (this.overviewUnassigned.length > 0) {
+      const unassigned = this.renderGraphIconButton(
+        navigation,
+        "lucide-inbox",
+        `Unassigned: ${this.overviewUnassigned.length} items`,
+        () => this.focusOverview(OVERVIEW_UNASSIGNED),
+      );
+      unassigned.addClass("base-board-graph-unassigned-button");
+      unassigned.createSpan({
+        text: String(this.overviewUnassigned.length),
+        attr: { "aria-hidden": "true" },
+      });
+      const attention = this.overviewUnassigned.filter(
+        (node) => node.state === "blocked" || node.state === "interrupted",
+      ).length;
+      if (attention)
+        this.renderGraphVisual(
+          unassigned,
+          "base-board-graph-unassigned-attention",
+          `${attention} unassigned items need attention`,
+          "lucide-octagon-alert",
+          getGraphStateVisual("blocked").color,
+          String(attention),
+        );
+    }
   }
 
   private renderGraphHistoryControls(toolbarEl: HTMLElement): void {
@@ -626,6 +1846,497 @@ export class GraphView extends BasesView {
       },
     );
     this.updateGraphHistoryButtons();
+  }
+
+  private getTemporalNodeKey(node: GraphNode): string {
+    if (node.file.path === OVERVIEW_UNASSIGNED) return OVERVIEW_UNASSIGNED;
+    return (
+      this.temporalSnapshots.get(node.file.path)?.key ??
+      this.temporalFileKeys.get(node.file) ??
+      `path:${node.file.path}`
+    );
+  }
+
+  private observeTemporalGraph(nodes: GraphNode[]): void {
+    if (
+      this.temporalRecordingEnabled &&
+      !this.temporalRecordingId &&
+      !this.temporalRecordingError &&
+      !this.temporalDisposed
+    ) {
+      try {
+        const saved = this.config?.get(CONFIG_KEY_GRAPH_RECORDING);
+        if (
+          saved !== undefined &&
+          (typeof saved !== "string" || !/^graph-[a-z0-9-]+$/.test(saved))
+        ) {
+          throw new Error("Invalid graph recording identity in view settings");
+        }
+        this.temporalRecordingId =
+          typeof saved === "string" ? saved : `graph-${crypto.randomUUID()}`;
+        if (saved === undefined)
+          this.config?.set(
+            CONFIG_KEY_GRAPH_RECORDING,
+            this.temporalRecordingId,
+          );
+        this.temporalHistory = this.plugin.getRecordedGraphHistory(
+          this.temporalRecordingId,
+        );
+      } catch (error) {
+        this.reportTemporalError(error);
+      }
+    }
+    const known = this.temporalHistory
+      ? (graphAtTime(
+          this.temporalHistory,
+          this.temporalHistory.observedThrough,
+        ) ?? [])
+      : [];
+    const knownByPath = new Map(known.map((node) => [node.path, node]));
+    const knownByIdentity = new Map<string, GraphHistoryNode>();
+    for (const node of known)
+      for (const identity of node.identities)
+        knownByIdentity.set(identity, node);
+    const snapshot = nodes.map((node): GraphHistoryNode => {
+      const id = this.getFrontmatter(node.file)?.id;
+      const previous =
+        knownByPath.get(node.file.path) ??
+        (typeof id === "string" && id.trim()
+          ? knownByIdentity.get(id.trim().toLowerCase())
+          : undefined);
+      const key =
+        this.temporalFileKeys.get(node.file) ??
+        previous?.key ??
+        (typeof id === "string" && id.trim()
+          ? `id:${id.trim()}`
+          : `path:${node.file.path}`);
+      this.temporalFileKeys.set(node.file, key);
+      return {
+        key,
+        path: node.file.path,
+        title: node.title,
+        identities: this.getNodeIdentities(node),
+        status: node.status,
+        parentKey: node.parentKey,
+        parentValue: node.parentValue,
+        dependsOnKeys: node.dependsOnKeys,
+        breaksToKeys: node.breaksToKeys,
+        restartsToKeys: node.restartsToKeys,
+        rollupToKeys: node.rollupToKeys,
+        compensatesKeys: node.compensatesKeys,
+        effecting: node.effecting,
+        nodeType: node.nodeType,
+        workflow: node.workflow,
+        kindExplicit: node.kindExplicit,
+        executorExplicit: node.executorExplicit,
+        autonomyExplicit: node.autonomyExplicit,
+        lockedExplicit: node.lockedExplicit,
+        order: this.getOrder(node.file),
+      };
+    });
+    this.temporalLiveNodes = snapshot;
+    if (
+      !this.temporalRecordingEnabled ||
+      !this.temporalRecordingId ||
+      this.temporalRecordingError ||
+      this.temporalDisposed
+    )
+      return;
+    try {
+      const recordingId = this.temporalRecordingId;
+      void this.plugin
+        .recordGraphHistory(
+          recordingId,
+          snapshot,
+          Date.now(),
+          this.temporalSession,
+        )
+        .then(() => {
+          if (this.temporalDisposed) return;
+          this.temporalHistory =
+            this.plugin.getRecordedGraphHistory(recordingId);
+          this.renderTemporalNavigation();
+        })
+        .catch((error: unknown) => this.reportTemporalError(error));
+    } catch (error) {
+      this.reportTemporalError(error);
+    }
+  }
+
+  private reportTemporalError(error: unknown): void {
+    this.temporalRecordingError =
+      error instanceof Error ? error.message : String(error);
+    console.error("Base Board: graph history is unavailable", error);
+    this.renderTemporalNavigation();
+  }
+
+  private setTemporalTime(at: number | null): void {
+    if (at !== null && !Number.isFinite(at)) return;
+    const history = this.temporalHistory;
+    if (!history?.frames.length) return;
+    const next =
+      at === null
+        ? null
+        : Math.max(history.frames[0].at, Math.min(this.getTemporalEnd(), at));
+    if (next === this.temporalCursor) return;
+    if (this.temporalCursor === null && next !== null) {
+      this.temporalScopeKey = this.isGraphOverview()
+        ? this.overviewScopeKey
+        : OVERVIEW_ALL;
+      this.temporalReturnScopeKey = this.overviewScopeKey;
+      if (!this.isGraphOverview()) this.overviewResetCamera = true;
+      this.temporalPositionScopes.clear();
+      const viewport = this.getGraphViewportEl();
+      this.temporalReturnCamera = viewport
+        ? this.getGraphViewportState(viewport)
+        : this.graphViewportState;
+      this.temporalExpandedKeys = new Set(
+        this.graphNodes
+          .filter((node) => !node.collapsed)
+          .map((node) => this.getTemporalNodeKey(node)),
+      );
+      this.temporalPositions = new Map(
+        (this.isGraphOverview() ? this.visibleNodes : []).map((node) => [
+          this.getTemporalNodeKey(node),
+          { x: node.x, y: node.y },
+        ]),
+      );
+    }
+    const previous =
+      this.temporalRenderedCursor === null
+        ? this.temporalLiveNodes
+        : (graphAtTime(history, this.temporalRenderedCursor) ?? []);
+    const current =
+      next === null
+        ? this.temporalLiveNodes
+        : (graphAtTime(history, next) ?? []);
+    const focusKey = this.temporalScopeKey ?? this.overviewScopeKey;
+    const scopedBefore = scopeGraphSnapshot(previous, focusKey);
+    const scopedAfter = scopeGraphSnapshot(current, focusKey);
+    const changes = compareGraphSnapshots(scopedBefore, scopedAfter);
+    this.temporalChangedKeys = changedGraphHistoryKeys(
+      scopedBefore,
+      scopedAfter,
+    );
+    this.temporalAddedKeys = new Set(changes.added.map((node) => node.key));
+    this.temporalUpdatedCount = changes.updated.length;
+    this.temporalRemovedNodes = changes.removed;
+    this.temporalCursor = next;
+    if (next === null) {
+      if (this.temporalScopeKey !== this.temporalReturnScopeKey) {
+        this.temporalChangedKeys.clear();
+        this.temporalAddedKeys.clear();
+        this.temporalUpdatedCount = 0;
+        this.temporalRemovedNodes = [];
+      }
+      this.overviewScopeKey = this.temporalReturnScopeKey;
+      this.temporalScopeKey = null;
+      this.overviewResetCamera = false;
+      this.temporalRestoreCamera = this.temporalReturnCamera;
+      this.renderedPresentation = null;
+      this.temporalSnapshots.clear();
+      this.temporalPositions.clear();
+      this.temporalPositionScopes.clear();
+    }
+    if (this.temporalRenderFrame !== null)
+      window.cancelAnimationFrame(this.temporalRenderFrame);
+    this.temporalRenderFrame = window.requestAnimationFrame(() => {
+      this.temporalRenderFrame = null;
+      if (!this.temporalDisposed) this.render();
+    });
+  }
+
+  private getTemporalEnd(): number {
+    return Math.max(Date.now(), this.temporalHistory?.observedThrough ?? 0);
+  }
+
+  private stepTemporalDay(direction: -1 | 1): void {
+    const history = this.temporalHistory;
+    if (!history?.frames.length) return;
+    this.setTemporalTime(
+      stepGraphHistoryDay(
+        this.temporalCursor ?? this.getTemporalEnd(),
+        direction,
+        history.frames[0].at,
+        this.getTemporalEnd(),
+      ),
+    );
+  }
+
+  private stepTemporalChange(direction: -1 | 1): void {
+    const history = this.getScopedTemporalHistory();
+    if (!history) return;
+    const next = adjacentGraphHistoryChange(
+      history,
+      this.temporalCursor ?? this.getTemporalEnd(),
+      direction,
+    );
+    if (next !== null) this.setTemporalTime(next);
+  }
+
+  private getScopedTemporalHistory(): GraphHistory | null {
+    const history = this.temporalHistory;
+    if (!history) return null;
+    const key = this.getTemporalFocusKey();
+    const cached = this.temporalScopeCache;
+    if (
+      cached &&
+      cached.key === key &&
+      cached.source.frames === history.frames
+    ) {
+      return { ...cached.history, observedThrough: history.observedThrough };
+    }
+    const scoped = scopeGraphHistory(history, key);
+    this.temporalScopeCache = { key, source: history, history: scoped };
+    return scoped;
+  }
+
+  private getTemporalFocusKey(): string {
+    return this.temporalCursor !== null
+      ? (this.temporalScopeKey ?? this.overviewScopeKey)
+      : this.isGraphOverview()
+        ? this.overviewScopeKey
+        : OVERVIEW_ALL;
+  }
+
+  private renderTemporalNavigation(): void {
+    if (this.temporalDisposed) return;
+    if (!this.temporalBarEl) {
+      this.temporalBarEl = this.containerEl.createDiv({
+        cls: "base-board-graph-history",
+        attr: { "aria-label": "Recorded graph history" },
+      });
+      const controls = this.temporalBarEl.createDiv({
+        cls: "base-board-graph-history-controls",
+      });
+      for (const [key, icon, label, action] of [
+        [
+          "previous-change",
+          "lucide-skip-back",
+          "Previous recorded change",
+          () => this.stepTemporalChange(-1),
+        ],
+        [
+          "previous-day",
+          "lucide-chevron-left",
+          "Previous day",
+          () => this.stepTemporalDay(-1),
+        ],
+        [
+          "next-day",
+          "lucide-chevron-right",
+          "Next day",
+          () => this.stepTemporalDay(1),
+        ],
+        [
+          "next-change",
+          "lucide-skip-forward",
+          "Next recorded change",
+          () => this.stepTemporalChange(1),
+        ],
+        [
+          "present",
+          "lucide-radio",
+          "Return to present",
+          () => this.setTemporalTime(null),
+        ],
+        [
+          "retry",
+          "lucide-refresh-cw",
+          "Retry graph recording",
+          () => {
+            this.temporalRecordingError = null;
+            this.render();
+          },
+        ],
+      ] as const)
+        this.temporalControls.set(
+          key,
+          this.renderGraphIconButton(controls, icon, label, action),
+        );
+      this.temporalDateEl = controls.createEl("time", {
+        cls: "base-board-graph-history-date",
+      });
+      this.temporalStatusEl = controls.createSpan({
+        cls: "base-board-graph-history-status",
+        attr: { role: "img" },
+      });
+      const track = this.temporalBarEl.createDiv({
+        cls: "base-board-graph-history-track",
+      });
+      this.temporalEventsEl = track.createDiv({
+        cls: "base-board-graph-history-events",
+        attr: { "aria-hidden": "true" },
+      });
+      this.temporalRangeEl = track.createEl("input", {
+        attr: { type: "range", step: "1", "aria-label": "Graph history time" },
+      });
+      this.temporalRangeEl.addEventListener("input", () => {
+        if (this.temporalRangeEl)
+          this.setTemporalTime(Number(this.temporalRangeEl.value));
+      });
+      this.temporalBarEl.addEventListener("keydown", (event: KeyboardEvent) => {
+        if (
+          event.key !== "ArrowLeft" &&
+          event.key !== "ArrowRight" &&
+          event.key !== "Home" &&
+          event.key !== "End"
+        )
+          return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.key === "End") this.setTemporalTime(null);
+        else if (event.key === "Home")
+          this.setTemporalTime(this.temporalHistory?.frames[0]?.at ?? null);
+        else if (event.shiftKey)
+          this.stepTemporalChange(event.key === "ArrowLeft" ? -1 : 1);
+        else this.stepTemporalDay(event.key === "ArrowLeft" ? -1 : 1);
+      });
+      this.temporalBarEl.addEventListener(
+        "wheel",
+        (event: WheelEvent) => {
+          if (!this.temporalHistory || event.ctrlKey || event.metaKey) return;
+          const delta =
+            Math.abs(event.deltaX) > Math.abs(event.deltaY)
+              ? event.deltaX
+              : event.deltaY;
+          if (!delta) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const duration =
+            this.getTemporalEnd() - this.temporalHistory.frames[0].at;
+          const scale = Math.max(1, duration / 600);
+          this.setTemporalTime(
+            (this.temporalCursor ?? this.getTemporalEnd()) +
+              delta * scale * (event.deltaMode === 1 ? 16 : 1),
+          );
+        },
+        { passive: false },
+      );
+      this.temporalChangesEl = this.temporalBarEl.createDiv({
+        cls: "base-board-graph-history-changes",
+      });
+    }
+    const history = this.getScopedTemporalHistory();
+    const range = this.temporalRangeEl;
+    if (
+      !range ||
+      !this.temporalDateEl ||
+      !this.temporalStatusEl ||
+      !this.temporalEventsEl ||
+      !this.temporalChangesEl
+    )
+      return;
+    const from = history?.frames[0]?.at ?? Date.now();
+    const through = this.getTemporalEnd();
+    const selected = this.temporalCursor ?? through;
+    range.min = String(from);
+    range.max = String(Math.max(from + 1, through));
+    range.value = String(selected);
+    range.disabled = !history || Boolean(this.temporalRecordingError);
+    range.setAttribute(
+      "aria-valuetext",
+      `${this.getTemporalFocusKey() === OVERVIEW_ALL ? "All work" : (this.overviewBreadcrumbs[this.overviewBreadcrumbs.length - 1]?.title ?? "Selected scope")}; ${this.temporalCursor === null ? "Present" : "Recorded snapshot"}: ${new Date(selected).toLocaleString()}`,
+    );
+    this.temporalDateEl.textContent = new Date(selected).toLocaleString([], {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    this.temporalDateEl.dateTime = new Date(selected).toISOString();
+    const inGap = history ? isGraphHistoryGap(history, selected) : false;
+    const status = this.temporalRecordingError
+      ? `Graph recording error: ${this.temporalRecordingError}`
+      : !history
+        ? "Waiting for the first graph observation"
+        : inGap
+          ? "Observation gap: showing the last known graph, not a verified snapshot of this time"
+          : `Recording began ${new Date(from).toLocaleString()}. Observed graph metadata only; note contents and unobserved changes are not recorded.`;
+    setIcon(
+      this.temporalStatusEl,
+      this.temporalRecordingError || inGap
+        ? "lucide-octagon-alert"
+        : this.temporalCursor === null
+          ? "lucide-radio"
+          : "lucide-history",
+    );
+    this.temporalStatusEl.setAttribute("aria-label", status);
+    this.temporalStatusEl.setAttribute("title", status);
+    setTooltip(this.temporalStatusEl, status);
+    this.temporalBarEl.toggleClass("base-board-graph-history--gap", inGap);
+    this.temporalBarEl.toggleClass(
+      "base-board-graph-history--error",
+      Boolean(this.temporalRecordingError),
+    );
+    for (const [key, button] of this.temporalControls) {
+      if (key === "retry") {
+        button.hidden = !this.temporalRecordingError;
+        button.disabled = false;
+        continue;
+      }
+      if (key === "present") {
+        button.disabled = this.temporalCursor === null;
+        continue;
+      }
+      button.disabled =
+        !history ||
+        Boolean(this.temporalRecordingError) ||
+        ((key === "previous-day" || key === "previous-change") &&
+          selected <= from) ||
+        (key === "next-day" && selected >= through) ||
+        (key === "next-change" &&
+          history !== null &&
+          adjacentGraphHistoryChange(history, selected, 1) === null);
+    }
+    this.temporalEventsEl.empty();
+    if (history) {
+      const stride = Math.max(1, Math.ceil(history.frames.length / 240));
+      history.frames.forEach((frame, index) => {
+        if (frame.gapAfter !== null && frame.at > frame.gapAfter) {
+          const gap = this.temporalEventsEl!.createSpan({
+            cls: "base-board-graph-history-gap",
+          });
+          gap.style.left = `${((frame.gapAfter - from) / Math.max(1, through - from)) * 100}%`;
+          gap.style.width = `${((frame.at - frame.gapAfter) / Math.max(1, through - from)) * 100}%`;
+        }
+        if (index % stride !== 0 && index !== history.frames.length - 1) return;
+        const marker = this.temporalEventsEl!.createSpan({
+          cls: `base-board-graph-history-event base-board-graph-history-event--${frame.kind}`,
+        });
+        marker.style.left = `${((frame.at - from) / Math.max(1, through - from)) * 100}%`;
+        marker.style.height = `${Math.min(16, 4 + frame.upserts.length + frame.removed.length)}px`;
+      });
+    }
+    this.temporalChangesEl.empty();
+    for (const [icon, label, value] of [
+      [
+        "lucide-circle-plus",
+        "Items added since the previously selected time",
+        this.temporalAddedKeys.size,
+      ],
+      [
+        "lucide-pencil",
+        "Items changed since the previously selected time",
+        this.temporalUpdatedCount,
+      ],
+      [
+        "lucide-circle-minus",
+        `Items that left this graph: ${this.temporalRemovedNodes.map((node) => node.title).join(", ")}`,
+        this.temporalRemovedNodes.length,
+      ],
+    ] as const) {
+      if (value)
+        this.renderGraphVisual(
+          this.temporalChangesEl,
+          "base-board-graph-history-change",
+          label,
+          icon,
+          undefined,
+          String(value),
+        );
+    }
   }
 
   private renderGraphIconButton(
@@ -657,14 +2368,44 @@ export class GraphView extends BasesView {
     count: number,
     state: GraphNodeState,
   ): void {
-    const statEl = toolbarEl.createSpan({
-      cls: `base-board-graph-stat base-board-graph-stat--${state}`,
+    const visual = getGraphStateVisual(state);
+    this.renderGraphVisual(
+      toolbarEl,
+      `base-board-graph-stat base-board-graph-stat--${state}`,
+      `${label}: ${count}`,
+      visual.icon,
+      visual.color,
+      String(count),
+    );
+  }
+
+  private renderGraphVisual(
+    parentEl: HTMLElement,
+    className: string,
+    label: string,
+    icon: string,
+    color?: string,
+    value?: string,
+  ): HTMLElement {
+    const element = parentEl.createSpan({
+      cls: `${className} base-board-graph-icon-value`,
+      attr: { role: "img", "aria-label": label, title: label },
     });
-    statEl.createSpan({ cls: "base-board-graph-stat-label", text: label });
-    statEl.createSpan({
-      cls: "base-board-graph-stat-value",
-      text: String(count),
+    if (color) element.style.setProperty("--graph-status-color", color);
+    const iconEl = element.createSpan({
+      cls: "base-board-graph-status-icon",
+      attr: { "aria-hidden": "true" },
     });
+    setIcon(iconEl, icon);
+    if (value !== undefined) {
+      element.createSpan({
+        cls: "base-board-graph-stat-value",
+        text: value,
+        attr: { "aria-hidden": "true" },
+      });
+    }
+    setTooltip(element, label);
+    return element;
   }
 
   private renderGraphFrontierButton(toolbarEl: HTMLElement): void {
@@ -697,7 +2438,9 @@ export class GraphView extends BasesView {
   }
 
   private getGraphFrontier(): GraphNode[] {
-    return this.visibleNodes.filter((node) => this.isFrontierLeaf(node));
+    return (
+      this.isGraphOverview() ? this.overviewScopeNodes : this.graphNodes
+    ).filter((node) => this.isFrontierLeaf(node));
   }
 
   /**
@@ -723,16 +2466,16 @@ export class GraphView extends BasesView {
    * to drive folding the vault's disparate items into the proper structure.
    */
   private getGraphHygiene(): GraphHygieneItem[] {
-    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const parentByPath = this.getResolvedParentsByPath(this.graphNodes);
     return engineGetHygiene(
-      this.visibleNodes,
+      this.isGraphOverview() ? this.overviewScopeNodes : this.graphNodes,
       (candidate) =>
         parentByPath.get((candidate as GraphNode).file.path) ?? null,
     );
   }
 
   private showGraphFrontier(): void {
-    const parentByPath = this.getResolvedParentsByPath(this.visibleNodes);
+    const parentByPath = this.getResolvedParentsByPath(this.graphNodes);
     const frontier: GraphFrontierItem[] = this.getGraphFrontier()
       .map((node) => ({
         lineage: this.getNodeLineage(node, parentByPath),
@@ -790,10 +2533,11 @@ export class GraphView extends BasesView {
   private renderCanvas(nodes: GraphNode[], edges: GraphEdge[]): HTMLElement {
     const bounds = this.getGraphBounds(nodes);
     this.graphWorldBounds = bounds.world;
-    const viewportEl = this.containerEl.createDiv({
+    const viewportEl = this.getGraphContentEl().createDiv({
       cls: "base-board-graph-viewport",
     });
     viewportEl.addEventListener("scroll", () => {
+      if (viewportEl.dataset.graphCameraReady !== "true") return;
       this.graphViewportState = this.getGraphViewportState(viewportEl);
     });
     viewportEl.addEventListener(
@@ -817,7 +2561,8 @@ export class GraphView extends BasesView {
     canvasEl.style.height = `${bounds.height}px`;
     this.applyGraphZoom(zoomContentEl, canvasEl, bounds);
     canvasEl.addEventListener("contextmenu", (event: MouseEvent) => {
-      this.showCanvasCreateMenu(event, canvasEl);
+      if (this.isGraphOverview()) event.preventDefault();
+      else this.showCanvasCreateMenu(event, canvasEl);
     });
 
     const svgEl = activeDocument.createElementNS(
@@ -825,6 +2570,7 @@ export class GraphView extends BasesView {
       "svg",
     );
     svgEl.addClass("base-board-graph-edges");
+    if (this.isGraphOverview()) svgEl.setAttribute("aria-hidden", "true");
     svgEl.setAttribute("width", String(bounds.width));
     svgEl.setAttribute("height", String(bounds.height));
     svgEl.setAttribute("viewBox", `0 0 ${bounds.width} ${bounds.height}`);
@@ -849,6 +2595,25 @@ export class GraphView extends BasesView {
       "http://www.w3.org/2000/svg",
       "defs",
     );
+    const physicsStates: GraphNodeState[] = [
+      "completed",
+      "in-progress",
+      "active",
+      "awaiting",
+      "blocked",
+      "interrupted",
+      "cancelled",
+      "invalidated",
+      "waiting",
+      "idle",
+    ];
+    const physicsColors = new Map(
+      physicsStates.map((state) => [
+        `physics-${state}`,
+        getGraphStateVisual(state === "cancelled" ? "interrupted" : state)
+          .color,
+      ]),
+    );
     for (const kind of [
       "requirement-start",
       "requirement-return",
@@ -859,6 +2624,9 @@ export class GraphView extends BasesView {
       "restart",
       "membership",
       "compensation",
+      "association",
+      "flow-inactive",
+      ...physicsColors.keys(),
     ] as const) {
       const markerEl = activeDocument.createElementNS(
         "http://www.w3.org/2000/svg",
@@ -878,6 +2646,8 @@ export class GraphView extends BasesView {
         "path",
       );
       arrowEl.setAttribute("d", "M 1 2 L 8 5 L 1 8 z");
+      const color = physicsColors.get(kind);
+      if (color) arrowEl.style.fill = color;
       markerEl.appendChild(arrowEl);
       defsEl.appendChild(markerEl);
     }
@@ -889,6 +2659,7 @@ export class GraphView extends BasesView {
     this.renderedGraphEdgeEls = [];
     this.renderedGraphEdgeHitEls = [];
     this.renderedGraphEdgeHandleEls = [];
+    this.updatePhysicsRouteNodes();
     this.recomputeBreakEscalation();
     for (const edge of edges) {
       const pathEl = activeDocument.createElementNS(
@@ -897,9 +2668,18 @@ export class GraphView extends BasesView {
       );
       pathEl.addClass("base-board-graph-edge");
       pathEl.addClass(`base-board-graph-edge--${edge.kind}`);
+      if (edge.backtrack) pathEl.addClass("base-board-graph-edge--backtrack");
       const markerKind = this.getEdgeMarkerKind(edge);
       if (markerKind !== edge.kind) {
         pathEl.addClass(`base-board-graph-edge--${markerKind}`);
+      }
+      pathEl.dataset.from = edge.from.file.path;
+      pathEl.dataset.to = edge.to.file.path;
+      pathEl.dataset.kind = edge.kind;
+      pathEl.dataset.backtrack = String(edge.backtrack === true);
+      if (this.isGraphPhysics()) {
+        pathEl.dataset.physicsSpring = String(edge.spring === true);
+        if (edge.spring) pathEl.addClass("base-board-graph-edge--spring");
       }
       pathEl.setAttribute("fill", "none");
       pathEl.setAttribute("d", this.getEdgePath(edge));
@@ -942,11 +2722,16 @@ export class GraphView extends BasesView {
       "http://www.w3.org/2000/svg",
       "title",
     );
-    titleEl.textContent = "Right-click to delete line";
+    titleEl.textContent = this.isGraphPhysics()
+      ? `${edge.from.title} to ${edge.to.title}: ${edge.kind}`
+      : "Right-click to delete line";
     hitTargetEl.appendChild(titleEl);
 
     hitTargetEl.addEventListener("contextmenu", (event: MouseEvent) => {
-      this.showGraphEdgeMenu(event, edge);
+      if (this.isGraphPhysics()) {
+        event.preventDefault();
+        event.stopPropagation();
+      } else this.showGraphEdgeMenu(event, edge);
     });
     svgEl.appendChild(hitTargetEl);
     return hitTargetEl;
@@ -1022,7 +2807,12 @@ export class GraphView extends BasesView {
   ): void {
     if (event.button !== 0) return;
     // Derived compensation edges are not directly rewirable.
-    if (edge.kind === "compensation") return;
+    if (
+      edge.backtrack ||
+      edge.kind === "compensation" ||
+      edge.kind === "association"
+    )
+      return;
     // Structural edges inside a locked subgraph are not draggable.
     if (this.isEdgeStructurallyLocked(edge)) return;
     event.preventDefault();
@@ -1140,13 +2930,11 @@ export class GraphView extends BasesView {
       if (nextDropHandleTarget) {
         anchorTarget = null;
         clearAnchorSlots();
-        if (
-          !(
-            dropHandleTarget &&
-            nextDropHandleTarget.handleEl === dropHandleTarget.handleEl &&
-            nextDropHandleTarget.endpoint === dropHandleTarget.endpoint
-          )
-        ) {
+        if (!(
+          dropHandleTarget &&
+          nextDropHandleTarget.handleEl === dropHandleTarget.handleEl &&
+          nextDropHandleTarget.endpoint === dropHandleTarget.endpoint
+        )) {
           clearDropTarget();
           dropHandleTarget = nextDropHandleTarget;
           dropHandleTarget.handleEl.addClass(
@@ -1309,7 +3097,7 @@ export class GraphView extends BasesView {
     const nextZoom = this.clampGraphZoom(
       previousZoom * Math.exp(-event.deltaY * GRAPH_ZOOM_STEP),
     );
-    if (Math.abs(nextZoom - previousZoom) < 0.001) return;
+    if (nextZoom === previousZoom) return;
 
     const rect = viewportEl.getBoundingClientRect();
     const pointerX = event.clientX - rect.left;
@@ -1345,7 +3133,7 @@ export class GraphView extends BasesView {
 
     const previousZoom = this.graphZoom;
     const nextZoom = this.clampGraphZoom(previousZoom * factor);
-    if (Math.abs(nextZoom - previousZoom) < 0.001) return;
+    if (nextZoom === previousZoom) return;
 
     const focusX = viewportEl.clientWidth / 2;
     const focusY = viewportEl.clientHeight / 2;
@@ -1393,6 +3181,57 @@ export class GraphView extends BasesView {
     viewportEl: HTMLElement,
     nodes: GraphNode[],
   ): void {
+    const root = this.isGraphPhysics()
+      ? nodes.find(
+          (node) => this.getTemporalNodeKey(node) === this.physicsRootKey,
+        )
+      : null;
+    if (root) {
+      const size = this.getPhysicsNodeSize(root);
+      const bounds = this.getRenderedNodesCanvasBounds(nodes);
+      const canvasCenter = this.getNodeCenter(root);
+      const center = {
+        x: root.x + size.width / 2,
+        y: root.y + size.height / 2,
+      };
+      const frame = (
+        minimum: number,
+        maximum: number,
+        focus: number,
+        extent: number,
+        preferred = extent / 2,
+      ): number => {
+        const first = 32 + (focus - minimum) * this.graphZoom;
+        const last = extent - 32 - (maximum - focus) * this.graphZoom;
+        return first <= last
+          ? Math.max(first, Math.min(preferred, last))
+          : preferred;
+      };
+      const mode = this.getGraphPhysicsLayout();
+      const rootMargin = Math.min(
+        viewportEl.clientHeight / 2,
+        size.height / 2 + 48,
+      );
+      const verticalFocus =
+        mode === "hanging"
+          ? rootMargin
+          : mode === "growing"
+            ? viewportEl.clientHeight - rootMargin
+            : viewportEl.clientHeight / 2;
+      this.scrollViewportToWorldPoint(
+        viewportEl,
+        center,
+        frame(bounds.minX, bounds.maxX, canvasCenter.x, viewportEl.clientWidth),
+        frame(
+          bounds.minY,
+          bounds.maxY,
+          canvasCenter.y,
+          viewportEl.clientHeight,
+          verticalFocus,
+        ),
+      );
+      return;
+    }
     const bounds = this.getRenderedNodesCanvasBounds(nodes);
     const centerX = (bounds.minX + bounds.maxX) / 2;
     const centerY = (bounds.minY + bounds.maxY) / 2;
@@ -1405,8 +3244,9 @@ export class GraphView extends BasesView {
     viewportEl.scrollTop = Math.max(
       0,
       this.getGraphPanMarginY(viewportEl) +
-        centerY * this.graphZoom -
-        viewportEl.clientHeight / 2,
+        (this.isGraphOverview() && !this.isGraphPhysics()
+          ? bounds.minY * this.graphZoom - 32
+          : centerY * this.graphZoom - viewportEl.clientHeight / 2),
     );
   }
 
@@ -1447,6 +3287,7 @@ export class GraphView extends BasesView {
   }
 
   private clampGraphZoom(zoom: number): number {
+    if (Number.isNaN(zoom)) return 1;
     return Math.max(GRAPH_MIN_ZOOM, Math.min(GRAPH_MAX_ZOOM, zoom));
   }
 
@@ -1466,7 +3307,13 @@ export class GraphView extends BasesView {
   }
 
   private getSavedGraphViewportState(): GraphViewportState | null {
-    const raw = this.config?.get(CONFIG_KEY_GRAPH_VIEWPORT);
+    if (this.temporalCursor !== null) return this.graphViewportState;
+    if (this.isGraphPhysics()) return this.physicsCamera;
+    const raw = this.config?.get(
+      this.isGraphOverview()
+        ? CONFIG_KEY_GRAPH_OVERVIEW_VIEWPORT
+        : CONFIG_KEY_GRAPH_VIEWPORT,
+    );
     if (!raw || typeof raw !== "object") return null;
     const state = raw as Partial<GraphViewportState>;
     if (
@@ -1495,6 +3342,11 @@ export class GraphView extends BasesView {
   private persistGraphViewportState(state: GraphViewportState | null): void {
     if (!state) return;
     this.graphViewportState = state;
+    if (this.temporalCursor !== null) return;
+    if (this.isGraphPhysics()) {
+      this.physicsCamera = state;
+      return;
+    }
     // Persisting viewport state calls config.set, which can trigger a full
     // re-render (onDataUpdated) and detach the live viewport. During an active
     // pan that would orphan the pan handler mid-gesture (the camera freezes
@@ -1504,17 +3356,22 @@ export class GraphView extends BasesView {
       this.graphPanViewportPersistPending = true;
       return;
     }
-    this.config?.set(CONFIG_KEY_GRAPH_VIEWPORT, {
-      scrollLeft: Math.round(state.scrollLeft),
-      scrollTop: Math.round(state.scrollTop),
-      zoom: state.zoom,
-      ...(state.centerX !== undefined && state.centerY !== undefined
-        ? {
-            centerX: Math.round(state.centerX),
-            centerY: Math.round(state.centerY),
-          }
-        : {}),
-    });
+    this.config?.set(
+      this.isGraphOverview()
+        ? CONFIG_KEY_GRAPH_OVERVIEW_VIEWPORT
+        : CONFIG_KEY_GRAPH_VIEWPORT,
+      {
+        scrollLeft: Math.round(state.scrollLeft),
+        scrollTop: Math.round(state.scrollTop),
+        zoom: state.zoom,
+        ...(state.centerX !== undefined && state.centerY !== undefined
+          ? {
+              centerX: Math.round(state.centerX),
+              centerY: Math.round(state.centerY),
+            }
+          : {}),
+      },
+    );
   }
 
   private schedulePersistGraphViewportState(): void {
@@ -1669,30 +3526,105 @@ export class GraphView extends BasesView {
   }
 
   private renderNode(parentEl: HTMLElement, node: GraphNode): void {
+    const overview = this.isGraphOverview();
+    const item = overview ? this.overviewItems.get(node.file.path) : undefined;
+    const virtual = node.file.path === OVERVIEW_UNASSIGNED;
+    const physicsContext =
+      this.isGraphPhysics() && this.physicsContextPaths.has(node.file.path);
+    const fixedRoot =
+      this.isGraphPhysics() &&
+      this.getTemporalNodeKey(node) === this.physicsRootKey;
+    const container =
+      node.descendantCount > 0 ||
+      node.kind === "group" ||
+      node.kind === "process";
+    const summary = this.graphWorkSummaries.get(node.file.path);
+    const displayState =
+      overview && !this.isCompensationNode(node)
+        ? summary
+          ? container
+            ? getOverviewSummaryState(summary)
+            : summary.state
+          : node.state
+        : node.state;
+    const indicatorState =
+      !overview && displayState === "active" && this.isActiveStatus(node.status)
+        ? "in-progress"
+        : displayState;
     const nodeEl = parentEl.createDiv({
-      cls: `base-board-graph-node base-board-graph-node--${node.state}`,
+      cls: `base-board-graph-node base-board-graph-node--${displayState}`,
     });
+    if (this.isGraphPhysics()) {
+      nodeEl.style.setProperty(
+        "--graph-physics-diameter",
+        `${this.getPhysicsNodeSize(node).width}px`,
+      );
+      nodeEl.toggleClass(
+        "base-board-graph-node--has-summary",
+        Boolean(summary && node.descendantCount > 0),
+      );
+    }
+    if (item) {
+      nodeEl.addClass(`base-board-graph-node--${item.role}`);
+      nodeEl.dataset.overviewRole = item.role;
+      nodeEl.style.setProperty("--graph-overview-height", `${item.height}px`);
+      if (item.trail.length)
+        nodeEl.addClass("base-board-graph-node--compressed");
+    }
+    if (virtual) nodeEl.addClass("base-board-graph-node--unassigned");
+    if (fixedRoot) {
+      nodeEl.addClass("base-board-graph-node--root");
+      nodeEl.dataset.physicsFixed = "true";
+    }
     this.positionRenderedGraphNodeEl(nodeEl, node);
     nodeEl.style.setProperty(
       "--graph-node-color",
-      getColumnColor(this.config, this.getNodeColorStatus(node)),
+      overview
+        ? this.getOverviewColor(displayState)
+        : getColumnColor(this.config, this.getNodeColorStatus(node)),
     );
     nodeEl.dataset.filePath = node.file.path;
     nodeEl.setAttr("role", "button");
     nodeEl.setAttr("tabindex", "0");
     setTooltip(nodeEl, this.getNodeTooltip(node));
+    nodeEl.dataset.state = displayState;
+    const nodeKey = this.getTemporalNodeKey(node);
+    const hasChangedDescendant = getOverviewDescendants(node).some((child) =>
+      this.temporalChangedKeys.has(this.getTemporalNodeKey(child)),
+    );
+    const lostChild = this.temporalRemovedNodes.some(
+      (removed) =>
+        (removed.parentKey !== null &&
+          this.getNodeIdentities(node).includes(removed.parentKey)) ||
+        removed.rollupToKeys.some((key) =>
+          this.getNodeIdentities(node).includes(key),
+        ),
+    );
+    nodeEl.toggleClass(
+      "base-board-graph-node--history-added",
+      this.temporalAddedKeys.has(nodeKey),
+    );
+    nodeEl.toggleClass(
+      "base-board-graph-node--history-changed",
+      this.temporalChangedKeys.has(nodeKey) ||
+        hasChangedDescendant ||
+        lostChild,
+    );
+    if (node.descendantCount > 0 && !physicsContext)
+      nodeEl.setAttr("aria-expanded", String(!node.collapsed));
+    nodeEl.setAttr(
+      "aria-label",
+      `${node.title}, ${this.getOverviewStateLabel(node, indicatorState)}${fixedRoot ? ", fixed graph root" : ""}`,
+    );
 
-    const stateEl = nodeEl.createSpan({
-      cls: `base-board-graph-node-state base-board-graph-node-state--${node.state}`,
-    });
-    setIcon(stateEl, this.getStateIcon(node.state));
-
-    if (node.descendantCount > 0) {
+    if (node.descendantCount > 0 && !physicsContext) {
       const collapseBtn = nodeEl.createEl("button", {
         cls: "base-board-graph-collapse",
         attr: {
           type: "button",
-          title: node.collapsed ? "Expand workflow" : "Collapse workflow",
+          title: `${node.collapsed ? "Expand" : "Collapse"} ${node.title}`,
+          "aria-label": `${node.collapsed ? "Expand" : "Collapse"} ${node.title}`,
+          "aria-expanded": String(!node.collapsed),
         },
       });
       setIcon(
@@ -1706,7 +3638,7 @@ export class GraphView extends BasesView {
       });
     }
 
-    if (node.descendantCount > 0) {
+    if (!overview && node.descendantCount > 0) {
       const lockBtn = nodeEl.createEl("button", {
         cls: `base-board-graph-lock${
           node.effectiveLocked ? " base-board-graph-lock--locked" : ""
@@ -1727,47 +3659,25 @@ export class GraphView extends BasesView {
       });
     }
 
-    // Agency badge (top-left) when the node is not human-executed.
-    if (node.executor !== "human") {
-      const agencyEl = nodeEl.createSpan({
-        cls: `base-board-graph-agency base-board-graph-agency--${node.executor}`,
-        attr: {
-          title: `Run by ${node.executor} \u00b7 autonomy: ${node.autonomy}`,
-        },
+    if (item?.trail.length) {
+      const trailEl = nodeEl.createDiv({
+        cls: "base-board-graph-wrapper-trail",
       });
-      setIcon(
-        agencyEl,
-        node.executor === "agent" ? "lucide-bot" : "lucide-users",
-      );
+      for (const wrapper of item.trail) {
+        const button = trailEl.createEl("button", {
+          text: wrapper.title,
+          attr: {
+            type: "button",
+            title: `Focus ${wrapper.title}`,
+            "aria-label": `Focus ${wrapper.title}`,
+          },
+        });
+        button.addEventListener("click", (event: MouseEvent) => {
+          event.stopPropagation();
+          this.focusOverview(this.getTemporalNodeKey(wrapper));
+        });
+      }
     }
-
-    // Mitigation badge: a live, triggered compensation (rollback) task.
-    if (
-      node.compensatesTargets.length > 0 &&
-      this.isLiveGraphState(node.state)
-    ) {
-      const mitigationEl = nodeEl.createSpan({
-        cls: "base-board-graph-mitigation",
-        attr: {
-          title: "Mitigation \u2014 undoes a live change after a failure",
-        },
-      });
-      setIcon(mitigationEl, "lucide-undo-2");
-    }
-
-    // Attention badge (Phase 3): an effecting node with a live side-effect in a
-    // failed scope but no declared compensation — a cue to propose a rollback.
-    if (node.needsCompensation) {
-      const attentionEl = nodeEl.createSpan({
-        cls: "base-board-graph-attention",
-        attr: {
-          title:
-            "Unmitigated side-effect \u2014 this completed change has no declared compensation for the failure in its scope",
-        },
-      });
-      setIcon(attentionEl, "lucide-alert-triangle");
-    }
-
     const titleEl = nodeEl.createDiv({
       cls: "base-board-graph-node-title",
       text: node.title,
@@ -1775,52 +3685,96 @@ export class GraphView extends BasesView {
     titleEl.setAttr("title", node.title);
 
     const metaEl = nodeEl.createDiv({ cls: "base-board-graph-node-meta" });
-    metaEl.createSpan({
-      cls: "base-board-graph-node-status",
-      text: node.status ?? "(No value)",
-    });
     if (node.nodeType) {
       metaEl.createSpan({
         cls: "base-board-graph-node-deps",
         text: node.workflow ?? node.nodeType,
       });
     }
-    if (node.dependsOnKeys.length > 0) {
-      metaEl.createSpan({
-        cls: "base-board-graph-node-deps",
-        text: `${node.predecessors.length}/${node.dependsOnKeys.length} deps`,
-      });
+    if (!overview && node.dependsOnKeys.length > 0) {
+      this.renderGraphVisual(
+        metaEl,
+        "base-board-graph-node-deps",
+        `${node.predecessors.length} of ${node.dependsOnKeys.length} dependencies visible`,
+        "lucide-link",
+        undefined,
+        `${node.predecessors.length}/${node.dependsOnKeys.length}`,
+      );
     }
-    if (node.collapsed && node.descendantCount > 0) {
-      metaEl.createSpan({
-        cls: "base-board-graph-node-deps",
-        text: `${node.descendantCount} hidden`,
-      });
+    if (!overview && node.collapsed && node.descendantCount > 0) {
+      this.renderGraphVisual(
+        metaEl,
+        "base-board-graph-node-deps",
+        `${node.descendantCount} hidden descendants`,
+        "lucide-layers",
+        undefined,
+        String(node.descendantCount),
+      );
     }
 
-    const linkHandleEl = nodeEl.createDiv({
-      cls: "base-board-graph-link-handle",
-    });
-    linkHandleEl.dataset.side = "right";
-    window.requestAnimationFrame(() => {
-      this.snapNodeLinkHandleToSlot(nodeEl, linkHandleEl, {
-        side: "right",
-        xRatio: 1,
-        yRatio: 0.5,
+    if (overview) {
+      if (node.descendantCount > 0 || node.kind === "group") {
+        const focusButton = nodeEl.createEl("button", {
+          cls: "base-board-graph-focus-node",
+          attr: {
+            type: "button",
+            "aria-label": `Focus ${node.title}`,
+            title: `Focus ${node.title}`,
+          },
+        });
+        setIcon(focusButton, "lucide-scan");
+        focusButton.addEventListener("click", (event: MouseEvent) => {
+          event.stopPropagation();
+          this.focusOverview(this.getTemporalNodeKey(node));
+        });
+      }
+      if (!virtual) {
+        const openButton = nodeEl.createEl("button", {
+          cls: "base-board-graph-open-note",
+          attr: {
+            type: "button",
+            "aria-label": `Open ${node.title}`,
+            title: `Open ${node.title}`,
+          },
+        });
+        setIcon(openButton, "lucide-file-text");
+        openButton.addEventListener("click", (event: MouseEvent) => {
+          event.preventDefault();
+          event.stopPropagation();
+          this.openGraphNode(node);
+        });
+      }
+      if (summary && node.descendantCount > 0)
+        this.renderGraphWorkSummary(
+          nodeEl,
+          summary,
+          this.isGraphPhysics() || item?.role === "heading",
+        );
+    } else {
+      const linkHandleEl = nodeEl.createDiv({
+        cls: "base-board-graph-link-handle",
       });
-    });
-    setTooltip(linkHandleEl, "Drag to create a link");
-    nodeEl.addEventListener("mousemove", (event: MouseEvent) => {
-      this.positionNodeLinkHandle(event, nodeEl, linkHandleEl);
-    });
-    nodeEl.addEventListener("mouseleave", () => {
-      linkHandleEl.removeClass("base-board-graph-link-handle--visible");
-    });
-    linkHandleEl.addEventListener("mousedown", (event: MouseEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
-      this.startNodeLinkDrag(event, node, linkHandleEl);
-    });
+      linkHandleEl.dataset.side = "right";
+      window.requestAnimationFrame(() => {
+        this.snapNodeLinkHandleToSlot(nodeEl, linkHandleEl, {
+          side: "right",
+          xRatio: 1,
+          yRatio: 0.5,
+        });
+      });
+      setTooltip(linkHandleEl, "Drag to create a link");
+      nodeEl.addEventListener("mousemove", (event: MouseEvent) => {
+        this.positionNodeLinkHandle(event, nodeEl, linkHandleEl);
+      });
+      nodeEl.addEventListener("mouseleave", () => {
+        linkHandleEl.removeClass("base-board-graph-link-handle--visible");
+      });
+      linkHandleEl.addEventListener("mousedown", (event: MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.startNodeLinkDrag(event, node, linkHandleEl);
+      });
+    }
 
     nodeEl.addEventListener("click", (event: MouseEvent) => {
       if (this.suppressNextNodeClick) {
@@ -1828,19 +3782,286 @@ export class GraphView extends BasesView {
         event.stopPropagation();
         return;
       }
-      new CardDetailModal(this.app, node.file).open();
+      if (physicsContext) this.focusOverview(this.getTemporalNodeKey(node));
+      else if (overview && node.descendantCount > 0)
+        void this.toggleGraphCollapse(node);
+      else this.openGraphNode(node);
     });
     nodeEl.addEventListener("mousedown", (event: MouseEvent) => {
-      this.startNodeDrag(event, node);
+      if (this.isGraphPhysics()) this.startPhysicsNodeDrag(event, node);
+      else if (!overview) this.startNodeDrag(event, node);
     });
+    if (this.isGraphPhysics()) {
+      const trace = (): void => {
+        this.containerEl.addClass("base-board-graph--tracing");
+        this.renderedGraphEdges.forEach((edge, index) => {
+          this.renderedGraphEdgeEls[index]?.toggleClass(
+            "base-board-graph-edge--traced",
+            edge.from.file.path === node.file.path ||
+              edge.to.file.path === node.file.path,
+          );
+        });
+      };
+      const clearTrace = (): void => {
+        this.containerEl.removeClass("base-board-graph--tracing");
+        for (const edgeEl of this.renderedGraphEdgeEls)
+          edgeEl.removeClass("base-board-graph-edge--traced");
+      };
+      nodeEl.addEventListener("mouseenter", trace);
+      nodeEl.addEventListener("mouseleave", clearTrace);
+      nodeEl.addEventListener("focusin", trace);
+      nodeEl.addEventListener("focusout", clearTrace);
+    }
     nodeEl.addEventListener("contextmenu", (event: MouseEvent) => {
-      this.showNodeContextMenu(event, node);
+      if (overview) {
+        event.preventDefault();
+        event.stopPropagation();
+        const menu = new Menu();
+        if (!virtual)
+          menu.addItem((item) =>
+            item
+              .setTitle("Open note")
+              .setIcon("lucide-file-text")
+              .onClick(() => this.openGraphNode(node)),
+          );
+        if (node.descendantCount > 0) {
+          menu.addItem((item) =>
+            item
+              .setTitle("Focus this branch")
+              .setIcon("lucide-scan")
+              .onClick(() => this.focusOverview(this.getTemporalNodeKey(node))),
+          );
+          if (!physicsContext)
+            menu.addItem((item) =>
+              item
+                .setTitle(
+                  node.collapsed ? "Expand workstream" : "Collapse workstream",
+                )
+                .setIcon(
+                  node.collapsed
+                    ? "lucide-chevrons-down"
+                    : "lucide-chevrons-up",
+                )
+                .onClick(() => {
+                  void this.toggleGraphCollapse(node);
+                }),
+            );
+        }
+        menu.showAtMouseEvent(event);
+      } else this.showNodeContextMenu(event, node);
     });
     nodeEl.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (event.target !== nodeEl) return;
       if (event.key !== "Enter" && event.key !== " ") return;
       event.preventDefault();
-      new CardDetailModal(this.app, node.file).open();
+      if (physicsContext) this.focusOverview(this.getTemporalNodeKey(node));
+      else if (overview && node.descendantCount > 0)
+        void this.toggleGraphCollapse(node);
+      else this.openGraphNode(node);
     });
+  }
+
+  private openGraphNode(node: GraphNode): void {
+    if (node.file.path === OVERVIEW_UNASSIGNED) {
+      this.focusOverview(OVERVIEW_UNASSIGNED);
+      return;
+    }
+    if (this.temporalCursor !== null) {
+      const snapshot = this.temporalSnapshots.get(node.file.path);
+      if (snapshot)
+        new RecordedGraphNodeModal(
+          this.app,
+          snapshot,
+          this.temporalCursor,
+        ).open();
+      return;
+    }
+    new CardDetailModal(this.app, node.file).open();
+  }
+
+  private getOverviewColor(state: GraphNodeState): string {
+    return getGraphStateVisual(state).color;
+  }
+
+  private getOverviewStateLabel(
+    node: GraphNode,
+    state: GraphNodeState,
+  ): string {
+    if (node.kind === "impact") return "Observation";
+    if (this.isCompensationNode(node) && state === "active") return "Rollback";
+    return getGraphStateVisual(state).label;
+  }
+
+  private renderGraphWorkSummary(
+    nodeEl: HTMLElement,
+    summary: GraphWorkSummary,
+    compact = false,
+  ): void {
+    const progressEl = nodeEl.createDiv({
+      cls: "base-board-graph-work-summary",
+    });
+    const completedVisual = getGraphStateVisual("completed");
+    const completedCount = progressEl.createSpan({
+      cls: "base-board-graph-work-completed",
+      text: `${summary.completed} / ${summary.total}`,
+      attr: {
+        "aria-label": `${summary.completed} of ${summary.total} work items completed`,
+      },
+    });
+    completedCount.style.color = completedVisual.color;
+    setTooltip(
+      completedCount,
+      `${summary.completed} of ${summary.total} work items completed`,
+    );
+    if (!compact) {
+      const meter = progressEl.createDiv({
+        cls: "base-board-graph-progress",
+        attr: {
+          role: "progressbar",
+          "aria-label": "Completed work items",
+          "aria-valuemin": "0",
+          "aria-valuemax": String(Math.max(1, summary.total)),
+          "aria-valuenow": String(summary.completed),
+          "aria-valuetext": `${summary.completed} of ${summary.total} work items completed`,
+        },
+      });
+      const completed = meter.createSpan({
+        cls: "base-board-graph-progress--completed",
+      });
+      completed.style.width = `${getOverviewCompletion(summary) * 100}%`;
+      completed.setAttr("title", `${summary.completed} completed`);
+    }
+    const counts = progressEl.createDiv({
+      cls: "base-board-graph-work-counts",
+    });
+    for (const [key, state] of [
+      ["active", "in-progress"],
+      ["awaiting", "awaiting"],
+      ["blocked", "blocked"],
+      ["mitigations", "blocked"],
+      ["ready", "active"],
+    ] as const) {
+      if (summary[key] === 0) continue;
+      if (this.isGraphPhysics() && key !== "blocked" && key !== "mitigations")
+        continue;
+      const visual =
+        key === "mitigations"
+          ? {
+              icon: "lucide-undo-2",
+              color: "var(--color-orange, #e0843a)",
+              label: "Rollback",
+            }
+          : getGraphStateVisual(state);
+      const count = counts.createSpan({
+        cls: `base-board-graph-work-count--${key}`,
+        text: String(summary[key]),
+        attr: { "aria-label": `${visual.label}: ${summary[key]}` },
+      });
+      count.style.color = visual.color;
+      setTooltip(count, `${visual.label}: ${summary[key]}`);
+    }
+  }
+
+  private startPhysicsNodeDrag(event: MouseEvent, node: GraphNode): void {
+    const simulation = this.physicsSimulation;
+    const viewport = this.physicsViewportEl;
+    if (
+      event.button !== 0 ||
+      !simulation ||
+      !viewport ||
+      this.physicsDraggingId ||
+      this.getTemporalNodeKey(node) === this.physicsRootKey
+    )
+      return;
+    if (
+      (event.target as HTMLElement).closest("button, input, textarea, select")
+    )
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+    const id = this.getTemporalNodeKey(node);
+    const original = { x: node.x, y: node.y };
+    const viewportRect = viewport.getBoundingClientRect();
+    const start = this.getViewportWorldPoint(
+      viewport,
+      event.clientX - viewportRect.left,
+      event.clientY - viewportRect.top,
+    );
+    let dragged = false;
+    this.physicsDraggingId = id;
+    simulation.pin(id, node.x, node.y);
+    const element = this.physicsElements.get(id);
+    const move = (moveEvent: MouseEvent): void => {
+      if (
+        !dragged &&
+        Math.hypot(
+          moveEvent.clientX - event.clientX,
+          moveEvent.clientY - event.clientY,
+        ) < GRAPH_PAN_THRESHOLD_PX
+      )
+        return;
+      dragged = true;
+      moveEvent.preventDefault();
+      element?.addClass("base-board-graph-node--dragging");
+      const rect = viewport.getBoundingClientRect();
+      const point = this.getViewportWorldPoint(
+        viewport,
+        moveEvent.clientX - rect.left,
+        moveEvent.clientY - rect.top,
+      );
+      simulation.pin(
+        id,
+        original.x + point.x - start.x,
+        original.y + point.y - start.y,
+      );
+      this.applyPhysicsPositions(simulation.positions());
+      this.animateGraphPhysics();
+      this.updatePhysicsControls();
+    };
+    const finish = (cancelled: boolean): void => {
+      activeWindow.removeEventListener("mousemove", move);
+      activeWindow.removeEventListener("mouseup", release);
+      activeWindow.removeEventListener("keydown", cancel, true);
+      activeWindow.removeEventListener("blur", blur);
+      element?.removeClass("base-board-graph-node--dragging");
+      this.physicsDragCleanup = null;
+      this.physicsDraggingId = null;
+      if (cancelled) {
+        simulation.pin(id, original.x, original.y);
+        this.applyPhysicsPositions(simulation.positions());
+      }
+      simulation.release(id, dragged && !cancelled);
+      this.applyPhysicsPositions(simulation.positions());
+      if (dragged || cancelled) {
+        this.suppressNextNodeClick = true;
+        window.setTimeout(() => {
+          this.suppressNextNodeClick = false;
+        }, 0);
+      }
+      if (this.temporalDisposed) return;
+      if (this.physicsRenderPending) {
+        this.physicsRenderPending = false;
+        this.render();
+      } else {
+        this.animateGraphPhysics();
+        this.updatePhysicsControls();
+      }
+    };
+    const release = (): void => finish(false);
+    const blur = (): void => finish(true);
+    const cancel = (keyEvent: KeyboardEvent): void => {
+      if (keyEvent.key !== "Escape") return;
+      keyEvent.preventDefault();
+      keyEvent.stopPropagation();
+      finish(true);
+    };
+    this.physicsDragCleanup = finish;
+    activeWindow.addEventListener("mousemove", move);
+    activeWindow.addEventListener("mouseup", release);
+    activeWindow.addEventListener("keydown", cancel, true);
+    activeWindow.addEventListener("blur", blur);
+    this.animateGraphPhysics();
+    this.updatePhysicsControls();
   }
 
   private startNodeDrag(event: MouseEvent, node: GraphNode): void {
@@ -2485,12 +4706,15 @@ export class GraphView extends BasesView {
   }
 
   private syncRenderedGraphEdges(): void {
+    this.updatePhysicsRouteNodes();
     this.renderedGraphEdges.forEach((edge, index) => {
       const edgeEl = this.renderedGraphEdgeEls[index];
       if (!edgeEl) return;
-      edgeEl.setAttribute("d", this.getEdgePath(edge));
+      const path = this.getEdgePath(edge);
+      edgeEl.setAttribute("d", path);
       const hitEl = this.renderedGraphEdgeHitEls[index];
-      if (hitEl) hitEl.setAttribute("d", this.getEdgePath(edge));
+      if (hitEl) hitEl.setAttribute("d", path);
+      if (this.isGraphPhysics()) return;
       const handleEls = this.renderedGraphEdgeHandleEls[index];
       if (!handleEls) return;
       this.positionEdgeEndpointHandle(handleEls.from, edge, "from");
@@ -2734,10 +4958,15 @@ export class GraphView extends BasesView {
   private showGraphEdgeMenu(event: MouseEvent, edge: GraphEdge): void {
     event.preventDefault();
     event.stopPropagation();
+    if (edge.backtrack) return;
 
     // Requirement-return and compensation edges are derived (from containment /
     // triggered `compensates`), so they expose no structural edit action.
-    if (edge.kind === "requirement-return" || edge.kind === "compensation") {
+    if (
+      edge.kind === "requirement-return" ||
+      edge.kind === "compensation" ||
+      edge.kind === "association"
+    ) {
       return;
     }
     // Structural edges in a locked subgraph cannot be deleted/rewired.
@@ -2758,8 +4987,13 @@ export class GraphView extends BasesView {
   }
 
   private async deleteGraphEdge(edge: GraphEdge): Promise<void> {
+    if (edge.backtrack) return;
     // Requirement-return and compensation edges are derived; nothing to delete.
-    if (edge.kind === "requirement-return" || edge.kind === "compensation") {
+    if (
+      edge.kind === "requirement-return" ||
+      edge.kind === "compensation" ||
+      edge.kind === "association"
+    ) {
       return;
     }
     // Structural edges inside a locked subgraph are frozen.
@@ -2830,6 +5064,7 @@ export class GraphView extends BasesView {
     while (queue.length > 0) {
       const current = queue.shift();
       if (!current || visitedPaths.has(current.file.path)) continue;
+      if (this.isImpactNode(current)) continue;
       visitedPaths.add(current.file.path);
       result.push(current);
       queue.push(...current.children, ...this.getGatedSuccessors(current));
@@ -2884,6 +5119,7 @@ export class GraphView extends BasesView {
     while (queue.length > 0) {
       const prerequisite = queue.shift();
       if (!prerequisite || resultPaths.has(prerequisite.file.path)) continue;
+      if (this.isImpactNode(prerequisite)) continue;
       resultPaths.add(prerequisite.file.path);
       result.push(prerequisite);
       // A prerequisite container is only complete when its children are too.
@@ -2984,10 +5220,12 @@ export class GraphView extends BasesView {
     this.graphParentByPath = this.getResolvedParentsByPath(this.visibleNodes);
     const escalation = new Set<string>();
     for (const candidate of this.visibleNodes) {
+      if (this.isImpactNode(candidate)) continue;
       if (!this.isGenuinelyFailedStatus(candidate.status)) continue;
       const visited = new Set<string>();
       let current: GraphNode | null = candidate;
       while (current && !visited.has(current.file.path)) {
+        if (this.isImpactNode(current)) break;
         visited.add(current.file.path);
         escalation.add(current.file.path);
         current = this.graphParentByPath.get(current.file.path) ?? null;
@@ -3003,8 +5241,44 @@ export class GraphView extends BasesView {
   }
 
   private getEdgeMarkerKind(edge: GraphEdge): string {
+    const inactiveForward =
+      (edge.kind === "gating" ||
+        edge.kind === "requirement-start" ||
+        edge.kind === "restart") &&
+      (edge.to.state === "invalidated" ||
+        edge.to.state === "cancelled" ||
+        edge.to.state === "waiting");
+    if (this.isGraphPhysics()) {
+      if (
+        edge.kind === "membership" ||
+        edge.kind === "compensation" ||
+        edge.kind === "association"
+      )
+        return edge.kind;
+      if (edge.kind === "break") return "physics-interrupted";
+      if (inactiveForward) return "physics-invalidated";
+      if (edge.kind === "requirement-return") {
+        const state = edge.returnState ?? edge.from.state;
+        return state === "completed"
+          ? "physics-completed"
+          : state === "cancelled"
+            ? "physics-cancelled"
+            : "physics-waiting";
+      }
+      const source = edge.kind === "requirement-start" ? edge.to : edge.from;
+      const state =
+        source.state === "active" && this.isActiveStatus(source.status)
+          ? "in-progress"
+          : source.state;
+      return `physics-${state}`;
+    }
+    if (inactiveForward) return "flow-inactive";
     if (edge.kind === "break") {
-      if (this.isBreakEdgeTriggered(edge) || this.isBreakEdgeEscalated(edge)) {
+      if (
+        edge.backtrack ||
+        this.isBreakEdgeTriggered(edge) ||
+        this.isBreakEdgeEscalated(edge)
+      ) {
         return "break";
       }
       return "break-dormant";
@@ -3015,7 +5289,7 @@ export class GraphView extends BasesView {
     // state, not its stored status: a group child carries no live stored
     // status, so its return only greens when all of its descendants complete.
     if (edge.kind === "requirement-return") {
-      return edge.from.state === "completed"
+      return (edge.returnState ?? edge.from.state) === "completed"
         ? "requirement-return"
         : "requirement-return-dormant";
     }
@@ -3030,6 +5304,12 @@ export class GraphView extends BasesView {
    * derived on render (Layers A/B). Group nodes are not directly actionable.
    */
   private async makeNodeActive(node: GraphNode): Promise<void> {
+    if (this.isImpactNode(node)) {
+      new Notice(
+        `"${node.title}" is an impact node and does not enter work flow.`,
+      );
+      return;
+    }
     if (node.children.length > 0) {
       new Notice(
         `"${node.title}" is a group — its state derives from its children. Set a work node inside it active instead.`,
@@ -3060,6 +5340,12 @@ export class GraphView extends BasesView {
    * statuses are written; groups derive.
    */
   private async markNodeAwaiting(node: GraphNode): Promise<void> {
+    if (this.isImpactNode(node)) {
+      new Notice(
+        `"${node.title}" is an impact node and does not enter work flow.`,
+      );
+      return;
+    }
     if (node.children.length > 0) {
       new Notice(
         `"${node.title}" is a group — its state derives from its children.`,
@@ -3090,7 +5376,10 @@ export class GraphView extends BasesView {
 
   /** Leaf (work) nodes among a set; group nodes derive and are never written. */
   private getLeafNodes(nodes: GraphNode[]): GraphNode[] {
-    return nodes.filter((candidate) => candidate.children.length === 0);
+    return nodes.filter(
+      (candidate) =>
+        candidate.children.length === 0 && !this.isImpactNode(candidate),
+    );
   }
 
   /**
@@ -3156,6 +5445,12 @@ export class GraphView extends BasesView {
    * are left untouched. An already-complete node is a no-op. Undoable.
    */
   private async markNodeComplete(node: GraphNode): Promise<void> {
+    if (this.isImpactNode(node)) {
+      new Notice(
+        `"${node.title}" is an impact node and does not enter work flow.`,
+      );
+      return;
+    }
     if (node.children.length > 0) {
       new Notice(
         `"${node.title}" is a group — its completion derives from its children.`,
@@ -3440,6 +5735,12 @@ export class GraphView extends BasesView {
    * deliberate policy action, not a side-effect of failure).
    */
   private async markNodeFailed(node: GraphNode): Promise<void> {
+    if (this.isImpactNode(node)) {
+      new Notice(
+        `"${node.title}" is an impact node and does not enter work flow.`,
+      );
+      return;
+    }
     if (node.children.length > 0) {
       new Notice(
         `"${node.title}" is a group and cannot be failed directly. Fail a work node inside it, or prune the group.`,
@@ -3966,6 +6267,43 @@ export class GraphView extends BasesView {
   }
 
   private async toggleGraphCollapse(node: GraphNode): Promise<void> {
+    if (this.isGraphOverview()) {
+      if (node.file.path === OVERVIEW_UNASSIGNED) {
+        this.focusOverview(OVERVIEW_UNASSIGNED);
+        return;
+      }
+      const viewport = this.getGraphViewportEl();
+      const nodeEl = this.getRenderedGraphNodeEl(node);
+      if (viewport && nodeEl) {
+        const viewportRect = viewport.getBoundingClientRect();
+        const nodeRect = nodeEl.getBoundingClientRect();
+        this.overviewAnchor = {
+          path: node.file.path,
+          x: nodeRect.left + nodeRect.width / 2 - viewportRect.left,
+          y: nodeRect.top + 16 * this.graphZoom - viewportRect.top,
+        };
+      }
+      if (this.temporalCursor !== null) {
+        const key = this.getTemporalNodeKey(node);
+        if (node.collapsed) this.temporalExpandedKeys.add(key);
+        else this.temporalExpandedKeys.delete(key);
+        this.render();
+        return;
+      }
+      const expanded = new Set(
+        this.graphNodes
+          .filter(
+            (candidate) =>
+              !candidate.collapsed && candidate.descendantCount > 0,
+          )
+          .map((candidate) => candidate.file.path),
+      );
+      if (node.collapsed) expanded.add(node.file.path);
+      else expanded.delete(node.file.path);
+      this.config?.set(CONFIG_KEY_GRAPH_OVERVIEW_EXPANDED, [...expanded]);
+      this.render();
+      return;
+    }
     await this.app.fileManager.processFrontMatter(
       node.file,
       (frontmatter: Record<string, unknown>) => {
@@ -4262,8 +6600,8 @@ export class GraphView extends BasesView {
     // derive their state from their children (GRAPH_SEMANTICS_SPEC.md); their
     // one allowed action is Prune (Cancel sub-graph). Scope/aggregation nodes
     // are not work at all — they only roll up members, so they get neither.
-    if (this.isScopeNode(sourceNode)) {
-      // Scope node: aggregation only; no work-node or prune actions.
+    if (this.isScopeNode(sourceNode) || this.isImpactNode(sourceNode)) {
+      // Scope/impact node: not actionable work; no work-node or prune actions.
     } else if (sourceNode.children.length === 0) {
       menu.addItem((item) => {
         item
@@ -4322,8 +6660,8 @@ export class GraphView extends BasesView {
       });
     }
     // Agency (who executes the work). Not applicable to pure group/aggregation
-    // nodes. Cycles executor and, when an agent is involved, autonomy.
-    if (sourceNode.kind !== "group") {
+    // or impact nodes. Cycles executor and, when an agent is involved, autonomy.
+    if (sourceNode.kind !== "group" && !this.isImpactNode(sourceNode)) {
       menu.addItem((item) => {
         item
           .setTitle(`Run by: ${sourceNode.executor}`)
@@ -5039,7 +7377,7 @@ export class GraphView extends BasesView {
       lines.push(`kind: ${this.formatYamlScalar(options.kind)}`);
     }
     lines.push(
-      `kanban_order: ${this.getNextOrder(options.status)}`,
+      `kanban_order: ${JSON.stringify(this.getNextKanbanOrder(options.status))}`,
       `graph_order: ${this.getNextOrder(options.status)}`,
       `created: ${new Date().toISOString()}`,
       `id: ${this.getGeneratedId(options.title)}`,
@@ -5153,7 +7491,7 @@ export class GraphView extends BasesView {
     const lines = [
       "type: task",
       `status: ${this.formatYamlScalar(status)}`,
-      `kanban_order: ${this.getNextOrder(status)}`,
+      `kanban_order: ${JSON.stringify(this.getNextKanbanOrder(status))}`,
       `created: ${new Date().toISOString()}`,
       `id: ${this.getGeneratedId(title)}`,
     ];
@@ -5180,8 +7518,9 @@ export class GraphView extends BasesView {
   }
 
   private getGraphNodes(): GraphNode[] {
+    this.temporalSnapshots.clear();
     const entries: BasesEntry[] = this.data?.data ?? [];
-    const nodes: GraphNode[] = [];
+    let nodes: GraphNode[] = [];
     for (const entry of entries) {
       const file = entry.file;
       if (!(file instanceof TFile)) continue;
@@ -5226,6 +7565,50 @@ export class GraphView extends BasesView {
         savedX: this.getSavedGraphPosition(file, GRAPH_POSITION_PROPERTY_X),
         savedY: this.getSavedGraphPosition(file, GRAPH_POSITION_PROPERTY_Y),
         state: "idle",
+      });
+    }
+
+    this.observeTemporalGraph(nodes);
+    if (this.temporalCursor !== null && this.temporalHistory) {
+      const recorded =
+        graphAtTime(this.temporalHistory, this.temporalCursor) ?? [];
+      this.temporalSnapshots = new Map(
+        recorded.map((node) => [node.path, node]),
+      );
+      nodes = recorded.map((snapshot): GraphNode => {
+        const file = new TFile();
+        file.path = snapshot.path;
+        file.name = snapshot.path.split("/").pop() ?? snapshot.path;
+        file.basename = file.name.replace(/\.md$/i, "");
+        file.extension = "md";
+        file.stat = { ctime: 0, mtime: 0, size: 0 };
+        return {
+          ...snapshot,
+          entry: null,
+          file,
+          collapsed: false,
+          descendantCount: 0,
+          children: [],
+          successors: [],
+          predecessors: [],
+          breakTargets: [],
+          restartTargets: [],
+          rollupTargets: [],
+          members: [],
+          compensatesTargets: [],
+          compensatedBy: [],
+          needsCompensation: false,
+          excludedFromFold: false,
+          kind: "work",
+          executor: "human",
+          autonomy: "propose",
+          effectiveLocked: false,
+          x: 0,
+          y: 0,
+          savedX: null,
+          savedY: null,
+          state: "idle",
+        };
       });
     }
 
@@ -5285,6 +7668,7 @@ export class GraphView extends BasesView {
 
     for (const node of nodes) {
       node.children.sort((first, second) => this.compareNodes(first, second));
+      node.members.sort((first, second) => this.compareNodes(first, second));
       node.successors.sort((first, second) => this.compareNodes(first, second));
       node.predecessors.sort((first, second) =>
         this.compareNodes(first, second),
@@ -5292,7 +7676,6 @@ export class GraphView extends BasesView {
     }
 
     for (const node of nodes) {
-      node.descendantCount = this.getDescendantCount(node);
       // A compensation is out-of-band: exclude it from its parent's fold (and,
       // below, from sibling chains, the execution partition, and — when dormant
       // — visibility).
@@ -5303,71 +7686,56 @@ export class GraphView extends BasesView {
     this.assignNodeStates(nodes);
     this.assignNodeLocks(nodes);
     this.assignNodeAgency(nodes);
+    nodes.sort((first, second) => this.compareNodes(first, second));
+    const expanded = this.config?.get(CONFIG_KEY_GRAPH_OVERVIEW_EXPANDED);
+    this.graphWorkSummaries.clear();
+    for (const node of nodes) {
+      node.descendantCount = getOverviewDescendants(node).filter(
+        (child) => !this.isDormantCompensation(child),
+      ).length;
+      this.graphWorkSummaries.set(node.file.path, summarizeGraphWork(node));
+      if (this.isGraphOverview()) {
+        node.collapsed =
+          node.descendantCount > 0 &&
+          (this.temporalCursor !== null
+            ? !this.temporalExpandedKeys.has(this.getTemporalNodeKey(node))
+            : Array.isArray(expanded)
+              ? !expanded.includes(node.file.path)
+              : true);
+      }
+    }
+    this.graphNodes = nodes;
+    if (this.isGraphOverview()) {
+      return this.prepareScopedOverview(nodes);
+    }
     return this.getVisibleGraphNodes(nodes);
   }
 
   private getVisibleGraphNodes(nodes: GraphNode[]): GraphNode[] {
-    const hiddenPaths = new Set<string>();
-    for (const node of nodes) {
-      if (!node.collapsed) continue;
-      this.collectCollapsedDescendantPaths(node, hiddenPaths);
-    }
-
-    const visibleNodes = nodes.filter(
-      (node) =>
-        !hiddenPaths.has(node.file.path) && !this.isDormantCompensation(node),
-    );
-    const visiblePaths = new Set(visibleNodes.map((node) => node.file.path));
+    const visibleNodes = projectOverview(
+      nodes,
+      new Set(nodes.filter((node) => node.collapsed)),
+    ).visible.map((node) => ({ ...node }));
+    const byPath = new Map(visibleNodes.map((node) => [node.file.path, node]));
     for (const node of visibleNodes) {
-      node.children = node.children.filter((child) =>
-        visiblePaths.has(child.file.path),
-      );
-      node.successors = node.successors.filter((successor) =>
-        visiblePaths.has(successor.file.path),
-      );
-      node.predecessors = node.predecessors.filter((predecessor) =>
-        visiblePaths.has(predecessor.file.path),
-      );
-      node.breakTargets = node.breakTargets.filter((target) =>
-        visiblePaths.has(target.file.path),
-      );
-      node.restartTargets = node.restartTargets.filter((target) =>
-        visiblePaths.has(target.file.path),
-      );
-      node.rollupTargets = node.rollupTargets.filter((target) =>
-        visiblePaths.has(target.file.path),
-      );
-      node.members = node.members.filter((member) =>
-        visiblePaths.has(member.file.path),
-      );
+      for (const relation of [
+        "children",
+        "successors",
+        "predecessors",
+        "breakTargets",
+        "restartTargets",
+        "rollupTargets",
+        "members",
+        "compensatesTargets",
+        "compensatedBy",
+      ] as const) {
+        node[relation] = node[relation]
+          .map((target) => byPath.get(target.file.path))
+          .filter((target): target is GraphNode => target !== undefined);
+      }
     }
 
     return visibleNodes;
-  }
-
-  private collectCollapsedDescendantPaths(
-    node: GraphNode,
-    hiddenPaths: Set<string>,
-  ): void {
-    for (const child of node.children) {
-      if (hiddenPaths.has(child.file.path)) continue;
-      hiddenPaths.add(child.file.path);
-      this.collectCollapsedDescendantPaths(child, hiddenPaths);
-    }
-  }
-
-  private getDescendantCount(node: GraphNode): number {
-    const visitedPaths = new Set<string>();
-    const visit = (current: GraphNode): number => {
-      let count = 0;
-      for (const child of current.children) {
-        if (visitedPaths.has(child.file.path)) continue;
-        visitedPaths.add(child.file.path);
-        count += 1 + visit(child);
-      }
-      return count;
-    };
-    return visit(node);
   }
 
   private layoutGraph(nodes: GraphNode[]): GraphEdge[] {
@@ -5412,33 +7780,94 @@ export class GraphView extends BasesView {
 
     this.applySavedGraphPositions(nodes);
 
-    // Break edges are DERIVED (GRAPH_SEMANTICS_SPEC.md Layer B): a genuinely
-    // failed leaf draws a red break link to its parent group that escalates up
-    // the containment chain. These are synthesized from the failed state rather
-    // than stored as `breaks_to`, so they appear/disappear as the failure is
-    // set/cleared. `brokenParentPaths` are the groups whose canonical return
-    // link the active break replaces, so their return link is suppressed.
-    const parentByPath = this.getResolvedParentsByPath(nodes);
+    return this.buildGraphFlowEdges(nodes);
+  }
+
+  private buildGraphFlowEdges(nodes: GraphNode[]): GraphEdge[] {
+    const allNodes = this.graphNodes.length > 0 ? this.graphNodes : nodes;
+    const parentByPath = this.getResolvedParentsByPath(allNodes);
     const breakEdgeKeys = new Set<string>();
     const derivedBreakEdges: GraphEdge[] = [];
     const brokenParentPaths = new Set<string>();
-    for (const node of nodes) {
-      if (!this.isGenuinelyFailedStatus(node.status)) continue;
-      let child: GraphNode = node;
-      let parent = parentByPath.get(child.file.path) ?? null;
-      const seen = new Set<string>([child.file.path]);
-      while (parent && !seen.has(parent.file.path)) {
-        seen.add(parent.file.path);
-        brokenParentPaths.add(parent.file.path);
-        const key = `${child.file.path}->${parent.file.path}`;
+    const getPrevious = (
+      child: GraphNode,
+      parent: GraphNode,
+      path: ReadonlySet<string>,
+    ): GraphNode[] => {
+      const predecessors = child.predecessors.filter(
+        (predecessor) =>
+          parentByPath.get(predecessor.file.path)?.file.path ===
+            parent.file.path &&
+          !this.isImpactNode(predecessor) &&
+          !this.isCompensationNode(predecessor) &&
+          !predecessor.restartTargets.some(
+            (target) => target.file.path === child.file.path,
+          ) &&
+          !path.has(predecessor.file.path),
+      );
+      return predecessors.length > 0 ? predecessors : [parent];
+    };
+    const traced = new Set<string>();
+    const traceFailure = (child: GraphNode, path = new Set<string>()): void => {
+      if (traced.has(child.file.path) || path.has(child.file.path)) return;
+      const parent = parentByPath.get(child.file.path);
+      if (!parent || this.isImpactNode(parent)) return;
+      const branch = new Set(path).add(child.file.path);
+      brokenParentPaths.add(parent.file.path);
+      for (const target of getPrevious(child, parent, branch)) {
+        if (branch.has(target.file.path)) continue;
+        const key = `${child.file.path}->${target.file.path}`;
         if (!breakEdgeKeys.has(key)) {
           breakEdgeKeys.add(key);
-          derivedBreakEdges.push({ from: child, to: parent, kind: "break" });
+          derivedBreakEdges.push({
+            from: child,
+            to: target,
+            kind: "break",
+            backtrack: true,
+          });
         }
-        child = parent;
-        parent = parentByPath.get(child.file.path) ?? null;
+        if (!this.isScopeNode(target)) traceFailure(target, branch);
       }
+      traced.add(child.file.path);
+    };
+    for (const node of allNodes) {
+      if (this.isImpactNode(node)) continue;
+      if (!this.isGenuinelyFailedStatus(node.status)) continue;
+      traceFailure(node);
     }
+
+    const returnEdges = new Map<string, GraphEdge>();
+    const traceReturn = (terminal: GraphNode, parent: GraphNode): void => {
+      const state =
+        terminal.state === "completed" || terminal.state === "cancelled"
+          ? terminal.state
+          : "waiting";
+      const visited = new Set<string>();
+      const visit = (child: GraphNode, path = new Set<string>()): void => {
+        if (
+          child.file.path === parent.file.path ||
+          visited.has(child.file.path)
+        )
+          return;
+        visited.add(child.file.path);
+        const branch = new Set(path).add(child.file.path);
+        for (const target of getPrevious(child, parent, branch)) {
+          if (branch.has(target.file.path)) continue;
+          const key = `${child.file.path}->${target.file.path}`;
+          const existing = returnEdges.get(key);
+          if (!existing || existing.returnState === "completed")
+            returnEdges.set(key, {
+              from: child,
+              to: target,
+              kind: "requirement-return",
+              backtrack: true,
+              returnState: state,
+            });
+          if (target.file.path !== parent.file.path) visit(target, branch);
+        }
+      };
+      visit(terminal);
+    };
 
     const edges: GraphEdge[] = [];
     for (const node of nodes) {
@@ -5446,21 +7875,35 @@ export class GraphView extends BasesView {
       // excluded from the forward sibling chain — no requirement-start/return,
       // and they never act as the chain terminal.
       const childChains = this.getSiblingChains(
-        node.children.filter((child) => !this.isCompensationNode(child)),
+        node.children.filter(
+          (child) =>
+            !this.isCompensationNode(child) &&
+            !this.isImpactNode(child) &&
+            !this.isScopeNode(node) &&
+            !this.isImpactNode(node),
+        ),
       );
+      for (const child of node.children) {
+        if (
+          this.isImpactNode(child) ||
+          this.isImpactNode(node) ||
+          this.isScopeNode(node)
+        )
+          edges.push({ from: node, to: child, kind: "association" });
+      }
       for (const chain of childChains) {
         const firstChild = chain[0];
         const lastChild = chain[chain.length - 1];
         if (firstChild) {
           edges.push({ from: node, to: firstChild, kind: "requirement-start" });
         }
-        if (lastChild && !brokenParentPaths.has(node.file.path)) {
-          edges.push({
-            from: lastChild,
-            to: node,
-            kind: "requirement-return",
-          });
-        }
+        if (
+          lastChild &&
+          (!brokenParentPaths.has(node.file.path) ||
+            (lastChild.state === "completed" &&
+              !traced.has(lastChild.file.path)))
+        )
+          traceReturn(lastChild, node);
       }
       for (const successor of node.successors) {
         const isRestart = node.restartTargets.some(
@@ -5469,7 +7912,12 @@ export class GraphView extends BasesView {
         edges.push({
           from: node,
           to: successor,
-          kind: isRestart ? "restart" : "gating",
+          kind:
+            this.isImpactNode(node) || this.isImpactNode(successor)
+              ? "association"
+              : isRestart
+                ? "restart"
+                : "gating",
         });
       }
       // Membership (manual aggregation): the node rolls up into each scope.
@@ -5489,8 +7937,18 @@ export class GraphView extends BasesView {
       // in the derived model an inactive break is not a real link and must not
       // compete with the canonical return (GRAPH_SEMANTICS_SPEC.md Layer B).
       // Containment escalation is covered by the derived break edges above.
-      if (this.isGenuinelyFailedStatus(node.status)) {
+      if (
+        !this.isImpactNode(node) &&
+        this.isGenuinelyFailedStatus(node.status)
+      ) {
+        const ancestors = new Set<string>();
+        let ancestor = parentByPath.get(node.file.path);
+        while (ancestor && !ancestors.has(ancestor.file.path)) {
+          ancestors.add(ancestor.file.path);
+          ancestor = parentByPath.get(ancestor.file.path);
+        }
         for (const breakTarget of node.breakTargets) {
+          if (ancestors.has(breakTarget.file.path)) continue;
           const key = `${node.file.path}->${breakTarget.file.path}`;
           if (breakEdgeKeys.has(key)) continue;
           breakEdgeKeys.add(key);
@@ -5498,8 +7956,20 @@ export class GraphView extends BasesView {
         }
       }
     }
+    for (const [key, edge] of returnEdges)
+      if (!breakEdgeKeys.has(key)) edges.push(edge);
     edges.push(...derivedBreakEdges);
-    return edges;
+    const visible = new Map(nodes.map((node) => [node.file.path, node]));
+    return edges
+      .filter(
+        (edge) =>
+          visible.has(edge.from.file.path) && visible.has(edge.to.file.path),
+      )
+      .map((edge) => ({
+        ...edge,
+        from: visible.get(edge.from.file.path)!,
+        to: visible.get(edge.to.file.path)!,
+      }));
   }
 
   private layoutNodeTree(
@@ -5627,22 +8097,10 @@ export class GraphView extends BasesView {
   }
 
   /**
-   * Registered signal handlers, applied in order after a signal propagates.
-   * Compensation is the first behaviour (declared rollbacks activate); the
-   * attention cue is second (undeclared effecting failures raise a flag). New
-   * reactions (e.g. iteration spawn) register here rather than being wired
-   * directly into the state derivation. See GRAPH_ARCHITECTURE_PLAN.md Step C.
+   * View-level reactions run after the shared engine derives compensation
+   * state. Attention badges consume the same failure boundaries as the engine.
    */
   private readonly signalHandlers: ReadonlyArray<GraphSignalHandler> = [
-    {
-      id: "compensation",
-      apply: (context) =>
-        this.applyCompensationStates(
-          context.nodes,
-          context.parentByPath,
-          context.failureScope,
-        ),
-    },
     {
       id: "attention",
       apply: (context) =>
@@ -5676,7 +8134,11 @@ export class GraphView extends BasesView {
 
   /** A node that undoes an effecting node (`compensates`). */
   private isCompensationNode(node: GraphNode): boolean {
-    return node.compensatesTargets.length > 0;
+    return engineIsCompensationNode(node);
+  }
+
+  private isImpactNode(node: GraphNode): boolean {
+    return engineIsImpactNode(node);
   }
 
   private isDormantCompensation(node: GraphNode): boolean {
@@ -5698,38 +8160,6 @@ export class GraphView extends BasesView {
   }
 
   /**
-   * Compensation (saga) state — derived out-of-band, not from forward gating.
-   * A compensation is `idle` (dormant; hidden) unless **triggered**: its
-   * effecting target's effect is live (`completed`) AND a genuine failure has
-   * escalated through that target's container (the same stage/ring). Triggered →
-   * `active` frontier; already-run → `completed`. Overrides the engine's generic
-   * derivation (a gateless compensation would otherwise read `active`).
-   * See GRAPH_ARCHITECTURE_PLAN.md "Compensation (saga)".
-   */
-  private applyCompensationStates(
-    nodes: GraphNode[],
-    parentByPath: Map<string, GraphNode>,
-    brokenScopePaths: Set<string>,
-  ): void {
-    for (const node of nodes) {
-      if (!this.isCompensationNode(node)) continue;
-      if (this.isCompletedStatus(node.status)) {
-        node.state = "completed";
-      } else if (this.isGenuinelyFailedStatus(node.status)) {
-        node.state = "interrupted";
-      } else {
-        node.state = this.isCompensationTriggered(
-          node,
-          parentByPath,
-          brokenScopePaths,
-        )
-          ? "active"
-          : "idle";
-      }
-    }
-  }
-
-  /**
    * Propagates a `failure` signal from every genuinely-failed leaf up the
    * containment chain, collecting the ancestors it reaches. Escalation stops at
    * the first ancestor whose kind `absorb`s the signal (the aggregation
@@ -5741,52 +8171,11 @@ export class GraphView extends BasesView {
     nodes: GraphNode[],
     parentByPath: Map<string, GraphNode>,
   ): Set<string> {
-    const scope = new Set<string>();
-    for (const node of nodes) {
-      if (!this.isGenuinelyFailedStatus(node.status)) continue;
-      const seen = new Set<string>([node.file.path]);
-      let current = parentByPath.get(node.file.path) ?? null;
-      while (current && !seen.has(current.file.path)) {
-        seen.add(current.file.path);
-        scope.add(current.file.path);
-        if (this.getSignalPolicy(current, "failure") === "absorb") break;
-        current = parentByPath.get(current.file.path) ?? null;
-      }
-    }
-    return scope;
-  }
-
-  /**
-   * Per-kind bounce policy for an escalating signal (Step C). A `group`
-   * (scope/aggregation) node `absorb`s a failure — its boundary contains the
-   * signal so it does not escalate into sibling portfolios — while every other
-   * kind lets it `pass` upward. `transform` is reserved for future reshaping
-   * (e.g. a failure becoming a retry at an iteration boundary).
-   */
-  private getSignalPolicy(
-    node: GraphNode,
-    kind: GraphSignalKind,
-  ): GraphSignalPolicy {
-    switch (kind) {
-      case "failure":
-        return node.kind === "group" ? "absorb" : "pass";
-      default:
-        return "pass";
-    }
-  }
-
-  private isCompensationTriggered(
-    node: GraphNode,
-    parentByPath: Map<string, GraphNode>,
-    brokenScopePaths: Set<string>,
-  ): boolean {
-    return node.compensatesTargets.some((effecting) => {
-      if (effecting.state !== "completed") return false;
-      const effectingParent = parentByPath.get(effecting.file.path);
-      return effectingParent
-        ? brokenScopePaths.has(effectingParent.file.path)
-        : false;
-    });
+    const scope = engineGetFailureScope(
+      nodes,
+      (node) => parentByPath.get((node as GraphNode).file.path) ?? null,
+    );
+    return new Set([...scope].map((node) => (node as GraphNode).file.path));
   }
 
   /**
@@ -5794,7 +8183,7 @@ export class GraphView extends BasesView {
    * side-effect is now stranded by a failure but has **no declared compensation**
    * — the graph cannot invent the domain rollback, so it raises a cue for a
    * human/agent to propose one. Declared compensations are already handled by
-   * `applyCompensationStates`, so they never raise this. Pure recompute.
+   * the shared compensation derivation, so they never raise this. Pure recompute.
    */
   private applyAttentionSignals(
     nodes: GraphNode[],
@@ -5959,6 +8348,38 @@ export class GraphView extends BasesView {
   }
 
   private getEdgePath(edge: GraphEdge): string {
+    if (this.isGraphPhysics()) {
+      const peers = this.renderedGraphEdges.filter(
+        (candidate) =>
+          candidate.kind === edge.kind &&
+          candidate.to.file.path === edge.to.file.path,
+      );
+      const lane = Math.max(0, peers.indexOf(edge));
+      const body = (node: GraphNode): GraphPhysicsNode => ({
+        id: node.file.path,
+        ...this.getNodeCanvasPosition(node),
+        ...this.getPhysicsNodeSize(node),
+      });
+      const curve = routeGraphPhysicsEdge(
+        body(edge.from),
+        body(edge.to),
+        edge.backtrack
+          ? edge.kind === "break"
+            ? "failure-trace"
+            : "completion-trace"
+          : edge.kind,
+        this.physicsRouteNodes,
+        lane,
+      );
+      return `M ${curve.start.x} ${curve.start.y} Q ${curve.control.x} ${curve.control.y} ${curve.end.x} ${curve.end.y}`;
+    }
+    if (this.isGraphOverview()) {
+      const from = this.getNodeCanvasPosition(edge.from);
+      const to = this.getNodeCanvasPosition(edge.to);
+      const startY = from.y + this.getRenderedGraphNodeSize(edge.from).height;
+      const endY = to.y + this.getRenderedGraphNodeSize(edge.to).height / 2;
+      return `M ${from.x + 8} ${startY} V ${endY} H ${to.x}`;
+    }
     return this.getPerpendicularCurvePath(
       this.getEdgeEndpointAnchor(edge, "from"),
       this.getEdgeEndpointAnchor(edge, "to"),
@@ -5987,6 +8408,39 @@ export class GraphView extends BasesView {
     edge: GraphEdge,
     endpoint: GraphEdgeEndpoint,
   ): GraphAnchorPoint {
+    if (edge.backtrack) {
+      const forward: GraphEdge = {
+        from: edge.to,
+        to: edge.from,
+        kind: edge.to.children.some(
+          (child) => child.file.path === edge.from.file.path,
+        )
+          ? "requirement-start"
+          : "gating",
+      };
+      const anchor = this.getDefaultEdgeEndpointAnchor(
+        forward,
+        endpoint === "from" ? "to" : "from",
+      );
+      const node = this.getEdgeEndpointNode(edge, endpoint);
+      const position = this.getNodeCanvasPosition(node);
+      const size = this.getRenderedGraphNodeSize(node);
+      return anchor.side === "left" || anchor.side === "right"
+        ? {
+            ...anchor,
+            y: Math.max(
+              position.y + 8,
+              Math.min(position.y + size.height - 8, anchor.y + 12),
+            ),
+          }
+        : {
+            ...anchor,
+            x: Math.max(
+              position.x + 8,
+              Math.min(position.x + size.width - 8, anchor.x + 12),
+            ),
+          };
+    }
     if (edge.kind === "requirement-start") {
       return endpoint === "from"
         ? this.getSemanticAnchorPoint(edge.from, "bottom", 0.5)
@@ -6119,6 +8573,7 @@ export class GraphView extends BasesView {
   }
 
   private getEdgeMinHandleLength(edge: GraphEdge): number {
+    if (edge.backtrack) return 72;
     if (edge.kind === "restart") return 112;
     if (edge.kind === "break") return 128;
     return 72;
@@ -6329,15 +8784,34 @@ export class GraphView extends BasesView {
     width: number;
     height: number;
   } {
+    if (this.isGraphPhysics()) return this.getPhysicsNodeSize(node);
+    const physicsSize = this.isGraphPhysics()
+      ? this.physicsSizes.get(node.file.path)
+      : undefined;
+    if (physicsSize) return physicsSize;
     const nodeEl = this.getRenderedGraphNodeEl(node);
     return {
       width: nodeEl?.offsetWidth ?? NODE_WIDTH,
-      height: nodeEl?.offsetHeight ?? NODE_MIN_HEIGHT,
+      height:
+        (this.isGraphOverview()
+          ? this.overviewItems.get(node.file.path)?.height
+          : undefined) ??
+        nodeEl?.offsetHeight ??
+        (this.isGraphOverview() ? OVERVIEW_NODE_HEIGHT : NODE_MIN_HEIGHT),
     };
   }
 
   private getNodeCanvasPosition(node: GraphNode): { x: number; y: number } {
     return this.worldToCanvasPoint({ x: node.x, y: node.y });
+  }
+
+  private updatePhysicsRouteNodes(): void {
+    if (!this.isGraphPhysics()) return;
+    this.physicsRouteNodes = this.visibleNodes.map((node) => ({
+      id: node.file.path,
+      ...this.getNodeCanvasPosition(node),
+      ...this.getPhysicsNodeSize(node),
+    }));
   }
 
   private positionRenderedGraphNodeEl(
@@ -6456,7 +8930,16 @@ export class GraphView extends BasesView {
       minX: Math.min(...nodes.map((node) => node.x)),
       minY: Math.min(...nodes.map((node) => node.y)),
       maxX: Math.max(...nodes.map((node) => node.x + NODE_WIDTH)),
-      maxY: Math.max(...nodes.map((node) => node.y + NODE_MIN_HEIGHT)),
+      maxY: Math.max(
+        ...nodes.map(
+          (node) =>
+            node.y +
+            (this.isGraphOverview()
+              ? (this.overviewItems.get(node.file.path)?.height ??
+                OVERVIEW_NODE_HEIGHT)
+              : NODE_MIN_HEIGHT),
+        ),
+      ),
     });
   }
 
@@ -6497,7 +8980,13 @@ export class GraphView extends BasesView {
   }
 
   private getSavedGraphWorldBounds(): GraphWorldBounds | null {
-    const raw = this.config?.get(CONFIG_KEY_GRAPH_WORLD);
+    if (this.temporalCursor !== null) return this.graphWorldBounds;
+    if (this.isGraphPhysics()) return this.physicsWorld;
+    const raw = this.config?.get(
+      this.isGraphOverview()
+        ? CONFIG_KEY_GRAPH_OVERVIEW_WORLD
+        : CONFIG_KEY_GRAPH_WORLD,
+    );
     if (!raw || typeof raw !== "object") return null;
     const bounds = raw as Partial<GraphWorldBounds>;
     if (
@@ -6519,6 +9008,14 @@ export class GraphView extends BasesView {
   }
 
   private persistGraphWorldBounds(bounds: GraphWorldBounds): void {
+    if (this.isGraphPhysics()) {
+      this.physicsWorld = bounds;
+      return;
+    }
+    if (this.temporalCursor !== null) {
+      this.graphWorldBounds = bounds;
+      return;
+    }
     // Persisting world bounds calls config.set, which can trigger a full
     // re-render (onDataUpdated) and detach the live viewport. During an active
     // pan that would orphan the pan handler's viewport reference and send the
@@ -6527,12 +9024,17 @@ export class GraphView extends BasesView {
       this.graphPanWorldPersistPending = true;
       return;
     }
-    this.config?.set(CONFIG_KEY_GRAPH_WORLD, {
-      minX: Math.round(bounds.minX),
-      minY: Math.round(bounds.minY),
-      maxX: Math.round(bounds.maxX),
-      maxY: Math.round(bounds.maxY),
-    });
+    this.config?.set(
+      this.isGraphOverview()
+        ? CONFIG_KEY_GRAPH_OVERVIEW_WORLD
+        : CONFIG_KEY_GRAPH_WORLD,
+      {
+        minX: Math.round(bounds.minX),
+        minY: Math.round(bounds.minY),
+        maxX: Math.round(bounds.maxX),
+        maxY: Math.round(bounds.maxY),
+      },
+    );
   }
 
   private getViewportStateForWorldChange(
@@ -6810,8 +9312,7 @@ export class GraphView extends BasesView {
 
   private getTitle(entry: BasesEntry, file: TFile): string {
     const titleProp = this.config.get("cardTitleProperty") as
-      | string
-      | undefined;
+      string | undefined;
     if (titleProp) {
       const propId = titleProp.startsWith("note.")
         ? titleProp
@@ -7002,6 +9503,8 @@ export class GraphView extends BasesView {
   }
 
   private getNodeIdentities(node: GraphNode): string[] {
+    const recorded = this.temporalSnapshots.get(node.file.path);
+    if (recorded) return recorded.identities;
     const frontmatter = this.getFrontmatter(node.file);
     const id = frontmatter?.id;
     return [
@@ -7020,20 +9523,22 @@ export class GraphView extends BasesView {
   }
 
   private compareNodes(first: GraphNode, second: GraphNode): number {
-    const orderDifference =
-      this.getOrder(first.file) - this.getOrder(second.file);
+    const orderDifference = compareOrderValues(
+      this.getOrder(first.file),
+      this.getOrder(second.file),
+    );
     if (orderDifference !== 0) return orderDifference;
     return first.title.localeCompare(second.title);
   }
 
-  private getOrder(file: TFile): number {
+  private getOrder(file: TFile): OrderValue {
+    const recorded = this.temporalSnapshots.get(file.path);
+    if (recorded) return recorded.order;
     const frontmatter = this.getFrontmatter(file);
-    const graphOrder = frontmatter?.graph_order;
-    if (typeof graphOrder === "number") return graphOrder;
-    const kanbanOrder = frontmatter?.[ORDER_PROPERTY];
-    return typeof kanbanOrder === "number"
-      ? kanbanOrder
-      : Number.POSITIVE_INFINITY;
+    return (
+      readOrderValue(frontmatter?.graph_order) ??
+      readOrderValue(frontmatter?.[ORDER_PROPERTY])
+    );
   }
 
   /** Node positions live in the graph view config (not note frontmatter). */
@@ -7110,21 +9615,31 @@ export class GraphView extends BasesView {
     );
   }
 
-  private getStateIcon(state: GraphNodeState): string {
-    if (state === "completed") return "lucide-check";
-    if (state === "interrupted") return "lucide-ban";
-    if (state === "invalidated") return "lucide-circle-off";
-    if (state === "cancelled") return "lucide-x-circle";
-    if (state === "awaiting") return "lucide-hourglass";
-    if (state === "waiting") return "lucide-lock";
-    if (state === "blocked") return "lucide-octagon-alert";
-    if (state === "active") return "lucide-play";
-    if (state === "in-progress") return "lucide-circle-dot";
-    return "lucide-circle";
-  }
-
   private getNodeTooltip(node: GraphNode): string {
     const lines = [node.title, `Status: ${node.status ?? "(No value)"}`];
+    if (node.executor !== "human")
+      lines.push(`Run by ${node.executor}; autonomy: ${node.autonomy}`);
+    if (node.compensatesTargets.length > 0)
+      lines.push(
+        `Rollback for: ${node.compensatesTargets.map((target) => target.title).join(", ")}`,
+      );
+    if (node.needsCompensation)
+      lines.push("Unmitigated side-effect needs attention");
+    if (this.temporalCursor !== null)
+      lines.push(
+        `Recorded graph snapshot: ${new Date(this.temporalCursor).toLocaleString()}`,
+      );
+    if (this.isGraphOverview()) {
+      const summary = this.graphWorkSummaries.get(node.file.path);
+      if (summary && node.descendantCount > 0) {
+        lines.push(
+          `${summary.completed} / ${summary.total} work items completed`,
+        );
+        lines.push(
+          `${summary.active} running, ${summary.awaiting} awaiting, ${summary.blocked} blocked, ${summary.ready} ready`,
+        );
+      }
+    }
     if (node.parentValue) lines.push(`Parent: ${node.parentValue}`);
     if (node.dependsOnKeys.length > 0) {
       lines.push(`Depends on: ${node.dependsOnKeys.join(", ")}`);
@@ -7151,6 +9666,7 @@ export class GraphView extends BasesView {
    * history; legacy records without a `property` field are included too.
    */
   private getNodeTransitionEvents(file: TFile): GraphTransitionEvent[] {
+    if (this.temporalCursor !== null) return [];
     const propertyName =
       this.plugin.data_.transitionHistory.propertyName.trim() ||
       "status_history";
@@ -7234,8 +9750,35 @@ export class GraphView extends BasesView {
     );
     const orders = matchingNodes
       .map((node) => this.getOrder(node.file))
-      .filter((order) => Number.isFinite(order));
+      .filter(
+        (order): order is number =>
+          typeof order === "number" && Number.isFinite(order),
+      );
     return orders.length > 0 ? Math.max(...orders) + 1 : 0;
+  }
+
+  private getNextKanbanOrder(status: string): OrderValue {
+    const orders = this.app.vault
+      .getMarkdownFiles()
+      .filter((file) => {
+        const frontmatter = this.getFrontmatter(file);
+        const value = frontmatter?.[this.getGroupByProperty() ?? "status"];
+        return (
+          typeof value === "string" &&
+          value.toLowerCase() === status.toLowerCase()
+        );
+      })
+      .map((file) =>
+        readOrderValue(this.getFrontmatter(file)?.[ORDER_PROPERTY]),
+      );
+    const keys = orders.filter(isOrderKey).sort();
+    if (keys.length > 0) return generateOrderKey(keys[keys.length - 1], null);
+    const numeric = orders.filter(
+      (order): order is number => typeof order === "number",
+    );
+    return numeric.length > 0
+      ? Math.max(...numeric) + 1
+      : generateOrderKey(null, null);
   }
 
   private async getAvailableFilePath(
@@ -7324,9 +9867,7 @@ class GraphNodeModal extends Modal {
 
     new Setting(contentEl)
       .setName("Kind")
-      .setDesc(
-        "A work item, a subprocess (container), or a group (aggregation).",
-      )
+      .setDesc("A work item, subprocess, group, or inert impact/metric.")
       .addDropdown((dropdown) => {
         for (const option of GRAPH_ADD_NODE_KIND_OPTIONS) {
           dropdown.addOption(option.value, option.label);
@@ -7440,6 +9981,47 @@ class GraphTemplateModal extends Modal {
       text: template.preview.join("\n"),
     });
     treeEl.setAttr("aria-label", `${template.name} preview`);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+class RecordedGraphNodeModal extends Modal {
+  constructor(
+    app: App,
+    private snapshot: GraphHistoryNode,
+    private at: number,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", { text: this.snapshot.title });
+    this.contentEl.createEl("time", {
+      text: new Date(this.at).toLocaleString(),
+      attr: { datetime: new Date(this.at).toISOString() },
+    });
+    this.contentEl.createEl("p", { text: this.snapshot.path });
+    const properties = this.contentEl.createEl("dl", {
+      cls: "base-board-recorded-node",
+    });
+    for (const [label, value] of [
+      ["Status", this.snapshot.status],
+      ["Parent", this.snapshot.parentValue],
+      ["Dependencies", this.snapshot.dependsOnKeys.join(", ")],
+      ["Scopes", this.snapshot.rollupToKeys.join(", ")],
+      ["Compensates", this.snapshot.compensatesKeys.join(", ")],
+      ["Kind", this.snapshot.kindExplicit],
+      ["Executor", this.snapshot.executorExplicit],
+      ["Autonomy", this.snapshot.autonomyExplicit],
+    ]) {
+      if (!value) continue;
+      properties.createEl("dt", { text: label ?? "" });
+      properties.createEl("dd", { text: value });
+    }
   }
 
   onClose(): void {
