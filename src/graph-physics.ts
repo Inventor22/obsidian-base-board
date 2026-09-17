@@ -52,6 +52,7 @@ export function isGraphSpringEdge(kind: string): boolean {
   return (
     kind === "requirement-start" ||
     kind === "gating" ||
+    kind === "sequence" ||
     kind === "requirement-return" ||
     kind === "restart"
   );
@@ -61,6 +62,246 @@ export interface GraphPhysicsCurve {
   start: { x: number; y: number };
   control: { x: number; y: number };
   end: { x: number; y: number };
+  waypoints?: { x: number; y: number }[];
+}
+
+export interface GraphPhysicsRoute {
+  source: string;
+  target: string;
+  points: { x: number; y: number }[];
+}
+
+export function flattenGraphPhysicsCurve(
+  curve: GraphPhysicsCurve,
+): { x: number; y: number }[] {
+  if (curve.waypoints) return curve.waypoints;
+  const points = [curve.start];
+  const visit = (part: GraphPhysicsCurve, depth: number): void => {
+    if (
+      depth >= 12 ||
+      segmentDistance(part.control, part.start, part.end) < 0.5
+    ) {
+      points.push(part.end);
+      return;
+    }
+    const first = {
+      x: (part.start.x + part.control.x) / 2,
+      y: (part.start.y + part.control.y) / 2,
+    };
+    const second = {
+      x: (part.control.x + part.end.x) / 2,
+      y: (part.control.y + part.end.y) / 2,
+    };
+    const middle = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+    visit({ start: part.start, control: first, end: middle }, depth + 1);
+    visit({ start: middle, control: second, end: part.end }, depth + 1);
+  };
+  visit(curve, 0);
+  return points;
+}
+
+function routeSegmentsCross(
+  first: { x: number; y: number },
+  second: { x: number; y: number },
+  third: { x: number; y: number },
+  fourth: { x: number; y: number },
+): boolean {
+  if (
+    Math.max(first.x, second.x) < Math.min(third.x, fourth.x) ||
+    Math.min(first.x, second.x) > Math.max(third.x, fourth.x) ||
+    Math.max(first.y, second.y) < Math.min(third.y, fourth.y) ||
+    Math.min(first.y, second.y) > Math.max(third.y, fourth.y)
+  )
+    return false;
+  const delta = { x: second.x - first.x, y: second.y - first.y };
+  const other = { x: fourth.x - third.x, y: fourth.y - third.y };
+  const determinant = delta.x * other.y - delta.y * other.x;
+  if (Math.abs(determinant) < 0.000001) return false;
+  const relative = { x: third.x - first.x, y: third.y - first.y };
+  const along = (relative.x * other.y - relative.y * other.x) / determinant;
+  const across = (relative.x * delta.y - relative.y * delta.x) / determinant;
+  return along >= 0 && along <= 1 && across >= 0 && across <= 1;
+}
+
+export function countGraphRouteCrossings(
+  points: { x: number; y: number }[],
+  routes: readonly GraphPhysicsRoute[],
+): number {
+  let count = 0;
+  for (const route of routes) {
+    let crossed = false;
+    for (let first = 1; first < points.length && !crossed; first += 1)
+      for (let second = 1; second < route.points.length; second += 1)
+        if (
+          routeSegmentsCross(
+            points[first - 1],
+            points[first],
+            route.points[second - 1],
+            route.points[second],
+          )
+        ) {
+          crossed = true;
+          break;
+        }
+    if (crossed) count += 1;
+  }
+  return count;
+}
+
+interface RouteCircle {
+  id: string;
+  x: number;
+  y: number;
+  radius: number;
+}
+
+function segmentDistance(
+  point: { x: number; y: number },
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+): number {
+  const deltaX = end.x - start.x;
+  const deltaY = end.y - start.y;
+  const lengthSquared = deltaX * deltaX + deltaY * deltaY;
+  const ratio =
+    lengthSquared === 0
+      ? 0
+      : Math.max(
+          0,
+          Math.min(
+            1,
+            ((point.x - start.x) * deltaX + (point.y - start.y) * deltaY) /
+              lengthSquared,
+          ),
+        );
+  return Math.hypot(
+    point.x - start.x - ratio * deltaX,
+    point.y - start.y - ratio * deltaY,
+  );
+}
+
+function curveClearsCircle(
+  curve: GraphPhysicsCurve,
+  circle: RouteCircle,
+  depth = 0,
+): boolean {
+  const distance = segmentDistance(circle, curve.start, curve.end);
+  const deviation = segmentDistance(curve.control, curve.start, curve.end);
+  if (distance > circle.radius + deviation) return true;
+  if (deviation < 0.25 || depth >= 12) return false;
+  const first = {
+    x: (curve.start.x + curve.control.x) / 2,
+    y: (curve.start.y + curve.control.y) / 2,
+  };
+  const second = {
+    x: (curve.control.x + curve.end.x) / 2,
+    y: (curve.control.y + curve.end.y) / 2,
+  };
+  const middle = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+  return (
+    curveClearsCircle(
+      { start: curve.start, control: first, end: middle },
+      circle,
+      depth + 1,
+    ) &&
+    curveClearsCircle(
+      { start: middle, control: second, end: curve.end },
+      circle,
+      depth + 1,
+    )
+  );
+}
+
+function routeAroundCircles(
+  source: RouteCircle,
+  target: RouteCircle,
+  obstacles: RouteCircle[],
+  preferredSide: number,
+  routes: readonly GraphPhysicsRoute[],
+): { x: number; y: number }[] {
+  const all = [source, target, ...obstacles];
+  const padding = Math.max(source.radius, target.radius) * 2;
+  const local = obstacles.filter(
+    (circle) =>
+      circle.x + circle.radius >= Math.min(source.x, target.x) - padding &&
+      circle.x - circle.radius <= Math.max(source.x, target.x) + padding &&
+      circle.y + circle.radius >= Math.min(source.y, target.y) - padding &&
+      circle.y - circle.radius <= Math.max(source.y, target.y) + padding,
+  );
+  const solve = (circles: RouteCircle[]): { x: number; y: number }[] => {
+    const vertices: { x: number; y: number }[] = [source, target];
+    const sides = 12;
+    for (const circle of circles) {
+      const radius = circle.radius / Math.cos(Math.PI / sides) + 1;
+      for (let step = 0; step < sides; step += 1) {
+        const angle = (step * Math.PI * 2) / sides;
+        const point = {
+          x: circle.x + Math.cos(angle) * radius,
+          y: circle.y + Math.sin(angle) * radius,
+        };
+        if (
+          all.every(
+            (other) =>
+              Math.hypot(point.x - other.x, point.y - other.y) > other.radius,
+          )
+        )
+          vertices.push(point);
+      }
+    }
+    const graph = new graphlib.Graph<never, never, number>({ directed: false });
+    vertices.forEach((_, index) => graph.setNode(String(index)));
+    for (let first = 0; first < vertices.length; first += 1) {
+      const start = vertices[first];
+      for (let second = first + 1; second < vertices.length; second += 1) {
+        const end = vertices[second];
+        const blocked = all.some((circle) => {
+          if (
+            (circle === source && (first === 0 || second === 0)) ||
+            (circle === target && (first === 1 || second === 1))
+          )
+            return false;
+          if (
+            circle.x + circle.radius < Math.min(start.x, end.x) ||
+            circle.x - circle.radius > Math.max(start.x, end.x) ||
+            circle.y + circle.radius < Math.min(start.y, end.y) ||
+            circle.y - circle.radius > Math.max(start.y, end.y)
+          )
+            return false;
+          return segmentDistance(circle, start, end) <= circle.radius;
+        });
+        if (blocked) continue;
+        const side =
+          (target.x - source.x) * ((start.y + end.y) / 2 - source.y) -
+          (target.y - source.y) * ((start.x + end.x) / 2 - source.x);
+        graph.setEdge(
+          String(first),
+          String(second),
+          Math.hypot(end.x - start.x, end.y - start.y) *
+            (side * preferredSide < 0 ? 1.015 : 1) +
+            countGraphRouteCrossings([start, end], routes) *
+              Math.max(
+                400,
+                Math.hypot(target.x - source.x, target.y - source.y) * 2,
+              ),
+        );
+      }
+    }
+    const shortest = graphlib.alg.dijkstra(graph, "0", (edge) =>
+      graph.edge(edge),
+    );
+    if (!Number.isFinite(shortest["1"].distance)) return [];
+    const path = [vertices[1]];
+    let current = "1";
+    while (current !== "0") {
+      current = shortest[current].predecessor;
+      path.push(vertices[Number(current)]);
+    }
+    return path.reverse();
+  };
+  const localPath = solve(local);
+  return localPath.length > 0 || local.length === obstacles.length
+    ? localPath
+    : solve(obstacles);
 }
 
 export function routeGraphPhysicsEdge(
@@ -69,7 +310,15 @@ export function routeGraphPhysicsEdge(
   kind: string,
   obstacles: GraphPhysicsNode[] = [],
   lane = 0,
+  reserved: readonly GraphPhysicsRoute[] = [],
 ): GraphPhysicsCurve {
+  const routes = reserved.filter(
+    (route) =>
+      !(
+        (route.source === source.id && route.target === target.id) ||
+        (route.source === target.id && route.target === source.id)
+      ),
+  );
   const from = {
     x: source.x + source.width / 2,
     y: source.y + source.height / 2,
@@ -105,9 +354,15 @@ export function routeGraphPhysicsEdge(
       y: center.y + ((control.y - center.y) * radius) / length,
     };
   };
-  const nearby = obstacles.filter(
-    (node) => node.id !== source.id && node.id !== target.id,
-  );
+  const nearby: RouteCircle[] = obstacles
+    .filter((node) => node.id !== source.id && node.id !== target.id)
+    .map((node) => ({
+      id: node.id,
+      x: node.x + node.width / 2,
+      y: node.y + node.height / 2,
+      radius: Math.max(node.width, node.height) / 2 + 10 + (backtrack ? 3 : 0),
+    }))
+    .sort((first, second) => first.id.localeCompare(second.id));
   const curveAt = (bend: number): GraphPhysicsCurve => {
     const control = {
       x: (from.x + to.x) / 2 + normal.x * bend,
@@ -122,35 +377,28 @@ export function routeGraphPhysicsEdge(
   const obstruction = (curve: GraphPhysicsCurve): number => {
     let score = 0;
     for (const node of nearby) {
-      const center = {
-        x: node.x + node.width / 2,
-        y: node.y + node.height / 2,
-      };
-      const radius = node.width / 2 + 10;
-      for (let sample = 1; sample < 24; sample += 1) {
-        const time = sample / 24;
-        const inverse = 1 - time;
-        const point = {
-          x:
-            inverse * inverse * curve.start.x +
-            2 * inverse * time * curve.control.x +
-            time * time * curve.end.x,
-          y:
-            inverse * inverse * curve.start.y +
-            2 * inverse * time * curve.control.y +
-            time * time * curve.end.y,
-        };
-        if (Math.hypot(point.x - center.x, point.y - center.y) < radius) {
-          score += 1;
-          break;
-        }
-      }
+      if (
+        node.x + node.radius <
+          Math.min(curve.start.x, curve.control.x, curve.end.x) ||
+        node.x - node.radius >
+          Math.max(curve.start.x, curve.control.x, curve.end.x) ||
+        node.y + node.radius <
+          Math.min(curve.start.y, curve.control.y, curve.end.y) ||
+        node.y - node.radius >
+          Math.max(curve.start.y, curve.control.y, curve.end.y)
+      )
+        continue;
+      if (!curveClearsCircle(curve, node)) score += 1;
     }
     return score;
   };
   let best = curveAt(baseBend * direction);
   let bestScore = obstruction(best);
-  if (bestScore === 0) return best;
+  let bestCrossings =
+    bestScore === 0
+      ? countGraphRouteCrossings(flattenGraphPhysicsCurve(best), routes)
+      : Infinity;
+  if (bestScore === 0 && bestCrossings === 0) return best;
   for (let attempt = 1; attempt <= 12; attempt += 1) {
     const bend =
       (baseBend + Math.ceil(attempt / 2) * 72) *
@@ -158,13 +406,38 @@ export function routeGraphPhysicsEdge(
       (attempt % 2 ? 1 : -1);
     const candidate = curveAt(bend);
     const score = obstruction(candidate);
-    if (score < bestScore) {
+    const crossings =
+      score === 0
+        ? countGraphRouteCrossings(flattenGraphPhysicsCurve(candidate), routes)
+        : Infinity;
+    if (
+      score < bestScore ||
+      (score === bestScore && crossings < bestCrossings)
+    ) {
       best = candidate;
       bestScore = score;
+      bestCrossings = crossings;
     }
-    if (score === 0) break;
+    if (score === 0 && crossings === 0) return candidate;
   }
-  return best;
+  const waypoints = routeAroundCircles(
+    { ...from, id: source.id, radius: source.width / 2 + 2 },
+    { ...to, id: target.id, radius: target.width / 2 + 2 },
+    nearby,
+    direction,
+    routes,
+  );
+  if (waypoints.length > 1) {
+    waypoints[0] = boundary(from, waypoints[1], source.width / 2 + 2);
+    const last = waypoints.length - 1;
+    waypoints[last] = boundary(to, waypoints[last - 1], target.width / 2 + 2);
+    if (
+      bestScore > 0 ||
+      countGraphRouteCrossings(waypoints, routes) < bestCrossings
+    )
+      return { ...best, start: waypoints[0], end: waypoints[last], waypoints };
+  }
+  return bestScore === 0 ? best : { ...best, waypoints: [] };
 }
 
 export function layoutGraphPhysics(
@@ -386,6 +659,7 @@ function layoutPhysicsComponent(
         ![
           "requirement-start",
           "gating",
+          "sequence",
           "restart",
           "membership",
           "association",

@@ -1,237 +1,141 @@
-# Graph Semantics Spec (authoritative behavior model)
+# Work Graph Semantics
 
-Trigger phrase for a future Copilot chat: **Implement the graph semantics model**.
+Authoritative product contract, implemented by build `2026.09.16.12`. This
+supersedes the former execution-frontier, cascade, group-fold, and compensation
+activation policies. Base Board is Dustin's personal, agent-maintained work
+graph, not a workflow execution engine.
 
-> **Why this file exists.** Earlier work implemented graph behavior by
-> imperatively mutating statuses inside `makeNodeActive` / `markNodeFailed` with
-> a growing pile of special cases (ancestor deps, downstream-of-ancestors,
-> parallel cancellation, break re-homing, container coloring…). That approach
-> kept introducing regressions because it patches *projections* of a model that
-> was never encoded. This document encodes that model. It is the **acceptance
-> spec** for Milestone 3 of `GRAPH_ARCHITECTURE_PLAN.md` (deterministic
-> recompute + per-node-type behavior). Build to THIS, with the worked cases as
-> tests. Do not re-derive behavior by tweaking call sites.
+## Recorded Facts
 
-## The two node categories (the core distinction)
+- Each Markdown note is one record. Existing `id` values remain stable.
+- `status` is the canonical recorded work status on every node, including
+  containers, scopes, and observations. Graph does not derive a replacement
+  status from descendants. Kanban can edit another explicitly configured field.
+- Setting a status changes only that record. Starting/completing does not
+  complete predecessors; failure does not invalidate successors; cancellation
+  does not cancel descendants or a branch. No prerequisite prevents recording
+  actual activity. Multiple concurrent activities and incomplete containers are
+  valid.
+- Counts summarize distinct descendant work items, not effort or the
+  container's own assertion. Recovery activity is counted separately. A
+  completed container can have residual incomplete children; flag uncertainty
+  for review instead of silently repairing it.
+- Unknown fields, identifiers, Markdown bodies, layouts, and historical records
+  are preserved. Unrecognized status text remains stored verbatim and neutral
+  unless it has an explicitly supported visual mapping.
 
-1. **Work node (leaf).** An actionable step with **no children**. It carries an
-   explicit, user-settable status: `Planned`, `Active`, `Completed`, `Failed`,
-   `Invalidated` (later: `Awaiting`, `Cancelled`). The user acts on these.
+## Canonical Storage
 
-2. **Group node (container).** A node **with children**. It represents the
-   aggregate of a gated sub-graph (e.g. `stage`, `repo`, `rollout`, `dev`,
-   `iteration`, the feature root `A`). **Its state is DERIVED from its children,
-   never set directly** (Case 2). Groups are not directly actionable for
-   Active/Completed.
+`baseboard_schema: 1` identifies migrated/new work records. There is no parallel
+writable graph database. Notes hold current facts; view configuration holds
+presentation; journals hold observations and reversible edit receipts.
 
-> This split is the abstraction we were missing. Container state must be a pure
-> function of descendants, computed bottom-up — not imperatively written.
+| Meaning | Note field | Direction and interpretation |
+| --- | --- | --- |
+| Containment | `parent` | Child belongs inside one parent |
+| Sequence | `sequence_after` | Target normally follows the listed sources; advisory |
+| Dependency | `depends_on` | Target requires something specific from a listed source |
+| Association | `associations` | Related context, without execution implications |
+| Scope membership | `rollup_to` | Record belongs to one or more scopes |
+| Recovery | `compensates` | Recovery record may address an effect of a listed record |
 
-## Two derived layers (everything below is a projection, not stored truth)
+Relationship lists contain stable IDs or unambiguous wiki links/paths. New UI
+links use full note paths. Ambiguous references are not authorization to edit a
+matching note. Legacy `breaks_to` and `restarts_to` remain contextual outcome and
+retry relationships, not transition instructions.
 
-The **only source of truth is the set of work-node (leaf) statuses** plus the
-graph structure (containment + `depends_on` gating). Everything else is derived:
+Dependencies may carry `dependency_assessments`, an appendable list of:
 
-### Layer A — Group state (fold over children, bottom-up)
-
-For a group node, derive its state from its children's states:
-
-| Children condition | Group state |
-|--------------------|-------------|
-| all children `Completed` | `Completed` (green) |
-| any child `Active` or `In Progress`, or any child `Failed` | `In Progress` (purple) |
-| all children `Cancelled` (or pruned) | `Cancelled` (orange/dim) |
-| all children `Invalidated` | `Invalidated` (gray/dim) |
-| group's own dependencies not yet satisfied / all children `Planned` | `Planned` |
-
-`In Progress` is a **new derived state** for "this group contains the active
-frontier / live work" — distinct from `Active` (the single work-node frontier)
-and from `Completed`. **Color: purple** (`--color-purple` / `#a371f7`, fallback
-with a faint tint + border, NOT a glow — it should read as "spans active work"
-and stay visually subordinate to the blue `Active` frontier leaf). Modeled like
-`Cancelled`/`Awaiting`: a status keyword + node-state + CSS.
-
-> Precedence for mixed children (decreasing): `In Progress` > `Completed` >
-> `Cancelled`/`Invalidated` > `Planned`. (Refine with the user if needed.)
-
-### Layer B — Link color (projection of endpoint states)
-
-Links are colored by the states of the nodes they connect; never set directly.
-
-- **Completion return** retraces the declared dependency chain to its parent on
-  a parallel track. For `A -> B -> C -> D`, the return is `D -> C -> B -> A`.
-  All return segments are green when the terminal step's derived state is
-  `Completed`; otherwise they remain muted. Independent branches report their
-  own outcomes, so a successful branch can remain green beside a failed branch.
-- **Failure return** begins at a genuinely failed/blocked work node and
-  backtracks through same-parent dependency predecessors, then the owning parent.
-  If C fails, the return is `C -> B -> A`, not a direct C-to-A shortcut. The
-  completed predecessors keep their own successful states. Feedback continues
-  through enclosing workflow sequences, stopping at scope membership boundaries.
-  It replaces completion feedback along the failed path; a shared return segment
-  is red once rather than overlapping red/green. Clearing failure removes the
-  derived red trace and restores the ordinary return.
-- **Unexecuted forward links** into invalidated, cancelled, or waiting successors
-  are gray. They do not propagate red into work that did not execute. Rendering
-  does not write statuses or relationship metadata; failure operations invalidate
-  downstream work as described below.
-
-## The unifying primitive: execution order ("before" / "after")
-
-Every other rule reduces to a node's position in **execution order**, computed
-once as a partial order over: `depends_on` gating **threaded through
-containment** (a group occupies the span of its children: a node inside a group
-runs after the group's predecessors and before the group's successors). This is
-the single concept that the piecemeal "ancestor dependencies" /
-"downstream-of-ancestors" patches were approximating. Compute it once; derive
-everything from it.
-
-## Operations on a WORK node (the only user actions)
-
-Given the execution-order partition relative to the acted-on work node `X`:
-
-### Set Active(X)
-- `X` → `Active`.
-- **Everything before `X`** (execution order) → `Completed`.
-- **Everything after `X`** → `Planned`.
-- All group nodes **re-derive** (Layer A): groups containing `X` → `In Progress`;
-  groups entirely before → `Completed`; groups entirely after → `Planned`.
-- Links re-derive (Layer B).
-
-### Set Failed(X)
-- `X` → `Failed`; a **red failure return** backtracks from X through its dependency
-  predecessors to its parent, continuing through enclosing workflow sequences.
-- **Everything before `X`** → `Completed` (it ran).
-- **Everything after `X`** → `Invalidated` (unreachable: the rest of its ring AND
-  all subsequent rings).
-- Groups + links re-derive.
-- **No iteration is spawned here.** Whether a retry/next iteration is warranted
-  is a *policy* decision owned by the agent (or a human), NOT the deterministic
-  failure mechanics. See "Iteration creation" below.
-
-### Set Completed(X)
-- `X` → `Completed`; everything before `X` → `Completed`. Groups/links re-derive.
-
-## Operation on a GROUP node: Prune (Cancel sub-graph)
-
-Groups are not actionable for Active/Completed/Failed (Case 2). The one allowed
-group-level action is **Prune** (UI label; status value `Cancelled`), for
-deliberately stopping a whole sub-graph for an external reason:
-- Every leaf in the group's sub-graph → `Cancelled`; the group then *derives*
-  `Cancelled` (we never set a group status directly).
-- Everything **after** the group in execution order → `Invalidated` (it can no
-  longer run).
-- It is **not** a failure: no red break-link escalation, no retry.
-- **Reuse the `Cancelled` status** (no new `Pruned` status). Record the reason
-  in the event log (`kind: cancelled, reason: "pruned-manual"`) so history/replay
-  distinguishes a manual prune from automatic parallel-branch cancellation.
-  This resolves the Case 2 vs Case 5 contradiction.
-
-## Iteration creation (policy, not mechanics)
-
-Creating the next iteration is a **deliberate decision**, never an automatic
-side-effect of failure:
-- **Human:** a "Start next iteration" action.
-- **Agent:** an MCP tool (e.g. `create_iteration` or `create_node` +
-  `restarts_to`) the harness calls when *its* policy decides a retry is
-  warranted (`GRAPH_AGENT_MCP_PLAN.md`).
-- The deterministic engine only provides the *mechanism*; it does not decide.
-  (This is why Case 3 shows Iteration 2 and Case 4 omits it — iteration creation
-  is no longer coupled to the failure op.)
-
-## Worked acceptance cases (verbatim from the user — these are the tests)
-
-Base graph:
-
-```
-A
-  iteration 1
-    dev → design, implementation, review
-    rollout → repo → stage → (await build rollout, enable feature flag,
-                              await feature flag rollout, verify),
-                       canary, pilot, broad
+```yaml
+dependency_assessments:
+  - source: "[[Stage]]"
+    action: promote-canary
+    assessment: satisfied
+    by: Dustin
+    at: "2026-09-16T12:00:00Z"
+    reason: Sufficient healthy-zone bake for this promotion.
+    evidence: ["[[Stage#Bake evidence]]"]
 ```
 
-**Case 1 — Set `enable feature flag` Active**
-```
-dev (Completed): design/implementation/review (Completed); review →green→ dev
-rollout (In Progress)
-  repo (In Progress)
-    stage (In Progress)
-      await build rollout (Completed)
-      enable feature flag (Active)
-      await feature flag rollout (Planned)
-      verify (Planned)            verify →muted-green→ stage
-    canary (Planned), pilot (Planned), broad (Planned)   broad →muted-green→ repo
-```
+Each assessment requires `source`, a particular `action`, one of `unresolved`,
+`satisfied`, or `waived`, and provenance (`by`, `at`, `reason`, `evidence`). The
+last recorded assessment for that source/action applies. An unmatched action is
+unresolved. Optional `dependency_action` selects the action shown by Graph's
+advisory count; otherwise the action is `work`. Source completion does not automatically satisfy a specific
+requirement. Satisfaction or waiver never changes the source status. An agent
+must not infer a waiver, approval, or event time.
 
-**Case 2 — Set `stage` Failed → NOT POSSIBLE.** `stage` is a group node (not
-actionable); it is the aggregate of its gated children.
+## Partial Stage, Active Canary
 
-**Case 3 — Set `await build rollout` Failed**
-```
-dev (Completed) + children Completed
-rollout / repo / stage (In Progress)
-  await build rollout (Failed)            await build rollout →red→ stage
-  enable / await flag / verify (Invalidated)   (verify muted-green→stage REMOVED)
-  canary / pilot / broad (Invalidated)         (broad muted-green→repo REMOVED)
-```
-(Iteration 2 is created only as a separate, deliberate retry — not by the
-failure op itself; see "Iteration creation".)
+This is an illustrative synthetic example, not a production approval:
 
-**Case 4 — Set `await feature flag rollout` Failed**
-```
-await build rollout (Completed), enable feature flag (Completed)
-await feature flag rollout (Failed)     →red→ stage
-verify (Invalidated)                    (verify muted-green→stage REMOVED)
-canary / pilot / broad (Invalidated)    (broad muted-green→repo REMOVED)
-rollout / repo / stage (In Progress)
-```
+1. Stage remains `In Progress`. Healthy zones have baked; a child note records
+   the broken zone and outstanding repair work.
+2. Canary retains a sequence link and, where a specific bake requirement is
+   useful to query, a dependency on Stage.
+3. Dustin's promotion decision is recorded in Canary's Markdown or `decision`
+   metadata, with rationale and evidence. The action-specific assessment above
+   records what was considered sufficient. A waiver would require its own
+   explicitly recorded rationale.
+4. A single-record batch sets Canary to `In Progress`. Stage, the broken zone,
+   Pilot, Broad, and all predecessors keep their statuses.
 
-**Case 5 — Prune `stage`** (the group-level "Cancel sub-graph" action; this is
-the resolution of the former Case 2/5 contradiction — the sub-graph is
-`Cancelled`, not Failed)
-```
-stage (Cancelled, derived)
-  await build rollout / enable / await flag / verify (all Cancelled)
-canary / pilot / broad (Invalidated — sequenced after the pruned group)
-verify →gray→ stage ; broad muted-green→repo REMOVED
-```
+Do not create an approval node merely to enable a promotion. Keep unusual
+domain reasoning in Markdown; add structure only when a view needs to query it.
 
-## Resolved decisions (confirmed with the user 2026-06-11)
+## Advisory Information
 
-1. **Case 2 vs Case 5 — RESOLVED.** Groups are non-actionable for work-ops
-   (Active/Completed/Failed). A separate **Prune** group action (status
-   `Cancelled`, reason `pruned-manual` in the event log) deliberately stops a
-   sub-graph: leaves → `Cancelled` (group derives), work after the group →
-   `Invalidated`, no failure escalation, no retry.
-2. **`In Progress` group color — RESOLVED: purple** (`--color-purple` /
-   `#a371f7`), faint tint + border, subordinate to the blue `Active` leaf.
-3. **Iteration spawn — RESOLVED: not in the engine.** Failure does NOT auto-spawn
-   an iteration. Iteration creation is a deliberate human action or an
-   agent/MCP policy decision (`GRAPH_AGENT_MCP_PLAN.md`).
+- Readiness and possible dependency blockers are advisory. They do not replace
+  status, hide activities, or reject observed transitions.
+- Recovery relationships remain visible without silently activating, hiding,
+  completing, or cancelling the recovery record. Possible recovery needs are
+  suggestions, not evidence that recovery happened.
+- Red dashed impact/return paths indicate possible impact from a recorded
+  failure. Ancestor nodes retain their own assertions. Successors become gray
+  only according to their own recorded state, never because a failure swept them.
+- Suggested Next replaces the active frontier. `suggested_next` lives on notes
+  as entries with `scope`, positive `rank`, `by`, `at`, `reason`, and `evidence`.
+  One entry per note/scope; entries persist until explicitly changed. Ordering
+  uses rank with deterministic tie-breaking. Completed or concurrent work is
+  not automatically removed. All Cards and the full graph remain accessible.
+- Containment collapse and **Fold downstream sequence** are separate actions.
+  The latter uses `graphSequenceFolds` view configuration, follows sequence plus
+  downstream containment, and never reparents notes or changes their state.
 
-## Remaining open question
+## Changes and History
 
-- **Group-state fold precedence** for mixed children is set to
-  `In Progress > Completed > Cancelled/Invalidated > Planned`; confirm this is
-  right for edge cases (e.g. a group with some Completed + some Invalidated
-  children and nothing active).
+All command batches name paths and fields, expected SHA-256 content revisions,
+actor, reason, and evidence. A before/after preview produces the token required
+for apply. Multi-note UI edits require review; topology alone cannot authorize
+mutations. Repeat application of an already-applied identical batch is inert.
 
-## Alignment with the milestones
+Receipts live in `.baseboard/commands`. Apply journals intent before writing and
+progress after each note. Partial failures attempt a field-level inverse, refuse
+to overwrite conflicts, and retain `rolled-back` or `partial` receipts. Undo is
+another reviewed command, preserving unrelated fields and bodies. Undoing a
+status edit appends a reversal event instead of erasing observed history.
+Interrupted/partial receipts require review, not blind replay.
 
-- This **is Milestone 3** of `GRAPH_ARCHITECTURE_PLAN.md` ("deterministic
-  scheduler + per-node-type handlers"), now with a concrete behavior contract.
-  The right implementation is a **pure recompute**: on any leaf-status change,
-  recompute Layer A (group states) and Layer B (link colors) from the leaf
-  statuses + structure, and implement the three work-node operations via the
-  execution-order partition — instead of incremental status mutation.
-- It needs one small **state addition** first (like `Cancelled`/`Awaiting`): the
-  derived **`In Progress`** group state (status keyword + node-state + CSS).
-- The circling we hit is precisely the "maintainability tipping point" the plan
-  predicted; the cure is to encode this model, not to keep patching
-  `makeNodeActive`/`markNodeFailed`.
-- The worked cases above become the **regression oracle** for the Milestone 3
-  "behavior-preserving / behavior-correcting" refactor (and supersede the
-  ad-hoc per-bug fixes in `GRAPH_VIEW_RULES.md` where they differ).
-```
+Transition history retains its shared event shape, adding attribution, evidence,
+batch identity, and reversal identity. Current status is authoritative; history
+is not a competing writable projection. Direct Markdown edits remain possible,
+but unrecorded edits do not retroactively generate status events.
+
+Timeline starts recorded spans only at recorded timestamps. Missing history
+produces no invented interval from file creation/modification. Open tails are
+last-known state with unverified continuity, not measured effort or actual
+duration. `planned_start`/`planned_end` are separate planned bars. Parent lanes
+use their own events, not an invented span over their children's work.
+
+Graph history preserves its existing baseline/delta journal, gaps, static
+historical browsing, and live-camera restoration. New observations can capture
+decisions, assessments, recommendations, and sequence/context links. Old frames
+are not backfilled with today's metadata or guessed approvals.
+
+## Permissions
+
+Graph maintenance and real production actions are separate permissions. A
+status, assessment, `executor`, or legacy `autonomy` value cannot authorize a
+deployment, flag change, PR merge, credential use, or external command. Dustin
+and Copilot supply judgment; deterministic code stores, validates, previews,
+summarizes, and renders it. No scheduler, hosted model, or MCP service is needed.

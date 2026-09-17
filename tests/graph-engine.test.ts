@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildFrontierGraph,
   deriveStates,
-  getFailureScope,
-  getFrontierNodes,
+  getAggregationChildren,
+  getRecordedState,
   getScopeAncestors,
   type FrontierNode,
   type FrontierRawNode,
@@ -50,120 +50,87 @@ function node(graph: FrontierNode[], key: string): FrontierNode {
 const parentOf = (candidate: FrontierNode): FrontierNode | null =>
   candidate.parent;
 
-describe("shared frontier compensation state", () => {
-  it("keeps an untriggered rollback dormant and off the frontier", () => {
-    const graph = buildFrontierGraph(rollout());
-    expect(node(graph, "disable").state).toBe("idle");
-    expect(getFrontierNodes(graph).map((candidate) => candidate.key)).toEqual([
-      "verify",
+describe("shared recorded work state", () => {
+  it("does not resolve an ambiguous title alias to an arbitrary record", () => {
+    const graph = buildFrontierGraph([
+      row("first", { identities: ["first", "shared"] }),
+      row("second", { identities: ["second", "shared"] }),
+      row("child", { parentKey: "shared", dependsOnKeys: ["shared"] }),
     ]);
+    expect(node(graph, "child").parent).toBeNull();
+    expect(node(graph, "child").predecessors).toEqual([]);
   });
 
-  it("excludes dormant rollbacks from completed process and scope rollups", () => {
-    const raw = rollout("Completed");
-    raw.find((candidate) => candidate.key === "disable")!.rollupToKeys = [
-      "scope",
-    ];
-    const graph = buildFrontierGraph(raw);
-    expect(node(graph, "ring").state).toBe("completed");
-    expect(node(graph, "scope").state).toBe("completed");
-    expect(getFrontierNodes(graph)).toEqual([]);
-  });
-
-  it.each(["Failed", "Interrupted", "Blocked"])(
-    "activates a declared rollback after %s verification",
+  it.each(["Failed", "Interrupted", "Blocked", "Completed", "Awaiting"])(
+    "does not activate recovery work after %s verification",
     (status) => {
       const graph = buildFrontierGraph(rollout(status));
-      expect(node(graph, "disable").state).toBe("active");
-      expect(getFrontierNodes(graph)).toContain(node(graph, "disable"));
+      expect(node(graph, "disable").state).toBe("waiting");
+      expect(node(graph, "disable").status).toBe("Planned");
+      expect(node(graph, "ring").state).toBe("waiting");
     },
   );
 
-  it("requires a completed effect before activating its rollback", () => {
-    const raw = rollout("Failed");
-    raw.find((candidate) => candidate.key === "enable")!.status = "Planned";
+  it("retains container assertions separately from descendant counts", () => {
+    const raw = rollout("Completed");
+    raw.find((candidate) => candidate.key === "ring")!.status = "In Progress";
     const graph = buildFrontierGraph(raw);
-    expect(node(graph, "disable").state).toBe("idle");
+    expect(node(graph, "ring").state).toBe("active");
+    expect(node(graph, "scope").state).toBe("waiting");
+    expect(getAggregationChildren(node(graph, "ring"))).toHaveLength(2);
   });
 
-  it("does not offer a rollback with an unresolved target as ordinary work", () => {
+  it("records partial Stage and active Canary without completing Stage", () => {
     const graph = buildFrontierGraph([
-      row("disable", { compensatesKeys: ["filtered-out-enable"] }),
+      row("stage", { status: "In Progress" }),
+      row("healthy-zone", { parentKey: "stage", status: "Completed" }),
+      row("broken-zone", { parentKey: "stage", status: "Failed" }),
+      row("canary", { status: "In Progress", dependsOnKeys: ["stage"] }),
+      row("pilot", { dependsOnKeys: ["canary"] }),
     ]);
-    expect(node(graph, "disable").state).toBe("idle");
-    expect(getFrontierNodes(graph)).toEqual([]);
+    expect(graph.map((candidate) => candidate.state)).toEqual([
+      "active",
+      "completed",
+      "interrupted",
+      "active",
+      "waiting",
+    ]);
+    const before = graph.map((candidate) => candidate.status);
+    deriveStates(graph);
+    expect(graph.map((candidate) => candidate.status)).toEqual(before);
+  });
+
+  it("keeps explicit recovery activity when failures clear", () => {
+    const graph = buildFrontierGraph(rollout("Failed"));
+    node(graph, "disable").status = "In Progress";
+    node(graph, "verify").status = "Completed";
+    deriveStates(graph);
+    expect(node(graph, "disable").state).toBe("active");
+  });
+
+  it("retains an explicit assertion on every node kind", () => {
+    for (const kind of ["work", "process", "group", "impact"] as const) {
+      const graph = buildFrontierGraph([
+        row(kind, { kindExplicit: kind, status: "Failed" }),
+      ]);
+      expect(graph[0].state).toBe("interrupted");
+    }
   });
 
   it.each([
+    ["Cancelled", "cancelled"],
+    ["Invalidated", "invalidated"],
     ["Completed", "completed"],
-    ["Failed", "interrupted"],
-  ])("retains a rollback's %s outcome", (status, expected) => {
-    const raw = rollout("Failed");
-    raw.find((candidate) => candidate.key === "disable")!.status = status;
-    const graph = buildFrontierGraph(raw);
-    expect(node(graph, "disable").state).toBe(expected);
+    ["Awaiting", "awaiting"],
+    ["Blocked", "blocked"],
+    ["In Progress", "active"],
+    ["Flighting", "waiting"],
+    [null, "idle"],
+  ] as const)("interprets only the recorded %s assertion", (status, state) => {
+    expect(getRecordedState(status)).toBe(state);
   });
 
-  it("returns a rollback to dormancy when a failure is cleared", () => {
-    const graph = buildFrontierGraph(rollout("Failed"));
-    expect(node(graph, "disable").state).toBe("active");
-    node(graph, "verify").status = "Awaiting";
-    deriveStates(graph, (candidate) => parentOf(candidate as FrontierNode));
-    expect(node(graph, "disable").state).toBe("idle");
-  });
-
-  it("does not activate compensations in an unrelated ring", () => {
-    const graph = buildFrontierGraph([
-      ...rollout(),
-      row("other-ring", { kindExplicit: "process", rollupToKeys: ["scope"] }),
-      row("other-failure", { parentKey: "other-ring", status: "Failed" }),
-    ]);
-    expect(node(graph, "disable").state).toBe("idle");
-  });
-
-  it("absorbs failure at a nested group boundary", () => {
-    const graph = buildFrontierGraph([
-      row("outer", { kindExplicit: "process" }),
-      row("enable", { parentKey: "outer", status: "Completed" }),
-      row("disable", { parentKey: "outer", compensatesKeys: ["enable"] }),
-      row("inner", { parentKey: "outer", kindExplicit: "group" }),
-      row("failure", { parentKey: "inner", status: "Failed" }),
-    ]);
-    const scope = getFailureScope(graph, (candidate) =>
-      parentOf(candidate as FrontierNode),
-    );
-    expect(scope.has(node(graph, "inner"))).toBe(true);
-    expect(scope.has(node(graph, "outer"))).toBe(false);
-    expect(node(graph, "disable").state).toBe("idle");
-  });
-
-  it("ignores failed impact nodes in failure propagation and rollups", () => {
-    const graph = buildFrontierGraph([
-      ...rollout("Completed"),
-      row("impact", {
-        kindExplicit: "impact",
-        parentKey: "ring",
-        status: "Failed",
-      }),
-    ]);
-    expect(node(graph, "impact").state).toBe("idle");
-    expect(node(graph, "disable").state).toBe("idle");
-    expect(node(graph, "ring").state).toBe("completed");
-    expect(getFrontierNodes(graph)).toEqual([]);
-  });
-
-  it("keeps Awaiting nonterminal for dependent work", () => {
-    const graph = buildFrontierGraph([
-      row("await", { status: "Awaiting" }),
-      row("next", { dependsOnKeys: ["await"] }),
-    ]);
-    expect(node(graph, "next").state).toBe("waiting");
-    expect(getFrontierNodes(graph).map((candidate) => candidate.key)).toEqual([
-      "await",
-    ]);
-  });
-
-  it("retains scope membership for an activated rollback", () => {
+  it("retains scope membership independently of recovery state", () => {
     const graph = buildFrontierGraph(rollout("Failed"));
     const scopes = getScopeAncestors(node(graph, "disable"), (candidate) =>
       parentOf(candidate as FrontierNode),

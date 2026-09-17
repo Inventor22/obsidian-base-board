@@ -1,5 +1,6 @@
 import {
   BasesEntry,
+  BasesAllOptions,
   BasesPropertyId,
   BasesView,
   NullValue,
@@ -21,6 +22,9 @@ import { relativeLuminance } from "./color-utils";
 import { ColorPickerModal } from "./tags";
 import { getColumnColor } from "./status-colors";
 import { CardDetailModal } from "./card-detail-modal";
+import { editGraphNotes } from "./graph-command-ui";
+import { WORK_GRAPH_BUILD } from "./work-graph";
+import { normalizeReference as normalizeGraphReference } from "./graph-engine";
 
 type TimelineZoomId = "day" | "week" | "month" | "year";
 type TimelineZoomStopId =
@@ -90,6 +94,7 @@ interface TimelineSegment {
   status: string | null;
   start: Date;
   end: Date;
+  basis?: "recorded" | "last-known" | "planned";
 }
 
 interface TimelineTask {
@@ -178,10 +183,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const MONTH_MS = 31 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
-const TIMELINE_BUILD_VERSION = "2026.06.02.19";
-const COMPLETED_SEGMENT_TAIL_MIN_MS = 12 * 60 * 60 * 1000;
-const COMPLETED_SEGMENT_TAIL_MAX_MS = 3 * DAY_MS;
-const COMPLETED_SEGMENT_TAIL_RATIO = 0.1;
+const TIMELINE_BUILD_VERSION = WORK_GRAPH_BUILD;
 const ROLLOUT_RING_PROPERTY = "rollout_ring";
 const ROLLOUT_HISTORY_PROPERTY = "rollout_history";
 
@@ -446,8 +448,15 @@ export class TimelineView extends BasesView {
     this.zoomId = this.getZoomIdForDuration(this.zoomDurationMs);
   }
 
-  static getViewOptions(): never[] {
-    return [];
+  static getViewOptions(): BasesAllOptions[] {
+    return [
+      {
+        type: "text",
+        key: "timelineSwimlaneProperty",
+        displayName: "Swimlane property",
+        default: "parent",
+      },
+    ];
   }
 
   public focus(): void {
@@ -1187,6 +1196,10 @@ export class TimelineView extends BasesView {
       cls: "base-board-timeline-task-title",
       text: task.title,
     });
+    setTooltip(
+      labelEl,
+      `${task.title}\nRecorded status: ${task.currentStatus ?? "(none)"}`,
+    );
 
     labelEl.addEventListener("click", () => {
       void this.app.workspace.getLeaf(false).openFile(task.file);
@@ -1207,9 +1220,10 @@ export class TimelineView extends BasesView {
       const status = this.getDisplayStatus(segment.status);
 
       const segmentEl = trackEl.createDiv({
-        cls: "base-board-timeline-segment",
-        text: status,
+        cls: `base-board-timeline-segment${segment.basis === "planned" ? " base-board-timeline-segment--planned" : ""}`,
+        text: segment.basis === "planned" ? "Planned" : status,
       });
+      segmentEl.dataset.basis = segment.basis ?? "recorded";
       segmentEl.style.left = `${left}%`;
       segmentEl.style.width = `${width}%`;
       segmentEl.style.setProperty(
@@ -1218,7 +1232,7 @@ export class TimelineView extends BasesView {
       );
       setTooltip(
         segmentEl,
-        `${task.title}\n${status}\n${this.formatBusinessElapsed(segment.start, segment.end)}\n${segment.start.toLocaleString()} → ${segment.end.toLocaleString()}`,
+        `${task.title}\n${segment.basis === "planned" ? "Planned dates" : segment.basis === "last-known" ? "Last recorded status; continuity unverified" : "Recorded changes"}: ${status}\n${segment.start.toLocaleString()} → ${segment.end.toLocaleString()}`,
       );
       segmentEl.addEventListener("click", () => {
         new CardDetailModal(this.app, task.file).open();
@@ -1250,7 +1264,7 @@ export class TimelineView extends BasesView {
       );
       setTooltip(
         rolloutEl,
-        `${task.title}\nRollout: ${ring}\n${this.formatBusinessElapsed(segment.start, segment.end)}\n${segment.start.toLocaleString()} → ${segment.end.toLocaleString()}`,
+        `${task.title}\nRecorded rollout: ${ring}${segment.basis === "last-known" ? " (continuity unverified)" : ""}\n${segment.start.toLocaleString()} → ${segment.end.toLocaleString()}`,
       );
       rolloutEl.addEventListener("click", () => {
         new CardDetailModal(this.app, task.file).open();
@@ -1268,7 +1282,10 @@ export class TimelineView extends BasesView {
 
       const currentStatus = this.getCurrentStatus(file, groupByProp);
       const events = this.getHistoryEvents(file, groupByProp);
-      const segments = this.getSegments(file, events, currentStatus);
+      const segments = [
+        ...this.getSegments(file, events, currentStatus),
+        ...this.getPlannedSegments(file),
+      ];
       const currentRolloutRing = this.getCurrentRolloutRing(file);
       const rolloutEvents = this.getRolloutHistoryEvents(file);
       const rolloutSegments =
@@ -1401,79 +1418,59 @@ export class TimelineView extends BasesView {
   }
 
   private getSegments(
-    file: TFile,
+    _file: TFile,
     events: TimelineEvent[],
     currentStatus: string | null,
   ): TimelineSegment[] {
     const now = new Date();
-    if (events.length === 0) {
-      const start = new Date(file.stat.ctime);
-      const end = this.isCompletedStatus(currentStatus)
-        ? this.getCompletedSegmentEnd(start, new Date(file.stat.mtime))
-        : now;
-      return [
-        {
-          status: currentStatus,
-          start,
-          end,
-        },
-      ];
-    }
-
+    if (events.length === 0) return [];
     const segments: TimelineSegment[] = [];
-    const firstEvent = events[0];
-    const createdAt = new Date(
-      Math.min(file.stat.ctime, firstEvent.at.getTime()),
-    );
-    if (
-      firstEvent.from !== null &&
-      createdAt.getTime() < firstEvent.at.getTime()
-    ) {
-      segments.push({
-        status: firstEvent.from,
-        start: createdAt,
-        end: firstEvent.at,
-      });
-    }
-
     for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
       const event = events[eventIndex];
+      if (event.at > now) continue;
       const nextEvent = events[eventIndex + 1];
-      const status = nextEvent ? event.to : (currentStatus ?? event.to);
+      const status = event.to;
+      const ongoing =
+        !nextEvent &&
+        status === currentStatus &&
+        !this.isCompletedStatus(status);
       segments.push({
         status,
         start: event.at,
         end:
-          nextEvent?.at ??
-          (this.isCompletedStatus(status)
-            ? this.getCompletedSegmentEnd(createdAt, event.at)
-            : now),
+          nextEvent?.at && nextEvent.at <= now
+            ? nextEvent.at
+            : ongoing
+              ? now
+              : event.at,
+        basis: ongoing ? "last-known" : "recorded",
       });
     }
 
     return segments.filter(
-      (segment) => segment.end.getTime() > segment.start.getTime(),
+      (segment) => segment.end.getTime() >= segment.start.getTime(),
     );
+  }
+
+  private getPlannedSegments(file: TFile): TimelineSegment[] {
+    const frontmatter = this.getFrontmatter(file);
+    const startValue = frontmatter?.planned_start;
+    const endValue = frontmatter?.planned_end;
+    if (typeof startValue !== "string") return [];
+    const start = new Date(startValue);
+    const end = typeof endValue === "string" ? new Date(endValue) : start;
+    if (
+      !Number.isFinite(start.getTime()) ||
+      !Number.isFinite(end.getTime()) ||
+      end < start
+    )
+      return [];
+    return [{ status: "Planned", start, end, basis: "planned" }];
   }
 
   private isCompletedStatus(status: string | null): boolean {
     const normalizedStatus = status?.trim().toLowerCase();
     return normalizedStatus === "completed" || normalizedStatus === "done";
-  }
-
-  private getCompletedSegmentEnd(workflowStart: Date, completedAt: Date): Date {
-    const workflowDurationMs = Math.max(
-      0,
-      completedAt.getTime() - workflowStart.getTime(),
-    );
-    const tailMs = Math.max(
-      COMPLETED_SEGMENT_TAIL_MIN_MS,
-      Math.min(
-        COMPLETED_SEGMENT_TAIL_MAX_MS,
-        workflowDurationMs * COMPLETED_SEGMENT_TAIL_RATIO,
-      ),
-    );
-    return new Date(completedAt.getTime() + tailMs);
   }
 
   private getTaskTitle(entry: BasesEntry, file: TFile): string {
@@ -1543,17 +1540,7 @@ export class TimelineView extends BasesView {
   }
 
   private normalizeReference(value: unknown): string | null {
-    const firstValue = Array.isArray(value) ? (value as unknown[])[0] : value;
-    if (typeof firstValue !== "string") return null;
-    let normalized = firstValue.trim();
-    if (!normalized) return null;
-
-    const linkMatch = normalized.match(/^\[\[([^|\]]+)(?:\|[^\]]+)?\]\]$/);
-    if (linkMatch) normalized = linkMatch[1];
-    normalized = normalized.replace(/\.md$/i, "");
-    const slashIndex = normalized.lastIndexOf("/");
-    if (slashIndex >= 0) normalized = normalized.slice(slashIndex + 1);
-    return normalized.toLowerCase();
+    return normalizeGraphReference(value);
   }
 
   private filterTasks(tasks: TimelineTask[]): TimelineTask[] {
@@ -1566,6 +1553,48 @@ export class TimelineView extends BasesView {
   }
 
   private getPools(tasks: TimelineTask[]): TimelinePool[] {
+    const grouping = this.config?.get("timelineSwimlaneProperty");
+    if (
+      typeof grouping === "string" &&
+      grouping.trim() &&
+      grouping !== "parent"
+    ) {
+      const property = grouping.replace(/^note\./, "").trim();
+      const pools = new Map<string, TimelinePool>();
+      for (const task of tasks) {
+        const raw = this.getFrontmatter(task.file)?.[property];
+        const values = Array.isArray(raw) ? raw : [raw];
+        const labels = [
+          ...new Set(
+            values.map((value: unknown) =>
+              typeof value === "string" ||
+              typeof value === "number" ||
+              typeof value === "boolean"
+                ? String(value)
+                : "Unassigned",
+            ),
+          ),
+        ];
+        if (!labels.length) labels.push("Unassigned");
+        for (const label of labels) {
+          const pool = pools.get(label) ?? {
+            id: `${property}:${label}`,
+            title: label,
+            lanes: [],
+          };
+          pool.lanes.push({
+            task,
+            depth: 0,
+            hasChildren: false,
+            segments: task.segments,
+          });
+          pools.set(label, pool);
+        }
+      }
+      return [...pools.values()].sort((first, second) =>
+        first.title.localeCompare(second.title),
+      );
+    }
     const tasksByIdentity = new Map<string, TimelineTask>();
     for (const task of tasks) {
       for (const identity of this.getTaskIdentities(task)) {
@@ -1646,7 +1675,7 @@ export class TimelineView extends BasesView {
       pools.push({
         id: root.task.file.path,
         title: root.task.title,
-        lanes: this.flattenTimelineTree(root.children, 1),
+        lanes: this.flattenTimelineTree([root], 0),
       });
     }
 
@@ -1682,46 +1711,11 @@ export class TimelineView extends BasesView {
         task: node.task,
         depth,
         hasChildren: node.children.length > 0,
-        segments:
-          node.children.length > 0
-            ? this.getAggregateSegments(node)
-            : node.task.segments,
+        segments: node.task.segments,
       });
       lanes.push(...this.flattenTimelineTree(node.children, depth + 1));
     }
     return lanes;
-  }
-
-  private getAggregateSegments(node: TimelineTreeNode): TimelineSegment[] {
-    const childSegments = this.getDescendantSegments(node);
-    if (childSegments.length === 0) return node.task.segments;
-
-    const startTime = Math.min(
-      ...childSegments.map((segment) => segment.start.getTime()),
-    );
-    const endTime = Math.max(
-      ...childSegments.map((segment) => segment.end.getTime()),
-    );
-    if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) {
-      return node.task.segments;
-    }
-
-    return [
-      {
-        status: node.task.currentStatus,
-        start: new Date(startTime),
-        end: new Date(endTime),
-      },
-    ];
-  }
-
-  private getDescendantSegments(node: TimelineTreeNode): TimelineSegment[] {
-    const segments: TimelineSegment[] = [];
-    for (const child of node.children) {
-      segments.push(...child.task.segments);
-      segments.push(...this.getDescendantSegments(child));
-    }
-    return segments;
   }
 
   private compareTimelineTasks(
@@ -1758,15 +1752,14 @@ export class TimelineView extends BasesView {
     const [draggedTask] = orderedTasks.splice(draggedIndex, 1);
     orderedTasks.splice(targetIndex, 0, draggedTask);
 
-    await Promise.all(
-      orderedTasks.map((task, order) =>
-        this.app.fileManager.processFrontMatter(
-          task.file,
-          (frontmatter: Record<string, unknown>) => {
-            frontmatter[TIMELINE_ORDER_PROPERTY] = order;
-          },
-        ),
-      ),
+    await editGraphNotes(
+      this.app,
+      orderedTasks.map((task, order) => ({
+        path: task.file.path,
+        set: { [TIMELINE_ORDER_PROPERTY]: order },
+      })),
+      "Reorder timeline swimlanes",
+      { transitions: [] },
     );
     this.render();
   }
@@ -2130,27 +2123,6 @@ export class TimelineView extends BasesView {
     const duration = range.end.getTime() - range.start.getTime();
     if (duration <= 0) return 0;
     return ((date.getTime() - range.start.getTime()) / duration) * 100;
-  }
-
-  private formatBusinessElapsed(start: Date, end: Date): string {
-    const durationMs = Math.max(0, end.getTime() - start.getTime());
-    if (durationMs < 24 * 60 * 60 * 1000) {
-      return this.formatShortElapsed(durationMs);
-    }
-
-    const businessDays = this.countBusinessDaysInclusive(start, end);
-    const weeks = Math.floor(businessDays / 5);
-    const days = businessDays % 5;
-    const parts: string[] = [];
-
-    if (weeks > 0) {
-      parts.push(`${weeks} ${weeks === 1 ? "week" : "weeks"}`);
-    }
-    if (days > 0 || parts.length === 0) {
-      parts.push(`${days} ${days === 1 ? "day" : "days"}`);
-    }
-
-    return `(${parts.join(" ")})`;
   }
 
   private formatShortElapsed(durationMs: number): string {

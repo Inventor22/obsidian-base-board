@@ -13,6 +13,7 @@ import { NO_VALUE_COLUMN } from "./constants";
 import { ColorPickerModal } from "./tags";
 import { getColumnColor, setColumnColor } from "./status-colors";
 import { generateOrderKey, isOrderKey, OrderValue } from "./order";
+import { editGraphNotes } from "./graph-command-ui";
 
 export class ColumnManager {
   private view: KanbanView;
@@ -433,27 +434,41 @@ export class ColumnManager {
     const groupByProp = this.view.getGroupByProperty();
 
     await this.view.applyBatchUpdate(async () => {
-      // 1. Update column config
+      if (groupByProp && entries.length) {
+        const settings = this.view.plugin.data_.transitionHistory;
+        const changes = entries
+          .filter((entry) => entry.file instanceof TFile)
+          .map((entry) => {
+            const set: Record<string, unknown> = {};
+            this.view.applyGroupByValue(set, groupByProp, newName);
+            return { path: entry.file.path, set };
+          });
+        const receipt = await editGraphNotes(
+          this.view.app,
+          changes,
+          `Rename ${groupByProp} column: ${oldName} -> ${newName}`,
+          {
+            transitions:
+              settings.enabled && settings.propertyName.trim()
+                ? [
+                    {
+                      property: groupByProp,
+                      historyProperty: settings.propertyName.trim(),
+                    },
+                  ]
+                : [],
+          },
+        );
+        if (!receipt) {
+          this.view.scheduleRender();
+          return;
+        }
+        this.view.rememberCommandBatch(receipt);
+      }
       const updatedColumns = columns.map((c) => (c === oldName ? newName : c));
       this.view.saveColumns(updatedColumns);
       this.view.updateColumnPreferences(oldName, newName);
-
-      // 2. Update frontmatter for all cards in this column
-      if (groupByProp) {
-        const updatePromises = entries.map((entry) => {
-          const filePath = entry.file?.path;
-          if (!filePath) return Promise.resolve();
-          const file = this.view.app.vault.getAbstractFileByPath(filePath);
-          if (!file || !(file instanceof TFile)) return Promise.resolve();
-          return this.view.app.fileManager.processFrontMatter(
-            file,
-            (fm: Record<string, unknown>) => {
-              this.view.applyGroupByValue(fm, groupByProp, newName);
-            },
-          );
-        });
-        await Promise.all(updatePromises);
-      }
+      this.view.scheduleRender();
     });
   }
 }

@@ -14,7 +14,7 @@ if (fixtureVault) {
   if (base.filters || JSON.stringify([...(view.filters?.or ?? [])].sort()) !== JSON.stringify(["!graph_order.isEmpty()", "!kanban_order.isEmpty()"]))
     throw new Error("Vault Graph query changed; the fixture selection must be updated.");
   const notes = [];
-  const properties = ["title", "status", "type", "kind", "id", "graph_order", "kanban_order", "graph_collapsed", "graph_locked", "workflow", "executor", "autonomy", "parent", "depends_on", "rollup_to", "compensates", "breaks_to", "restarts_to", "effecting"];
+  const properties = ["title", "status", "type", "kind", "id", "graph_order", "kanban_order", "graph_collapsed", "graph_locked", "workflow", "executor", "autonomy", "parent", "depends_on", "sequence_after", "associations", "dependency_assessments", "suggested_next", "decision", "baseboard_migration", "rollup_to", "compensates", "breaks_to", "restarts_to", "effecting"];
   const nonempty = value => value !== undefined && value !== null && value !== "";
   const visit = async folder => {
     for (const entry of await readdir(folder, { withFileTypes: true })) {
@@ -70,26 +70,50 @@ export class Modal {
     this.app = app;
     this.containerEl = document.createElement('div');
     this.modalEl = this.containerEl;
+    this.titleEl = document.createElement('h3');
+    this.containerEl.append(this.titleEl);
     this.contentEl = document.createElement('div');
     this.containerEl.append(this.contentEl);
   }
   open() {
     window.testModalOpenCount = (window.testModalOpenCount ?? 0) + 1;
-    if (this.snapshot) {
-      this.containerEl.className = 'fixture-recorded-modal';
-      this.containerEl.setAttribute('role', 'dialog');
-      this.containerEl.setAttribute('aria-label', 'Recorded graph item');
-      this.onOpen();
-      document.body.append(this.containerEl);
-      window.recordedModal = this;
-    }
+    this.containerEl.className = 'fixture-recorded-modal';
+    this.containerEl.setAttribute('role', 'dialog');
+    this.onOpen?.();
+    this.containerEl.setAttribute('aria-label', this.titleEl.textContent || this.title || 'Recorded graph item');
+    document.body.append(this.containerEl);
+    window.recordedModal = this;
+    this.escape = event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); this.close(); } };
+    document.addEventListener('keydown', this.escape, true);
   }
-  close() { this.containerEl.remove(); }
+  close() { document.removeEventListener('keydown', this.escape, true); this.onClose?.(); this.containerEl.remove(); }
 }
 export class ButtonComponent {}
 export class WorkspaceLeaf {}
 export class Notice { constructor(message) { window.lastNotice = message; } }
-export class Setting {}
+export class Setting {
+  constructor(parent) { this.element = parent.createDiv({ cls: 'setting-item' }); this.name = this.element.createDiv({ cls: 'setting-item-name' }); this.controls = this.element.createDiv({ cls: 'setting-item-control' }); }
+  setName(value) { this.name.textContent = value; return this; }
+  setDesc(value) { this.element.createEl('small', { text: value }); return this; }
+  setHeading() { return this; }
+  addButton(build) {
+    const element = this.controls.createEl('button', { attr: { type: 'button' } });
+    const component = { buttonEl: element, setButtonText(value) { element.textContent = value; return component; }, setCta() { return component; }, setDisabled(value) { element.disabled = value; return component; }, setIcon(value) { setIcon(element, value); return component; }, onClick(callback) { element.addEventListener('click', callback); return component; } };
+    build(component); return this;
+  }
+  addText(build) { return this.addInput('input', build); }
+  addTextArea(build) { return this.addInput('textarea', build); }
+  addInput(tag, build) {
+    const inputEl = this.controls.createEl(tag, { attr: { 'aria-label': this.name.textContent } });
+    const component = { inputEl, setValue(value) { inputEl.value = value; return component; }, setPlaceholder(value) { inputEl.placeholder = value; return component; }, onChange(callback) { inputEl.addEventListener('input', () => callback(inputEl.value)); return component; } };
+    build(component); return this;
+  }
+  addDropdown(build) {
+    const selectEl = this.controls.createEl('select', { attr: { 'aria-label': this.name.textContent } });
+    const component = { selectEl, addOptions(values) { for (const [value, text] of Object.entries(values)) selectEl.createEl('option', { text, attr: { value } }); return component; }, addOption(value, text) { selectEl.createEl('option', { text, attr: { value } }); return component; }, setValue(value) { selectEl.value = value; return component; }, onChange(callback) { selectEl.addEventListener('change', () => callback(selectEl.value)); return component; } };
+    build(component); return this;
+  }
+}
 export class Menu {
   constructor() { this.items = []; }
   addItem(callback) {
@@ -146,6 +170,8 @@ const client = String.raw`
 import { KanbanView } from './src/kanban-view.ts';
 import { TimelineView } from './src/timeline-view.ts';
 import { GraphView } from './src/graph-view.ts';
+import { RolloutView } from './src/rollout-view.ts';
+import { parse, stringify } from 'yaml';
 import { recordGraphObservation, parseGraphHistory } from './src/graph-history.ts';
 import { TFile, Value, NullValue, ListValue } from 'obsidian';
 
@@ -221,6 +247,32 @@ const app = {
   },
   workspace: { trigger() {}, iterateAllLeaves() {}, getMostRecentLeaf() { return null; }, getLeaf() { return { openFile() {} }; } },
 };
+function memoryVault(properties, files, updated) {
+  const documents = new Map();
+  const bodies = new Map();
+  const read = file => '---\n' + stringify(properties.get(file.path)) + '---\n' + (bodies.get(file.path) ?? 'Synthetic fixture note.\n');
+  const save = (file, content) => {
+    const match = /^---\n([\s\S]*?)\n---\n/.exec(content);
+    if (!match) throw new Error('Fixture expected YAML');
+    properties.set(file.path, parse(match[1]));
+    bodies.set(file.path, content.slice(match[0].length));
+    updated();
+  };
+  return {
+    read: async file => read(file),
+    process: async (file, update) => save(file, update(read(file))),
+    modify: async (file, content) => save(file, content),
+    create: async (filename, content) => { const file = new TFile(filename); files.push(file); save(file, content); return file; },
+    adapter: {
+      exists: async filename => documents.has(filename),
+      mkdir: async filename => { documents.set(filename, ''); },
+      read: async filename => documents.get(filename),
+      write: async (filename, content) => { documents.set(filename, content); },
+      rename: async (source, target) => { documents.set(target, documents.get(source)); documents.delete(source); },
+    },
+  };
+}
+Object.assign(app.vault, memoryVault(properties, files, () => refresh()));
 const plugin = {
   data_: { transitionHistory: { enabled: true, propertyName: 'status_history' }, timeline: { weekStartDay: 1 }, graphHistories: {} },
   getColumnConfig: () => null, saveColumnConfig: async () => {},
@@ -253,7 +305,20 @@ view.render();
 
 window.baseboardTest = {
   view, properties, configValues, refresh,
-  showBoard() { document.querySelector('#timeline').hidden = true; host.hidden = false; view.render(); },
+  showBoard() { document.querySelector('#timeline').hidden = true; document.querySelector('#graph-host').hidden = true; host.hidden = false; view.render(); },
+  showFullTimeline(property = 'parent') {
+    host.hidden = true; document.querySelector('#graph-host').hidden = true;
+    const surface = document.querySelector('#timeline'); surface.hidden = false; surface.empty(); surface.style.height = '100vh';
+    configValues.set('timelineSwimlaneProperty', property);
+    const timeline = new TimelineView({ app, config, data: { data: entries } }, surface, plugin);
+    timeline.render(); this.timeline = timeline; return timeline.getTasks('status').length;
+  },
+  showRollout() {
+    host.hidden = true; document.querySelector('#graph-host').hidden = true;
+    const surface = document.querySelector('#timeline'); surface.hidden = false; surface.empty(); surface.style.height = '100vh';
+    const rollout = new RolloutView({ app, config, data: { data: entries } }, surface, plugin);
+    rollout.render(); this.rollout = rollout;
+  },
   showTimeline(stop) {
     const durations = { '1w': 7, '1mo': 31, '3mo': 93, '6mo': 186, '1y': 365, '5y': 1825 };
     host.hidden = true;
@@ -311,11 +376,44 @@ const graphApp = {
   metadataCache: { getFileCache: file => ({ frontmatter: graphProperties.get(file.path) }) },
   fileManager: { processFrontMatter: async (file, update) => { graphNoteWrites += 1; update(graphProperties.get(file.path)); graphView.onDataUpdated(); } },
 };
+Object.assign(graphApp.vault, memoryVault(graphProperties, graphFiles, () => { graphNoteWrites += 1; graphView.onDataUpdated(); }));
 const graphHost = document.querySelector('#graph-host');
 const graphView = new GraphView({ app: graphApp, config: graphConfig, data: { data: graphEntries } }, graphHost, plugin);
 window.graphTest = {
   view: graphView, properties: graphProperties, settings: graphSettings,
   get noteWrites() { return graphNoteWrites; },
+  seedWorkExample() {
+    const now = new Date(); const earlier = new Date(now.getTime() - 86400000).toISOString();
+    const notes = [
+      ['Dustin.md', { id: 'scope-dustin', title: 'Dustin', kind: 'group', status: 'In Progress' }],
+      ['Rollout.md', { id: 'rollout', title: 'Release rollout', parent: '[[Dustin]]', kind: 'process', status: 'In Progress' }],
+      ['Stage.md', { id: 'stage', title: 'Stage', parent: '[[Rollout]]', status: 'In Progress', owner: 'Dustin', status_history: [{ from: 'Planned', to: 'In Progress', at: earlier, property: 'status' }] }],
+      ['Healthy zones.md', { id: 'healthy', title: 'Healthy zones baked', parent: '[[Stage]]', status: 'Completed', status_history: [{ from: 'In Progress', to: 'Completed', at: earlier, property: 'status' }] }],
+      ['Broken zone.md', { id: 'residual', title: 'Repair broken west zone', parent: '[[Stage]]', status: 'Failed', owner: 'Dustin', suggested_next: [{ scope: 'rollout', rank: 1, by: 'Dustin', at: earlier, reason: 'Residual zone needs repair; promotion does not resolve it.', evidence: ['[[Stage#Zone evidence]]'] }] }],
+      ['Canary.md', { id: 'canary', title: 'Canary', parent: '[[Rollout]]', status: 'Planned', sequence_after: ['[[Stage]]'], depends_on: ['[[Stage]]'], owner: 'Copilot', rollout_enabled: true, rollout_ring: 'Stage', decision: { reason: 'Stage mostly deployed and baked sufficiently; west zone remains broken.', evidence: ['[[Stage#Bake evidence]]'], by: 'Dustin', at: earlier }, dependency_assessments: [{ source: '[[Stage]]', action: 'promote-canary', assessment: 'waived', by: 'Dustin', at: earlier, reason: 'Sufficient bake with residual tracked separately.', evidence: ['[[Broken zone]]'] }] }],
+      ['Pilot.md', { id: 'pilot', title: 'Pilot', parent: '[[Rollout]]', status: 'Planned', sequence_after: ['[[Canary]]'], owner: 'Copilot', planned_start: now.toISOString(), planned_end: new Date(now.getTime() + 86400000).toISOString() }],
+      ['Broad.md', { id: 'broad', title: 'Broad', parent: '[[Rollout]]', status: 'Planned', sequence_after: ['[[Pilot]]'], associations: ['[[Broken zone]]'] }],
+      ['Recovery.md', { id: 'recovery', title: 'Optional recovery work', parent: '[[Stage]]', status: 'Planned', compensates: ['[[Healthy zones]]'] }],
+    ];
+    graphProperties.clear(); graphFiles.length = 0; graphEntries.length = 0;
+    properties.clear(); files.length = 0; entries.length = 0;
+    for (const [filename, metadata] of notes) {
+      metadata.graph_order = graphFiles.length; metadata.kanban_order = 'a' + graphFiles.length;
+      for (const [values, fileList, entryList] of [[graphProperties, graphFiles, graphEntries], [properties, files, entries]]) {
+        values.set(filename, structuredClone(metadata));
+        const file = new TFile(filename); fileList.push(file);
+        entryList.push({ file, getValue: key => { const value = values.get(filename)[key.replace(/^(note|formula)\./, '')]; return value == null ? new NullValue() : new Value(value); } });
+      }
+    }
+    graphSettings.set('graphRoot', 'scope-dustin');
+    graphSettings.set('graphOverviewFocus', '@all');
+    graphSettings.set('graphOverviewExpanded', notes.map(([filename]) => filename));
+    graphSettings.set('graphPresentation', 'physics');
+    graphSettings.set('graphSequenceFolds', []);
+    graphView.temporalRecordingEnabled = false;
+    graphView.temporalCursor = null;
+    refresh(); this.show(); return notes.length;
+  },
   async loadVaultGraph() {
     const response = await fetch('/vault-graph.json');
     if (!response.ok) throw new Error('Start the fixture with --vault to load a read-only graph snapshot.');
@@ -401,7 +499,7 @@ window.graphTest = {
 };
 `;
 
-const output = await build({
+const compileFixture = () => build({
   stdin: { contents: client, resolveDir: process.cwd(), sourcefile: "browser-fixture.js" },
   bundle: true,
   format: "iife",
@@ -417,16 +515,15 @@ const output = await build({
 
 const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Base Board integration fixture</title><link rel="stylesheet" href="/styles.css"><style>
 :root { --background-primary:#fff; --background-secondary:#f5f5f5; --background-secondary-alt:#eee; --background-modifier-border:#d5d5d5; --background-modifier-hover:#eee; --text-normal:#202020; --text-muted:#666; --text-faint:#888; --text-error:#bc3131; --interactive-accent:#267ca5; --text-on-accent:#fff; --font-ui-small:13px; --font-ui-smaller:11px; --font-semibold:600; --radius-s:4px; --radius-m:6px; --color-blue:#3977d4; --color-green:#378252; --color-purple:#8665b5; }
-* { box-sizing:border-box; } body { margin:0; font:14px sans-serif; } #host,#graph-host { height:100vh; overflow:auto; } [hidden] { display:none !important; } .svg-icon { display:inline-block; width:14px; height:14px; } button,input { font:inherit; } #timeline { height:400px; position:relative; --timeline-label-width:240px; } .base-board-timeline-content { height:340px; } .fixture-recorded-modal { position:fixed; inset:100px 25%; padding:24px; background:white; box-shadow:0 0 0 100vmax #0006; z-index:100; overflow:auto; } </style></head><body><div id="host"></div><div id="graph-host" hidden></div><div id="timeline" class="base-board-timeline" hidden></div><script src="/fixture.js"></script></body></html>`;
-const stylesheet = await readFile("styles.css", "utf8");
+* { box-sizing:border-box; } body { margin:0; font:14px sans-serif; } #host,#graph-host { height:100vh; overflow:auto; } [hidden] { display:none !important; } .svg-icon { display:inline-block; width:14px; height:14px; } button,input,textarea { font:inherit; } #timeline { height:400px; position:relative; --timeline-label-width:240px; } .base-board-timeline-content { height:340px; } .fixture-recorded-modal { position:fixed; inset:80px 22%; padding:24px; background:var(--background-primary); color:var(--text-normal); box-shadow:0 0 0 100vmax #0006; z-index:100; overflow:auto; } .setting-item { display:flex; justify-content:space-between; gap:16px; margin:12px 0; } .setting-item-control { display:flex; gap:8px; max-width:75%; } .setting-item-control textarea { width:300px; height:70px; } </style></head><body><div id="host"></div><div id="graph-host" hidden></div><div id="timeline" class="base-board-timeline" hidden></div><script src="/fixture.js"></script></body></html>`;
 const cover = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6r1sAAAAASUVORK5CYII=", "base64");
-const server = createServer((request, response) => {
+const server = createServer(async (request, response) => {
   const routes = {
     "/": ["text/html", html],
-    "/fixture.js": ["text/javascript", output.outputFiles[0].text],
-    "/styles.css": ["text/css", stylesheet],
     "/cover.png": ["image/png", cover],
   };
+  if (request.url === "/fixture.js") routes["/fixture.js"] = ["text/javascript", (await compileFixture()).outputFiles[0].text];
+  if (request.url === "/styles.css") routes["/styles.css"] = ["text/css", await readFile("styles.css", "utf8")];
   if (vaultGraph) routes["/vault-graph.json"] = ["application/json", vaultGraph];
   const route = routes[request.url];
   response.writeHead(route ? 200 : 404, { "Content-Type": route?.[0] ?? "text/plain" });

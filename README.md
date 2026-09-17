@@ -7,10 +7,10 @@
 
 # Base Board
 
-**Base Board** is an interactive, property-driven Kanban board view for [Obsidian Bases](https://obsidian.md). It allows you to organize your notes into visual columns based on any property in your frontmatter, providing a seamless drag-and-drop experience for managing tasks and structured data.
+**Base Board** is Dustin's personal, agent-maintained work graph for [Obsidian Bases](https://obsidian.md), with Graph, Kanban, Timeline, and Rollout views over Markdown notes. It records what happened, what is happening, and what may happen next. It is not a workflow execution engine.
 
 This development fork integrates upstream `2.5.1` and adds Timeline, Rollout,
-Graph, and active-frontier workflows. The community release described under
+Graph, and reviewed local agent commands. The community release described under
 Installation does not include these fork-specific extensions. The current
 implementation and remaining roadmap are tracked in [GRAPH_ARCHITECTURE_PLAN.md](GRAPH_ARCHITECTURE_PLAN.md).
 
@@ -31,8 +31,11 @@ implementation and remaining roadmap are tracked in [GRAPH_ARCHITECTURE_PLAN.md]
 - **Hover Preview**: Native note previews on hover (uses the **Page preview** core plugin).
 - **One-Click Creation**: Add new notes directly to a specific column without leaving the board view.
 - **Transition History**: Optionally append timestamped frontmatter entries when cards move between columns.
-- **Timeline View**: Visualize task lifecycle history as zoomable swimlanes grouped by parent task.
-- **Graph View**: Explore the full work graph with requirement and gated-successor relationships.
+- **Timeline View**: Distinguish planned dates from recorded history in configurable swimlanes.
+- **Graph View**: Explore containment, sequence, specific dependencies, associations, scopes, and recovery relationships.
+- **Local Status Edits**: Change only the named item, including containers. Counts and possible blockers remain separate.
+- **Suggested Next**: Persist ordered, scoped recommendations with reasons and provenance, without excluding other work.
+- **Reviewed Batches**: Preview multi-item edits, check revisions, record attribution, and undo without overwriting unrelated changes.
 - **Rollout View**: Track rollout rings independently from task status and Kanban order.
 - **WIP Limits**: Set per-column work-in-progress limits via the column header context menu. Columns that exceed their limit are highlighted in red.
 - **Collapsible Columns**: Collapse any column to save space; the state is remembered per board.
@@ -63,11 +66,19 @@ For example, moving a card from `In Progress` to `In Review` on a board grouped 
 
 ```yaml
 status_history:
-  - from: In Progress
+  - id: evt-example
+    node: task-example
+    kind: transition
+    from: In Progress
     to: In Review
     at: 2026-05-29T20:12:49.000Z
     property: status
-    source: baseboard-drag-drop
+    source: baseboard-command
+    causedBy: human
+    by: Dustin
+    batchId: ui-example
+    reason: Record the reported review state.
+    evidence: []
 ```
 
 Moves into or out of the no-value column are recorded as `null`. Reordering cards inside the same column does not add a history entry.
@@ -80,7 +91,9 @@ Base Board assigns visually distinct default colors to common Kanban columns suc
 
 Base Board also provides a `Timeline` Bases view for visualizing lifecycle history. Each task appears as a horizontal swimlane, and each lane is colored by the task phase recorded in `status_history`. Day, Week, Month, and Year buttons are shortcuts into 22 zoom stops, with the same tag filter pattern used by the Kanban view. Hold `Ctrl` or `Cmd` while scrolling over the timeline to step through the zoom stops.
 
-The timeline uses the same group-by property as the board, so a board grouped by `status` will visualize status transitions. Tasks without transition history still appear as a single segment from the note creation time to now using the current group-by value.
+The timeline uses the configured group-by property, normally `status`. Tasks without recorded transitions remain visible but have no invented past span. File creation and modification times are not activity evidence. Open tails are labeled as last-recorded state with unverified continuity, not actual duration.
+
+`planned_start` and `planned_end` draw separate dashed planned bars. Set the Timeline view option `timelineSwimlaneProperty` to `owner`, `project`, `rollup_to`, `rollout_ring`, or another property; the default `parent` retains hierarchical lanes. Container lanes use their own recorded events, not their children's inferred duration.
 
 Drag timeline lanes vertically to save a custom timeline order. This writes `timeline_order` to the affected task notes and does not change their Kanban column order.
 
@@ -94,18 +107,17 @@ If a task has children, the Timeline renders it as a parent lane and recursively
 
 Use a parent property for feature/subtask relationships instead of a tag. Tags are best for filtering and cross-cutting labels; `parent` is better for hierarchy because it points to one owning feature task. Child relationships are inferred from `parent`, so separate child tags are not needed.
 
-### Active Frontier Kanban
+### Suggested Next
 
-Use the **All cards / Active frontier** toggle to switch between the editable
-status board and a derived projection of actionable leaf work. The frontier
-shows active, awaiting, blocked, or failed leaves, plus recent completion and
-blocking history. Group containers and impact nodes do not become work cards.
+Use **All cards / Suggested Next** to switch between the editable board and
+persisted recommendations. Each note's `suggested_next` entries carry scope,
+rank, reason, author, timestamp, and evidence. Cards keep exact recorded status
+columns. Recommendations persist until explicitly changed; they are not a
+computed frontier, a daily priority reset, or permission to execute the work.
 
-Choose a scope to narrow the projection and pin cards into a daily priority
-order for that scope. Priorities live in view configuration, not task metadata.
-Compensations remain dormant until a completed effect needs rollback following
-a failure in its containing scope; missing targets do not make them ordinary work.
-The Graph and Kanban views use the same state derivation.
+The Graph node menu can add suggestions; Graph and Kanban read the same entries.
+All Cards and the full graph remain accessible. Recovery tasks remain visible
+without being automatically activated by another task's failure.
 
 ### Graph View
 
@@ -121,10 +133,12 @@ and tasks remain small readable cards. Repeated single-child process layers fold
 into clickable title trails. The note icon opens a note without expanding it.
 Collapse-all and expand-all apply to the selected scope.
 
-Containers show completed/total work items and icon-based activity counts:
-a green circled check for completed, yellow clock for awaiting, red alert octagon
-for attention, blue circled right arrow for running, and teal play circle for
-ready work. Status words live in tooltips and accessible labels rather than
+Collapse pulls the leaves inward before their parent nodes; expansion reveals
+parents before children. Reduced-motion settings skip the animation.
+
+Containers retain their own explicitly recorded status and separately show completed/total work items and colored activity counts:
+green for completed, yellow for awaiting, red for attention, blue for running,
+with recommendations and dependency assessments kept advisory. Status words live in tooltips and accessible labels rather than
 repeating on each card. Hidden descendants still contribute to progress and attention.
 Impact nodes are excluded from completion counts; live rollbacks are reported
 separately. Only completed work fills the green progress bar: `0 / n` stays empty.
@@ -144,14 +158,21 @@ depends_on:
   - [[Enable using pfgold]]
 ```
 
-`parent` creates a requirement relationship below the current node. `depends_on` creates a gated successor relationship to the right: the successor waits until its dependency is completed. The graph highlights active frontier nodes, muted completed nodes, waiting nodes, and blocked nodes using the same status colors as the Kanban board.
+`parent` expresses ownership. `sequence_after` expresses normal ordering, while `depends_on` expresses a specific requirement. Neither triggers status changes or prevents recording activity. Action-specific `dependency_assessments` can be unresolved, satisfied, or waived with provenance; satisfying a requirement does not complete its source note. `associations` adds context without execution implications.
+
+**Fold downstream sequence** hides later sequence items without reparenting them; containment collapse remains a separate action. **Unfold downstream sequence** reverses it.
 
 In **Free layout**, click a graph node to open its card detail modal. Right-click empty graph space to create a node or insert a top-level feature template. Right-click a node to create a child node, insert relevant downstream templates, or delete the node with graph reference cleanup. Hover near a node boundary to reveal a link anchor, then drag to another node to create a subprocess, dependency/gating, break, or restart link. New graph nodes are Markdown notes with normal task frontmatter, so they immediately participate in Kanban, Timeline, and Graph views.
 
-`rollup_to` adds scope membership, and `compensates` declares an out-of-band
-rollback. `kind: impact` keeps an observational node visible without making it
-participate in work execution. Layout positions and undoable Organize actions
-are stored in the view configuration.
+`rollup_to` adds scope membership; `compensates` declares possible recovery work.
+Any node kind can have a recorded status. A red dashed impact path does not
+assert that its ancestors failed. Layout positions and undoable Organize actions
+remain in view configuration.
+
+For example, Stage can remain In Progress with a broken-zone residual while
+Canary becomes In Progress. Record the promotion rationale/evidence on the note
+or as decision metadata; no approval node or automatic predecessor completion
+is required. See [GRAPH_SEMANTICS_SPEC.md](GRAPH_SEMANTICS_SPEC.md).
 
 ### Physics Experiment
 
@@ -159,6 +180,9 @@ Select the orbit icon in Graph to try **Physics layout (experimental)**. Visible
 owning and execution links act as springs; cross-branch information links do not.
 Nodes repel one another, including terminal children and rollback tasks. Circles
 use state colors and numeric summaries without state badges.
+
+Routes avoid node interiors and prefer paths with fewer edge crossings. Dense
+graphs can still have crossings; relationships are never removed just to hide them.
 
 The Physics toolbar offers four layouts: **Workflow**, **Hanging** (downward),
 **Growing** (upward), and **Radial** (around the root). The configured root stays
@@ -200,7 +224,26 @@ edits do not become progress events, and notes are not copied each day.
 
 Journals are stored in plugin data, so include plugin settings in your backups.
 Timelapse playback, document revision history, and focus/result tracking remain
-future work. The existing Timeline and `status_history` are unchanged.
+future work. Existing transition records are preserved; undo appends a reversal
+instead of erasing history. New snapshots can record decisions, assessments,
+suggestions, and relationship metadata without backfilling older frames.
+
+### Local Agent Editing and Migration
+
+Copilot in VS Code can query, preview, apply, and undo explicit graph changes
+using [the local command interface](GRAPH_AGENT_MCP_PLAN.md). No hosted agent,
+scheduler, or MCP server is needed. Editable guidance is in
+[AI-INSTRUCTIONS-TEMPLATE.md](AI-INSTRUCTIONS-TEMPLATE.md).
+
+Before migrating an existing vault, run the read-only inventory. Migration
+backs up notes, all Bases configurations, and plugin data; it preserves unknown
+fields, IDs, Markdown, layouts, and old history. Legacy dependency meanings and
+possibly stale container statuses are retained and flagged, never guessed away.
+Reruns are idempotent. Use the native app path for an open vault; offline writes
+require Obsidian closed. See [WORK_GRAPH_DELIVERY.md](WORK_GRAPH_DELIVERY.md).
+
+Graph edits are not production actions. A status, assessment, or recommendation
+does not authorize deployment, flag changes, or bypass other safeguards.
 
 ### Card Ordering
 

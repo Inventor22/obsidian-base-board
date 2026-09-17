@@ -3,6 +3,7 @@ import { icons } from "lucide";
 import { buildFrontierGraph, type FrontierRawNode } from "../src/graph-engine";
 import {
   connectOverviewToRoot,
+  planOverviewTransition,
   getGraphStateVisual,
   getOverviewCompletion,
   getOverviewSummaryState,
@@ -49,6 +50,87 @@ function hierarchy() {
 }
 
 describe("hierarchical graph overview", () => {
+  it("collapses deepest visible children first and expands in the opposite order", () => {
+    const nodes = hierarchy();
+    const visible = new Set(nodes.map((node) => node.key));
+    const changed = new Set(["process", "done", "running"]);
+    const collapse = planOverviewTransition(
+      nodes[1],
+      changed,
+      visible,
+      (node) => node.key,
+      false,
+    );
+    const expand = planOverviewTransition(
+      nodes[1],
+      changed,
+      visible,
+      (node) => node.key,
+      true,
+    );
+    expect(collapse.find((step) => step.key === "done")).toMatchObject({
+      parentKey: "process",
+      delay: 0,
+    });
+    expect(
+      collapse.find((step) => step.key === "process")!.delay,
+    ).toBeGreaterThan(0);
+    expect(expand.find((step) => step.key === "process")).toMatchObject({
+      parentKey: "feature",
+      delay: 0,
+    });
+    expect(expand.find((step) => step.key === "done")!.delay).toBeGreaterThan(
+      0,
+    );
+    expect(collapse.map((step) => step.key).sort()).toEqual(
+      [...changed].sort(),
+    );
+    expect(collapse.every((step) => step.delay + step.duration <= 660)).toBe(
+      true,
+    );
+  });
+
+  it("leaves shared visible nodes alone and skips hidden wrappers in animation paths", () => {
+    const nodes = hierarchy();
+    const steps = planOverviewTransition(
+      nodes[0],
+      new Set(["running"]),
+      new Set(["scope", "feature", "running"]),
+      (node) => node.key,
+      false,
+    );
+    expect(steps).toEqual([
+      {
+        key: "running",
+        parentKey: "feature",
+        depth: 2,
+        delay: 0,
+        duration: 180,
+      },
+    ]);
+    expect(nodes[2].children.map((node) => node.key)).toEqual([
+      "done",
+      "running",
+    ]);
+  });
+
+  it("bounds animation planning through hierarchy cycles", () => {
+    const nodes = buildFrontierGraph([
+      row("root", { kindExplicit: "group", rollupToKeys: ["scope"] }),
+      row("scope", { kindExplicit: "group", rollupToKeys: ["root"] }),
+      row("task", { rollupToKeys: ["scope"] }),
+    ]);
+    const steps = planOverviewTransition(
+      nodes[0],
+      new Set(["scope", "task"]),
+      new Set(nodes.map((node) => node.key)),
+      (node) => node.key,
+      false,
+    );
+    expect(steps).toHaveLength(2);
+    expect(new Set(steps.map((step) => step.key)).size).toBe(2);
+  });
+
   const clusterOptions = {
     viewportWidth: 1100,
     width: 220,
@@ -319,7 +401,7 @@ describe("hierarchical graph overview", () => {
     expect(nodes[0].state).toBe(state);
   });
 
-  it("excludes dormant rollbacks and reports triggered mitigation separately", () => {
+  it("keeps recovery visible and counts only recorded recovery activity", () => {
     const nodes = buildFrontierGraph([
       row("ring"),
       row("enable", { parentKey: "ring", status: "Completed" }),
@@ -330,10 +412,12 @@ describe("hierarchical graph overview", () => {
       total: 2,
       completed: 1,
       blocked: 1,
-      mitigations: 1,
+      mitigations: 0,
     });
+    nodes[3].state = "active";
+    expect(summarizeGraphWork(nodes[0]).mitigations).toBe(1);
     nodes[3].state = "idle";
-    expect(projectOverview(nodes, new Set()).visible).not.toContain(nodes[3]);
+    expect(projectOverview(nodes, new Set()).visible).toContain(nodes[3]);
   });
 
   it("does not prune or mutate the underlying work graph", () => {

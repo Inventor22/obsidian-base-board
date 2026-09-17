@@ -19,11 +19,8 @@ export const CONFIG_KEY_OPEN_BEHAVIOR = "cardOpenBehavior";
 /** Key used by BasesViewConfig.set/get to choose which hierarchy nodes appear on Kanban. */
 export const CONFIG_KEY_BOARD_PROJECTION = "boardProjection";
 
-/** Key used by BasesViewConfig.set/get to persist the active frontier lens scope (Step E). */
-export const CONFIG_KEY_FRONTIER_SCOPE = "frontierScope";
-
-/** Key used by BasesViewConfig.set/get to persist the ephemeral per-(scope, day) frontier priority overlay (Step F). */
-export const CONFIG_KEY_FRONTIER_PRIORITY = "frontierPriority";
+/** Selected recommendation scope; recommendations themselves live in notes. */
+export const CONFIG_KEY_FRONTIER_SCOPE = "suggestedNextScope";
 
 /** Key used by BasesViewConfig.set/get to persist column colors in the .base file. */
 export const CONFIG_KEY_COLUMN_COLORS = "columnColors";

@@ -9,14 +9,7 @@ import {
 import type BaseBoardPlugin from "./main";
 import { DragDropManager } from "./drag-drop";
 import { CardDetailModal } from "./card-detail-modal";
-
-interface RolloutHistoryEntry {
-  from: string | null;
-  to: string | null;
-  at: string;
-  property: "rollout_ring";
-  source: "baseboard-rollout-board";
-}
+import { editGraphNotes } from "./graph-command-ui";
 
 interface RolloutItem {
   entry: BasesEntry;
@@ -265,51 +258,33 @@ export class RolloutView extends BasesView {
     const nextRing = this.normalizeRing(targetColumn);
 
     await this.applyBatchUpdate(async () => {
-      await this.updateRolloutRing(file, nextRing);
-      await Promise.all(
-        orderedPaths.map((orderedPath, order) => {
-          const orderedFile = this.app.vault.getAbstractFileByPath(orderedPath);
-          if (!(orderedFile instanceof TFile)) return Promise.resolve();
-          return this.app.fileManager.processFrontMatter(
-            orderedFile,
-            (frontmatter: Record<string, unknown>) => {
-              frontmatter[ROLLOUT_ORDER_PROPERTY] = order;
+      const paths = [...new Set([...orderedPaths, filePath])];
+      await editGraphNotes(
+        this.app,
+        paths.map((path, order) => ({
+          path,
+          set:
+            path === filePath
+              ? {
+                  [ROLLOUT_ORDER_PROPERTY]: order,
+                  [ROLLOUT_ENABLED_PROPERTY]: true,
+                  [ROLLOUT_RING_PROPERTY]: nextRing,
+                }
+              : { [ROLLOUT_ORDER_PROPERTY]: order },
+        })),
+        `Record rollout ring: ${file.basename} -> ${nextRing}`,
+        {
+          transitions: [
+            {
+              property: ROLLOUT_RING_PROPERTY,
+              historyProperty: ROLLOUT_HISTORY_PROPERTY,
             },
-          );
-        }),
+          ],
+        },
       );
     });
 
     this.render();
-  }
-
-  private async updateRolloutRing(
-    file: TFile,
-    nextRing: string,
-  ): Promise<void> {
-    await this.app.fileManager.processFrontMatter(
-      file,
-      (frontmatter: Record<string, unknown>) => {
-        const previousRing = this.normalizeRing(
-          frontmatter[ROLLOUT_RING_PROPERTY],
-        );
-        if (previousRing === nextRing) return;
-
-        frontmatter[ROLLOUT_ENABLED_PROPERTY] = true;
-        frontmatter[ROLLOUT_RING_PROPERTY] = nextRing;
-        const history = Array.isArray(frontmatter[ROLLOUT_HISTORY_PROPERTY])
-          ? (frontmatter[ROLLOUT_HISTORY_PROPERTY] as unknown[])
-          : [];
-        const record: RolloutHistoryEntry = {
-          from: previousRing === "None" ? null : previousRing,
-          to: nextRing === "None" ? null : nextRing,
-          at: new Date().toISOString(),
-          property: ROLLOUT_RING_PROPERTY,
-          source: "baseboard-rollout-board",
-        };
-        frontmatter[ROLLOUT_HISTORY_PROPERTY] = [...history, record];
-      },
-    );
   }
 
   private getFrontmatter(file: TFile): Record<string, unknown> | undefined {

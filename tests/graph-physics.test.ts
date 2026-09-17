@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   GraphPhysics,
+  countGraphRouteCrossings,
+  flattenGraphPhysicsCurve,
   GRAPH_PHYSICS_SPACING,
   layoutGraphPhysics,
   routeGraphPhysicsEdge,
@@ -18,6 +20,94 @@ function distance(nodes: GraphPhysicsNode[]): number {
 }
 
 describe("experimental graph physics", () => {
+  it("seeds a connected sequence component without dropping its ordering links", () => {
+    const nodes = ["root", "stage", "canary", "pilot", "broad"].map(
+      (id, index) => ({
+        id,
+        x: 0,
+        y: 0,
+        width: 144,
+        height: 144,
+        fixed: index === 0,
+      }),
+    );
+    const links = [
+      { source: "root", target: "stage", kind: "association", spring: true },
+      { source: "stage", target: "canary", kind: "sequence", spring: true },
+      { source: "canary", target: "pilot", kind: "sequence", spring: true },
+      { source: "pilot", target: "broad", kind: "sequence", spring: true },
+    ];
+    const positions = layoutGraphPhysics(nodes, links, 1440);
+    expect(positions).toHaveLength(nodes.length);
+    expect(
+      positions.every(
+        (node) => Number.isFinite(node.x) && Number.isFinite(node.y),
+      ),
+    ).toBe(true);
+    expect(positions.find((node) => node.id === "root")).toMatchObject({
+      x: 0,
+      y: 0,
+    });
+  });
+
+  it("routes around an existing unrelated edge instead of crossing it", () => {
+    const nodes = [
+      { id: "north-west", x: 0, y: 0, width: 144, height: 144 },
+      { id: "south-east", x: 500, y: 500, width: 144, height: 144 },
+      { id: "south-west", x: 0, y: 500, width: 144, height: 144 },
+      { id: "north-east", x: 500, y: 0, width: 144, height: 144 },
+    ];
+    const first = routeGraphPhysicsEdge(nodes[0], nodes[1], "gating", nodes);
+    const reserved = [
+      {
+        source: nodes[0].id,
+        target: nodes[1].id,
+        points: flattenGraphPhysicsCurve(first),
+      },
+    ];
+    const direct = routeGraphPhysicsEdge(nodes[2], nodes[3], "gating", nodes);
+    expect(
+      countGraphRouteCrossings(flattenGraphPhysicsCurve(direct), reserved),
+    ).toBe(1);
+    const routed = routeGraphPhysicsEdge(
+      nodes[2],
+      nodes[3],
+      "gating",
+      nodes,
+      0,
+      reserved,
+    );
+    const points = flattenGraphPhysicsCurve(routed);
+    expect(points.length).toBeGreaterThan(1);
+    expect(countGraphRouteCrossings(points, reserved)).toBe(0);
+    expect(
+      routeGraphPhysicsEdge(
+        nodes[2],
+        nodes[3],
+        "gating",
+        [...nodes].reverse(),
+        0,
+        reserved,
+      ),
+    ).toEqual(routed);
+  });
+
+  it("keeps paired forward and return tracks together while avoiding other paths", () => {
+    const parent = { id: "parent", x: 0, y: 0, width: 144, height: 144 };
+    const child = { ...parent, id: "child", x: 200 };
+    const forward = routeGraphPhysicsEdge(parent, child, "gating");
+    const expected = routeGraphPhysicsEdge(child, parent, "failure-trace");
+    expect(
+      routeGraphPhysicsEdge(child, parent, "failure-trace", [], 0, [
+        {
+          source: parent.id,
+          target: child.id,
+          points: flattenGraphPhysicsCurve(forward),
+        },
+      ]),
+    ).toEqual(expected);
+  });
+
   it.each(["workflow", "hanging", "growing", "radial"] as GraphPhysicsLayout[])(
     "shortens visible spring gaps in %s without changing node size or root position",
     (mode) => {
@@ -419,16 +509,45 @@ describe("experimental graph physics", () => {
     const source = { id: "source", x: 0, y: 0, width: 144, height: 144 };
     const target = { ...source, id: "target", x: 900 };
     const obstacles = [-300, -150, 0, 150, 300].map((y, index) => ({
-      ...source, id: `obstacle-${index}`, x: 420, y,
+      ...source,
+      id: `obstacle-${index}`,
+      x: 420,
+      y,
     }));
     const curve = routeGraphPhysicsEdge(source, target, "gating", obstacles);
-    for (let sample = 0; sample <= 500; sample += 1) {
-      const time = sample / 500;
+    expect(curve.waypoints!.length).toBeGreaterThan(2);
+    for (let segment = 1; segment < curve.waypoints!.length; segment += 1) {
+      const start = curve.waypoints![segment - 1];
+      const end = curve.waypoints![segment];
+      for (let sample = 0; sample <= 100; sample += 1) {
+        const time = sample / 100;
+        const x = start.x + (end.x - start.x) * time;
+        const y = start.y + (end.y - start.y) * time;
+        for (const obstacle of obstacles)
+          expect(
+            Math.hypot(x - obstacle.x - 72, y - obstacle.y - 72),
+          ).toBeGreaterThan(82);
+      }
+    }
+  });
+
+  it("detects small obstacles between sample points on long links", () => {
+    const source = { id: "source", x: 0, y: 0, width: 144, height: 144 };
+    const target = { ...source, id: "target", x: 12000 };
+    const obstacle = { ...source, id: "middle", x: 6280 };
+    const curve = routeGraphPhysicsEdge(source, target, "gating", [obstacle]);
+    for (let sample = 0; sample <= 12000; sample += 1) {
+      const time = sample / 12000;
       const inverse = 1 - time;
-      const x = inverse * inverse * curve.start.x + 2 * inverse * time * curve.control.x + time * time * curve.end.x;
-      const y = inverse * inverse * curve.start.y + 2 * inverse * time * curve.control.y + time * time * curve.end.y;
-      for (const obstacle of obstacles)
-        expect(Math.hypot(x - obstacle.x - 72, y - obstacle.y - 72)).toBeGreaterThan(82);
+      const x =
+        inverse * inverse * curve.start.x +
+        2 * inverse * time * curve.control.x +
+        time * time * curve.end.x;
+      const y =
+        inverse * inverse * curve.start.y +
+        2 * inverse * time * curve.control.y +
+        time * time * curve.end.y;
+      expect(Math.hypot(x - obstacle.x - 72, y - 72)).toBeGreaterThan(82);
     }
   });
 

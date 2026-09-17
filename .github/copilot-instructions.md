@@ -1,6 +1,16 @@
 # Copilot Project Instructions
 
-This repository is an Obsidian plugin named Base Board. It adds Kanban and Timeline views for Obsidian Bases.
+This repository is an Obsidian plugin named Base Board. It provides Graph, Kanban, Timeline, and Rollout views for Obsidian Bases.
+
+## Recorded Work Graph
+
+- Base Board records Dustin's work; it is not a workflow execution engine. The current contract is `GRAPH_SEMANTICS_SPEC.md`, which supersedes older cascade/frontier policies.
+- Status edits are local to named records, including containers. Descendant counts, possible blockers, and recovery suggestions never replace explicit assertions or authorize topology-driven mutations.
+- Use the shared command layer for graph metadata changes: expected revisions, before/after preview, attribution, evidence/reason, explicit batch apply and conflict-aware undo. Detailed reasoning belongs in Markdown first.
+- Suggested Next is persisted, ordered, scoped recommendation metadata on notes, not an active frontier or automatic scheduler.
+- Preserve Physics, rooted connectivity, Dustin's fixed anchor, deep zoom/Home, collapse rings/animations, manual layouts, and recorded history. Desktop only.
+- Follow `AI-INSTRUCTIONS-TEMPLATE.md` and the `maintain-work-graph` skill when maintaining vault records. Graph maintenance does not grant production/deployment permissions.
+- Migration must inventory and back up affected notes, Bases, and plugin data before writes, preserve source values and unknown fields, flag uncertainty, and be idempotent. Browser checks use synthetic or read-only snapshots only.
 
 ## Project Context
 

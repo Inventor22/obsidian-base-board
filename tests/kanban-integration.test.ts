@@ -1,6 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { parse, stringify } from "yaml";
 
 vi.mock("obsidian", () => {
+  const element = (): Record<string, unknown> => ({
+    empty() {},
+    setText() {},
+    setAttr() {},
+    addClass() {},
+    createEl: element,
+    createDiv: element,
+    createSpan: element,
+  });
   class Value {
     constructor(public value: unknown) {}
     toString(): string {
@@ -26,13 +36,41 @@ vi.mock("obsidian", () => {
     ListValue: class extends Value {},
     BasesView: class {},
     Modal: class {
-      open() {}
+      titleEl = { setText() {} };
+      contentEl = element();
+      onOpen() {}
+      onClose() {}
+      open() {
+        this.onOpen();
+      }
+      close() {
+        this.onClose();
+      }
     },
     Plugin: class {},
     PluginSettingTab: class {},
     Notice: class {},
     Menu: class {},
-    Setting: class {},
+    Setting: class {
+      addButton(build: (button: unknown) => void) {
+        let label = "";
+        const button = {
+          setButtonText(value: string) {
+            label = value;
+            return button;
+          },
+          setCta() {
+            return button;
+          },
+          onClick(callback: () => void) {
+            if (label === "Apply batch") queueMicrotask(callback);
+            return button;
+          },
+        };
+        build(button);
+        return this;
+      }
+    },
     Platform: { isMobile: false },
     Keymap: { isModEvent: () => false },
     setIcon: vi.fn(),
@@ -43,7 +81,14 @@ vi.mock("obsidian", () => {
 import { BooleanValue, NumberValue, TFile } from "obsidian";
 import { KanbanView } from "../src/kanban-view";
 import { CardManager } from "../src/card";
+import { ColumnManager } from "../src/column";
 import { RolloutView } from "../src/rollout-view";
+import { TimelineView } from "../src/timeline-view";
+import {
+  createVaultCommandStore,
+  handleGraphRequest,
+} from "../src/graph-command-ui";
+import { previewGraphBatch, type GraphBatch } from "../src/graph-commands";
 import BaseBoardPlugin from "../src/main";
 import { GraphView } from "../src/graph-view";
 import { isGraphSpringEdge } from "../src/graph-physics";
@@ -74,6 +119,23 @@ function fixture(notes: Note[], groupKeys?: unknown[]) {
     notes.map((note) => [note.path, { ...note.properties }]),
   );
   const writes: string[] = [];
+  const adapterFiles = new Map<string, string>();
+  const bodies = new Map(
+    notes.map((note) => [note.path, "Synthetic note body.\n"]),
+  );
+  const readNote = (file: TFile) =>
+    `---\n${stringify(properties.get(file.path))}---\n${bodies.get(file.path) ?? ""}`;
+  const writeNote = (file: TFile, content: string) => {
+    const match = /^---\n([\s\S]*?)\n---\n/.exec(content);
+    if (!match) throw new Error("Fixture expected YAML frontmatter");
+    const updated = parse(match[1]) as Record<string, unknown>;
+    const current = properties.get(file.path) ?? {};
+    for (const key of Object.keys(current)) delete current[key];
+    Object.assign(current, updated);
+    properties.set(file.path, current);
+    bodies.set(file.path, content.slice(match[0].length));
+    writes.push(file.path);
+  };
   const keys = groupKeys ?? [
     ...new Set(notes.map((note) => note.properties.status)),
   ];
@@ -91,6 +153,32 @@ function fixture(notes: Note[], groupKeys?: unknown[]) {
         getAbstractFileByPath: (path: string) =>
           files.find((file) => file.path === path) ?? null,
         getMarkdownFiles: () => files,
+        read: async (file: TFile) => readNote(file),
+        process: async (file: TFile, update: (content: string) => string) =>
+          writeNote(file, update(readNote(file))),
+        create: async (path: string, content: string) => {
+          const file = Object.assign(new TFile(), {
+            path,
+            basename: path.replace(/\.md$/, ""),
+          });
+          files.push(file);
+          writeNote(file, content);
+          return file;
+        },
+        adapter: {
+          exists: async (path: string) => adapterFiles.has(path),
+          mkdir: async (path: string) => {
+            adapterFiles.set(path, "");
+          },
+          read: async (path: string) => adapterFiles.get(path)!,
+          write: async (path: string, content: string) => {
+            adapterFiles.set(path, content);
+          },
+          rename: async (from: string, to: string) => {
+            adapterFiles.set(to, adapterFiles.get(from)!);
+            adapterFiles.delete(from);
+          },
+        },
       },
       metadataCache: {
         getFileCache: (file: TFile) => ({
@@ -98,6 +186,11 @@ function fixture(notes: Note[], groupKeys?: unknown[]) {
         }),
       },
       fileManager: {
+        trashFile: async (file: TFile) => {
+          files.splice(files.indexOf(file), 1);
+          properties.delete(file.path);
+          writes.push(file.path);
+        },
         processFrontMatter: async (
           file: TFile,
           update: (value: Record<string, unknown>) => void,
@@ -137,6 +230,64 @@ function fixture(notes: Note[], groupKeys?: unknown[]) {
 }
 
 beforeEach(() => vi.clearAllMocks());
+
+describe("recorded and planned timeline", () => {
+  it("never invents status history from file timestamps or a newer current status", () => {
+    const setup = fixture([
+      { path: "Stage.md", properties: { status: "Completed" } },
+    ]);
+    const view = Object.assign(Object.create(TimelineView.prototype), {
+      app: setup.view.app,
+    });
+    expect(view.getSegments(setup.files[0], [], "Completed")).toEqual([]);
+    const at = new Date("2026-01-01T12:00:00Z");
+    const segments = view.getSegments(
+      setup.files[0],
+      [{ from: "Planned", to: "Awaiting", at }],
+      "Completed",
+    );
+    expect(segments).toEqual([
+      { status: "Awaiting", start: at, end: at, basis: "recorded" },
+    ]);
+  });
+
+  it("groups the same records by a configured property and keeps planned dates separate", () => {
+    const setup = fixture([
+      {
+        path: "Stage.md",
+        properties: {
+          status: "In Progress",
+          owner: "Dustin",
+          planned_start: "2026-10-01",
+          planned_end: "2026-10-03",
+        },
+      },
+      {
+        path: "Canary.md",
+        properties: { status: "In Progress", owner: "Copilot" },
+      },
+    ]);
+    const view = Object.assign(Object.create(TimelineView.prototype), {
+      app: setup.view.app,
+      config: { get: () => "owner" },
+    });
+    const tasks = setup.files.map((file) => ({
+      file,
+      title: file.basename,
+      currentStatus: "In Progress",
+      segments: [],
+      rolloutSegments: [],
+    }));
+    expect(
+      view.getPools(tasks).map((pool: { title: string }) => pool.title),
+    ).toEqual(["Copilot", "Dustin"]);
+    expect(view.getPlannedSegments(setup.files[0])).toEqual([
+      expect.objectContaining({ basis: "planned", status: "Planned" }),
+    ]);
+    expect(view.getSegments(setup.files[0], [], "In Progress")).toEqual([]);
+    expect(setup.writes).toEqual([]);
+  });
+});
 
 interface OverviewTestNode extends EngineNode {
   file: TFile;
@@ -213,6 +364,11 @@ function overviewFixture(extraNotes: Note[] = []) {
     getGraphPresentation: () => string;
     getGraphPhysicsLayout: () => string;
     getPhysicsCacheKey: () => string;
+    getEdgePath: (edge: {
+      from: OverviewTestNode;
+      to: OverviewTestNode;
+      kind: string;
+    }) => string;
     graphZoom: number;
     clampGraphZoom: (zoom: number) => number;
     zoomGraphByFactor: (factor: number) => void;
@@ -257,6 +413,307 @@ function overviewFixture(extraNotes: Note[] = []) {
 }
 
 describe("Graph overview integration", () => {
+  it("reviews column rename as named status changes with shared history", async () => {
+    const setup = fixture([
+      { path: "Stage.md", properties: { status: "In Progress" } },
+      { path: "Canary.md", properties: { status: "In Progress" } },
+      { path: "Residual.md", properties: { status: "Failed" } },
+    ]);
+    setup.view.getColumns = () => ["In Progress", "Failed"];
+    setup.view.saveColumns = vi.fn();
+    setup.view.updateColumnPreferences = vi.fn();
+    const controller = new ColumnManager(setup.view) as unknown as {
+      handleRenameColumn: (
+        oldName: string,
+        newName: string,
+        entries: { file: TFile }[],
+      ) => Promise<void>;
+    };
+    await controller.handleRenameColumn(
+      "In Progress",
+      "Awaiting",
+      setup.files.slice(0, 2).map((file) => ({ file })),
+    );
+    expect(setup.properties.get("Stage.md")?.status).toBe("Awaiting");
+    expect(setup.properties.get("Canary.md")?.status_history).toHaveLength(1);
+    expect(setup.properties.get("Residual.md")?.status).toBe("Failed");
+    expect(setup.view.saveColumns).toHaveBeenCalledWith(["Awaiting", "Failed"]);
+  });
+
+  it("serializes duplicate local agent requests and records the batch only once", async () => {
+    const setup = fixture([
+      { path: "Canary.md", properties: { id: "canary", status: "Planned" } },
+    ]);
+    const store = createVaultCommandStore(setup.view.app);
+    const batch: GraphBatch = {
+      id: "agent-request",
+      actor: { kind: "agent", name: "GitHub Copilot" },
+      reason: "Record reported activity",
+      evidence: [],
+      changes: [
+        {
+          path: "Canary.md",
+          expectedRevision: (await store.read("Canary.md")).revision,
+          set: { status: "In Progress" },
+        },
+      ],
+    };
+    const preview = await previewGraphBatch(store, batch);
+    const request = JSON.stringify({
+      operation: "apply",
+      batch,
+      token: preview.token,
+    });
+    const adapter = setup.view.app.vault.adapter;
+    for (const id of ["first", "second"])
+      await adapter.write(`.baseboard/requests/${id}.request.json`, request);
+    await Promise.all([
+      handleGraphRequest(setup.view.app, "first"),
+      handleGraphRequest(setup.view.app, "second"),
+    ]);
+    expect(setup.properties.get("Canary.md")?.status_history).toHaveLength(1);
+    expect(setup.properties.get("Canary.md")?.status).toBe("In Progress");
+    for (const id of ["first", "second"])
+      expect(
+        JSON.parse(
+          await adapter.read(`.baseboard/requests/${id}.response.json`),
+        ),
+      ).toMatchObject({ ok: true, result: { state: "applied" } });
+  });
+
+  it("cleans new sequence/context references in an explicit card deletion batch", async () => {
+    const setup = fixture([
+      { path: "Stage.md", properties: { id: "stage", status: "In Progress" } },
+      {
+        path: "Canary.md",
+        properties: {
+          id: "canary",
+          status: "In Progress",
+          sequence_after: ["[[Stage]]"],
+          associations: ["[[Stage]]"],
+        },
+      },
+    ]);
+    const manager = new CardManager(setup.view);
+    const controller = manager as unknown as {
+      deleteCardAndCleanupReferences: (file: TFile) => Promise<number>;
+    };
+    expect(
+      await controller.deleteCardAndCleanupReferences(setup.files[0]),
+    ).toBe(2);
+    expect(setup.properties.has("Stage.md")).toBe(false);
+    expect(setup.properties.get("Canary.md")?.status).toBe("In Progress");
+    expect(setup.properties.get("Canary.md")?.sequence_after).toBeUndefined();
+    expect(setup.properties.get("Canary.md")?.associations).toBeUndefined();
+  });
+
+  it("reviews and records template insertion as one reversible batch", async () => {
+    const setup = overviewFixture();
+    setup.controller.getGraphNodes();
+    const controller = setup.graph as unknown as {
+      insertRootTemplate: (
+        kind: string,
+        title: string,
+        point: { x: number; y: number },
+      ) => Promise<void>;
+      undoGraphHistory: () => Promise<void>;
+      graphUndoStack: { batch?: { applied: unknown[] }; positions?: unknown }[];
+    };
+    await controller.insertRootTemplate("ring-basic", "New ring", {
+      x: 30,
+      y: 50,
+    });
+    expect(controller.graphUndoStack).toHaveLength(1);
+    expect(controller.graphUndoStack[0].batch?.applied).toHaveLength(3);
+    expect(
+      setup.properties.get("New ring - verify.md")?.sequence_after,
+    ).toEqual(["[[New ring - await build rollout]]"]);
+    expect(
+      setup.properties.get("New ring - verify.md")?.depends_on,
+    ).toBeUndefined();
+    expect(setup.properties.get("New ring.md")?.graph_x).toBeUndefined();
+    expect(controller.graphUndoStack[0].positions).toBeDefined();
+    await controller.undoGraphHistory();
+    expect(setup.properties.has("New ring.md")).toBe(false);
+    expect(setup.properties.has("New ring - verify.md")).toBe(false);
+    expect(setup.properties.get("Feature.md")?.status).toBe("Completed");
+  });
+
+  it("rewires two named records through a batch without status changes", async () => {
+    const setup = overviewFixture([
+      {
+        path: "Canary.md",
+        properties: {
+          parent: "[[Feature]]",
+          depends_on: ["[[Done]]"],
+          status: "In Progress",
+        },
+      },
+    ]);
+    setup.controller.getGraphNodes();
+    const find = (path: string) =>
+      setup.controller.graphNodes.find((node) => node.file.path === path)!;
+    const controller = setup.graph as unknown as {
+      reassignGraphEdgeEndpoint: (
+        edge: unknown,
+        endpoint: string,
+        target: unknown,
+      ) => Promise<void>;
+      undoGraphHistory: () => Promise<void>;
+    };
+    await controller.reassignGraphEdgeEndpoint(
+      { from: find("Done.md"), to: find("Canary.md"), kind: "gating" },
+      "to",
+      find("Thread.md"),
+    );
+    expect(setup.properties.get("Canary.md")?.depends_on).toBeUndefined();
+    expect(setup.properties.get("Thread.md")?.depends_on).toEqual(["[[Done]]"]);
+    setup.properties.get("Thread.md")!.custom = "Later unrelated edit";
+    await controller.undoGraphHistory();
+    expect(setup.properties.get("Canary.md")?.depends_on).toEqual(["[[Done]]"]);
+    expect(setup.properties.get("Thread.md")?.custom).toBe(
+      "Later unrelated edit",
+    );
+    expect(setup.properties.get("Thread.md")?.status).toBe("In Progress");
+  });
+
+  it("retains both sequence and dependency links between the same records", () => {
+    const setup = overviewFixture([
+      {
+        path: "Canary.md",
+        properties: {
+          parent: "[[Feature]]",
+          status: "In Progress",
+          sequence_after: ["[[Done]]"],
+          depends_on: ["[[Done]]"],
+        },
+      },
+    ]);
+    setup.controller.getGraphNodes();
+    const edges = setup.controller.buildGraphFlowEdges(
+      setup.controller.graphNodes,
+    );
+    expect(
+      edges
+        .filter(
+          (edge) =>
+            edge.from.file.path === "Done.md" &&
+            edge.to.file.path === "Canary.md",
+        )
+        .map((edge) => edge.kind)
+        .sort(),
+    ).toEqual(["gating", "sequence"]);
+  });
+
+  it.each([
+    "In Progress",
+    "Awaiting",
+    "Completed",
+    "Failed",
+    "Cancelled",
+    "Blocked",
+  ])(
+    "records %s on a container without changing its children or successors",
+    async (status) => {
+      const setup = overviewFixture([
+        {
+          path: "Canary.md",
+          properties: { status: "In Progress", depends_on: ["[[Feature]]"] },
+        },
+      ]);
+      const nodes = setup.controller.getGraphNodes();
+      const target = nodes.find((node) => node.file.path === "Feature.md")!;
+      const before = new Map(
+        [...setup.properties].map(([path, properties]) => [
+          path,
+          structuredClone(properties),
+        ]),
+      );
+      await (
+        setup.graph as unknown as {
+          setGraphNodeStatus: (
+            node: OverviewTestNode,
+            status: string,
+          ) => Promise<void>;
+        }
+      ).setGraphNodeStatus(target, status);
+      expect(setup.properties.get("Feature.md")!.status).toBe(status);
+      for (const [path, properties] of setup.properties) {
+        if (path !== "Feature.md") expect(properties).toEqual(before.get(path));
+      }
+      const rendered = setup.controller.getGraphNodes();
+      expect(
+        rendered.find((node) => node.file.path === "Feature.md")!.status,
+      ).toBe(status);
+      expect(
+        setup.controller.graphWorkSummaries.get("Feature.md"),
+      ).toMatchObject({ total: 2, completed: 1, active: 1 });
+    },
+  );
+
+  it("records partial Stage and active Canary consistently through Graph commands and Kanban", async () => {
+    const setup = overviewFixture([
+      {
+        path: "Stage.md",
+        properties: { parent: "[[Feature]]", status: "In Progress" },
+      },
+      {
+        path: "Broken zone.md",
+        properties: { parent: "[[Stage]]", status: "Failed" },
+      },
+      {
+        path: "Canary.md",
+        properties: {
+          status: "Planned",
+          depends_on: ["[[Stage]]"],
+          decision: {
+            reason: "Baked sufficiently; west zone remains broken",
+            evidence: ["[[Stage#Bake]]"],
+          },
+        },
+      },
+    ]);
+    const beforeStage = structuredClone(setup.properties.get("Stage.md"));
+    await setup.drop("Canary.md", "In Progress", ["Canary.md"]);
+    expect(setup.properties.get("Stage.md")).toEqual(beforeStage);
+    expect(setup.properties.get("Broken zone.md")!.status).toBe("Failed");
+    setup.controller.getGraphNodes();
+    const canary = setup.controller.graphNodes.find(
+      (node) => node.file.path === "Canary.md",
+    )!;
+    expect(canary.state).toBe("active");
+    expect(setup.properties.get("Canary.md")!.decision).toBeDefined();
+    expect(setup.properties.get("Canary.md")!.status_history).toHaveLength(1);
+  });
+
+  it("renders obstacle detours as waypoint paths instead of the blocked curve", () => {
+    const setup = overviewFixture();
+    setup.settings.set("graphPresentation", "physics");
+    const nodes = setup.controller.getGraphNodes();
+    const source = nodes.find((node) => node.file.path === "Feature.md")!;
+    const target = nodes.find((node) => node.file.path === "Scope.md")!;
+    Object.assign(source, { x: 0, y: 0 });
+    Object.assign(target, { x: 900, y: 0 });
+    Object.assign(setup.graph, {
+      physicsRouteNodes: [-300, -150, 0, 150, 300].map((y, index) => ({
+        id: `obstacle-${index}`,
+        x: 420,
+        y,
+        width: 144,
+        height: 144,
+      })),
+    });
+    const path = setup.controller.getEdgePath({
+      from: source,
+      to: target,
+      kind: "gating",
+    });
+    expect(path).toMatch(/^M /);
+    expect(path).toContain(" L ");
+    expect(path).not.toContain(" Q ");
+    expect(setup.writes).toEqual([]);
+  });
+
   it.each(["overview", "canvas", "physics"])(
     "allows deep zoom with a positive numeric floor in %s",
     (mode) => {
@@ -1426,7 +1883,7 @@ describe("upstream ordering with fork workflows", () => {
       to: "In Progress",
       kind: "activated",
       causedBy: "human",
-      source: "baseboard-drag-drop",
+      source: "baseboard-command",
       property: "status",
     });
   });
@@ -1456,14 +1913,18 @@ describe("upstream ordering with fork workflows", () => {
       [{ path: "check.md", properties: { status: true } }],
       [new BooleanValue(true)],
     );
+    booleanSetup.view.getGroupByProperty = () => "checked";
+    booleanSetup.properties.get("check.md")!.checked = true;
     await booleanSetup.drop("check.md", "false", ["check.md"]);
-    expect(booleanSetup.properties.get("check.md")!.status).toBe(false);
+    expect(booleanSetup.properties.get("check.md")!.checked).toBe(false);
     const numberSetup = fixture(
       [{ path: "number.md", properties: { status: 1 } }],
       [new NumberValue(1)],
     );
+    numberSetup.view.getGroupByProperty = () => "progress";
+    numberSetup.properties.get("number.md")!.progress = 1;
     await numberSetup.drop("number.md", "2", ["number.md"]);
-    expect(numberSetup.properties.get("number.md")!.status).toBe(2);
+    expect(numberSetup.properties.get("number.md")!.progress).toBe(2);
   });
 
   it("removes the property and records null for a no-value drop", async () => {

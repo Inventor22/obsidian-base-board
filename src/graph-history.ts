@@ -22,6 +22,7 @@ export interface GraphHistoryNode {
   autonomyExplicit: "propose" | "execute" | "autopilot" | null;
   lockedExplicit: boolean | null;
   order: OrderValue;
+  work?: Record<string, unknown>;
 }
 
 export interface GraphHistoryFrame {
@@ -54,6 +55,14 @@ function copyNode(node: GraphHistoryNode): GraphHistoryNode {
     restartsToKeys: [...node.restartsToKeys],
     rollupToKeys: [...node.rollupToKeys],
     compensatesKeys: [...node.compensatesKeys],
+    ...(node.work
+      ? {
+          work: JSON.parse(JSON.stringify(node.work)) as Record<
+            string,
+            unknown
+          >,
+        }
+      : {}),
   };
 }
 
@@ -330,6 +339,7 @@ function isHistoryNode(value: unknown): value is GraphHistoryNode {
     if (value[field] !== null && typeof value[field] !== "string") return false;
   }
   return (
+    (value.work === undefined || isRecord(value.work)) &&
     typeof value.effecting === "boolean" &&
     (value.lockedExplicit === null ||
       typeof value.lockedExplicit === "boolean") &&

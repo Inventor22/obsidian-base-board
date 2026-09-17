@@ -18,6 +18,8 @@ import { NO_VALUE_COLUMN, ORDER_PROPERTY, sanitizeFilename } from "./constants";
 import { relativeLuminance } from "./color-utils";
 import type { OrderValue } from "./order";
 import { CardDetailModal } from "./card-detail-modal";
+import { createVaultCommandStore, editGraphNotes } from "./graph-command-ui";
+import { graphValuesEqual, type GraphChange } from "./graph-commands";
 
 const IMAGE_EXTENSIONS = new Set([
   "apng",
@@ -89,6 +91,10 @@ const FILE_PROPS_TO_SKIP = new Set([
 const HIERARCHY_PROPS = new Set(["parent"]);
 const RELATION_LIST_PROPS = [
   ["depends_on"],
+  ["sequence_after"],
+  ["associations"],
+  ["rollup_to"],
+  ["compensates"],
   ["breaks_to"],
   ["restarts_to"],
 ] as const;
@@ -1302,6 +1308,7 @@ export class CardManager {
         .onClick(async () => {
           const cleanedReferences =
             await this.deleteCardAndCleanupReferences(file);
+          if (cleanedReferences < 0) return;
           new Notice(
             cleanedReferences > 0
               ? `Moved "${file.basename}" to trash and cleaned ${cleanedReferences} reference${cleanedReferences === 1 ? "" : "s"}`
@@ -1317,14 +1324,36 @@ export class CardManager {
   private async deleteCardAndCleanupReferences(file: TFile): Promise<number> {
     let cleanedReferences = 0;
     await this.view.applyBatchUpdate(async () => {
-      cleanedReferences = await this.cleanupReferencesToDeletedCard(file);
-      await this.view.app.fileManager.trashFile(file);
+      const changes: GraphChange[] = [];
+      cleanedReferences = await this.cleanupReferencesToDeletedCard(
+        file,
+        changes,
+      );
+      const current = await createVaultCommandStore(this.view.app).read(
+        file.path,
+      );
+      changes.push({
+        path: file.path,
+        expectedRevision: current.revision,
+        delete: true,
+      });
+      const receipt = await editGraphNotes(
+        this.view.app,
+        changes,
+        `Delete ${file.basename} and review its references`,
+        { transitions: [] },
+      );
+      if (receipt) this.view.rememberCommandBatch(receipt);
+      else cleanedReferences = -1;
     });
     this.view.scheduleRender();
     return cleanedReferences;
   }
 
-  private async cleanupReferencesToDeletedCard(file: TFile): Promise<number> {
+  private async cleanupReferencesToDeletedCard(
+    file: TFile,
+    changes: GraphChange[],
+  ): Promise<number> {
     const deletedIdentities = this.getDeletedCardIdentities(file);
     const entries = this.view
       .getCurrentEntries()
@@ -1338,20 +1367,32 @@ export class CardManager {
       );
     let cleanedReferences = 0;
 
-    await Promise.all(
-      entries.map((entry) =>
-        this.view.app.fileManager.processFrontMatter(
-          entry.file,
-          (frontmatter: Record<string, unknown>) => {
-            const result = this.removeReferencesFromFrontmatter(
-              frontmatter,
-              deletedIdentities,
-            );
-            cleanedReferences += result.removedCount;
-          },
-        ),
-      ),
-    );
+    for (const entry of entries) {
+      const current = await createVaultCommandStore(this.view.app).read(
+        entry.file.path,
+      );
+      const next = { ...current.properties };
+      const result = this.removeReferencesFromFrontmatter(
+        next,
+        deletedIdentities,
+      );
+      if (!result.removedCount) continue;
+      cleanedReferences += result.removedCount;
+      const set: Record<string, unknown> = {};
+      const unset: string[] = [];
+      for (const key of Object.keys(current.properties)) {
+        if (graphValuesEqual(current.properties[key], next[key])) continue;
+        if (Object.prototype.hasOwnProperty.call(next, key))
+          set[key] = next[key];
+        else unset.push(key);
+      }
+      changes.push({
+        path: entry.file.path,
+        expectedRevision: current.revision,
+        set,
+        unset,
+      });
+    }
 
     return cleanedReferences;
   }
@@ -1769,7 +1810,7 @@ export class CardManager {
     for (const col of columns) {
       menu.addItem((item) => {
         item.setTitle(col).onClick(() => {
-          void this.moveBatchToColumn(selectedPaths, col, groupByProp);
+          void this.moveBatchToColumn(selectedPaths, col);
         });
       });
     }
@@ -1780,32 +1821,17 @@ export class CardManager {
   private async moveBatchToColumn(
     filePaths: string[],
     targetColumn: string,
-    groupByProp: string,
   ): Promise<void> {
+    if (!filePaths.length) return;
     const selected = new Set(filePaths);
     const orderedPaths = this.view
       .getOrderedPathsForColumn(targetColumn)
       .filter((path) => !selected.has(path));
     orderedPaths.push(...filePaths);
 
-    await this.view.applyBatchUpdate(async () => {
-      const updates = filePaths.map((fp) => {
-        const file = this.view.app.vault.getAbstractFileByPath(fp);
-        if (!file || !(file instanceof TFile)) return Promise.resolve();
-        return this.view.app.fileManager.processFrontMatter(
-          file,
-          (fm: Record<string, unknown>) => {
-            this.view.applyGroupByValue(fm, groupByProp, targetColumn);
-          },
-        );
-      });
-      await Promise.all(updates);
-      await this.view.writeCardOrder(orderedPaths, filePaths);
-    });
+    this.view.selectedCards = selected;
+    await this.view.handleCardDrop(filePaths[0], targetColumn, orderedPaths);
     this.clearSelection();
-    new Notice(
-      `Moved ${filePaths.length} card${filePaths.length > 1 ? "s" : ""} to "${targetColumn}"`,
-    );
   }
 
   private getCardCoverSrc(file: TFile, coverPropName: string): string | null {

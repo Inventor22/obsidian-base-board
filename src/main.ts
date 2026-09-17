@@ -15,6 +15,7 @@ import { GraphView } from "./graph-view";
 import { sanitizeFilename } from "./constants";
 import { CreateBoardModal, BoardConfig } from "./modals";
 import { updateBaseFolderReferences } from "./folder-rename";
+import { handleGraphRequest } from "./graph-command-ui";
 import {
   parseGraphHistory,
   recordGraphObservation,
@@ -74,6 +75,22 @@ export default class BaseBoardPlugin extends Plugin {
   async onload() {
     await this.loadPluginData();
     this.addSettingTab(new BaseBoardSettingTab(this));
+    this.registerObsidianProtocolHandler("baseboard-command", (parameters) => {
+      void handleGraphRequest(this.app, parameters.request ?? "", {
+        transitions: this.data_.transitionHistory.enabled
+          ? [
+              {
+                property: "status",
+                historyProperty: this.data_.transitionHistory.propertyName,
+              },
+              { property: "rollout_ring", historyProperty: "rollout_history" },
+            ]
+          : [],
+      }).catch(
+        (error: unknown) =>
+          new Notice(error instanceof Error ? error.message : String(error)),
+      );
+    });
 
     this.registerBasesView("kanban", {
       name: "Kanban",

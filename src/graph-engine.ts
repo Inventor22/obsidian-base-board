@@ -1,10 +1,5 @@
-// Shared graph engine: the single source of truth for the derived work-state
-// model and the active-frontier projection. Pure and dependency-free (no
-// Obsidian imports) so both the Graph view and the Kanban view derive frontier
-// state from the same logic — there is no duplicated frontier derivation.
-//
-// See GRAPH_ARCHITECTURE_PLAN.md ("Boundaries, signals & lenses", Step D) and
-// GRAPH_VIEW_RULES.md §1.2 for the behavioural contract.
+// Shared, read-only interpretation of recorded work. Relationships and
+// descendant summaries never replace a node's explicitly recorded status.
 
 // ---------------------------------------------------------------------------
 //  Types
@@ -119,9 +114,7 @@ export function normalizeReference(value: unknown): string | null {
 
   const linkMatch = normalized.match(/^\[\[([^|\]]+)(?:\|[^\]]+)?\]\]$/);
   if (linkMatch) normalized = linkMatch[1];
-  normalized = normalized.replace(/\.md$/i, "");
-  const slashIndex = normalized.lastIndexOf("/");
-  if (slashIndex >= 0) normalized = normalized.slice(slashIndex + 1);
+  normalized = normalized.split("#")[0].replace(/\.md$/i, "");
   return normalized.toLowerCase();
 }
 
@@ -130,6 +123,20 @@ export function normalizeReferences(value: unknown): string[] {
   return rawValues
     .map((rawValue) => normalizeReference(rawValue))
     .filter((reference): reference is string => reference !== null);
+}
+
+export function indexNodeIdentities<Node>(
+  nodes: readonly Node[],
+  identitiesOf: (node: Node) => readonly string[],
+): Map<string, Node | null> {
+  const index = new Map<string, Node | null>();
+  for (const node of nodes) {
+    for (const identity of identitiesOf(node)) {
+      if (!index.has(identity)) index.set(identity, node);
+      else if (index.get(identity) !== node) index.set(identity, null);
+    }
+  }
+  return index;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,39 +194,19 @@ export function getAggregationChildren(node: EngineNode): EngineNode[] {
 //  State derivation (GRAPH_SEMANTICS_SPEC.md — pure recompute)
 // ---------------------------------------------------------------------------
 
-/**
- * Recomputes every node's derived `state` in place. Leaf (work-node) statuses
- * are the only stored truth; group states are folded bottom-up. Uses
- * object-reference memoization so the derivation terminates on malformed graphs.
- */
-export function deriveStates(nodes: EngineNode[], parentOf: ParentOf): void {
-  const memo = new Map<EngineNode, EngineNodeState>();
-  const inProgress = new Set<EngineNode>();
-  for (const node of nodes) {
-    node.state = deriveNodeState(node, parentOf, memo, inProgress);
-  }
-  const failureScope = getFailureScope(nodes, parentOf);
-  for (const node of nodes) {
-    if (isImpactNode(node) || !isCompensationNode(node)) continue;
-    if (isCompletedStatus(node.status)) {
-      node.state = "completed";
-    } else if (
-      isInterruptedStatus(node.status) ||
-      isBlockedStatus(node.status)
-    ) {
-      node.state = "interrupted";
-    } else {
-      const triggered = node.compensatesTargets?.some((target) => {
-        const parent = parentOf(target);
-        return (
-          target.state === "completed" &&
-          parent !== null &&
-          failureScope.has(parent)
-        );
-      });
-      node.state = triggered ? "active" : "idle";
-    }
-  }
+export function getRecordedState(status: string | null): EngineNodeState {
+  if (isInvalidatedStatus(status)) return "invalidated";
+  if (isCancelledStatus(status)) return "cancelled";
+  if (isInterruptedStatus(status)) return "interrupted";
+  if (isActiveStatus(status)) return "active";
+  if (isAwaitingStatus(status)) return "awaiting";
+  if (isCompletedStatus(status)) return "completed";
+  if (isBlockedStatus(status)) return "blocked";
+  return status ? "waiting" : "idle";
+}
+
+export function deriveStates(nodes: EngineNode[], _parentOf?: ParentOf): void {
+  for (const node of nodes) node.state = getRecordedState(node.status);
 }
 
 export function getFailureScope(
@@ -242,150 +229,6 @@ export function getFailureScope(
     }
   }
   return scope;
-}
-
-function deriveNodeState(
-  node: EngineNode,
-  parentOf: ParentOf,
-  memo: Map<EngineNode, EngineNodeState>,
-  inProgress: Set<EngineNode>,
-): EngineNodeState {
-  const cached = memo.get(node);
-  if (cached) return cached;
-  // Cycle guard: a node referenced while it is still being computed resolves to
-  // a neutral state so derivation terminates on malformed graphs.
-  if (inProgress.has(node)) return "idle";
-  inProgress.add(node);
-
-  const state = isImpactNode(node)
-    ? "idle"
-    : (() => {
-        const aggregationChildren = getAggregationChildren(node);
-        return aggregationChildren.length > 0
-          ? deriveGroupState(
-              aggregationChildren.map((child) =>
-                deriveNodeState(child, parentOf, memo, inProgress),
-              ),
-            )
-          : deriveLeafState(node, parentOf, memo, inProgress);
-      })();
-
-  inProgress.delete(node);
-  memo.set(node, state);
-  return state;
-}
-
-/**
- * Leaf (work-node) state read from its stored status. A ready leaf with no
- * explicit lifecycle status falls through to the computed active frontier
- * (gating prerequisites satisfied) or `waiting` (prerequisites pending).
- */
-function deriveLeafState(
-  node: EngineNode,
-  parentOf: ParentOf,
-  memo: Map<EngineNode, EngineNodeState>,
-  inProgress: Set<EngineNode>,
-): EngineNodeState {
-  if (isInvalidatedStatus(node.status)) return "invalidated";
-  if (isCancelledStatus(node.status)) return "cancelled";
-  if (isInterruptedStatus(node.status)) return "interrupted";
-  if (isActiveStatus(node.status)) return "active";
-  if (isAwaitingStatus(node.status)) return "awaiting";
-  if (isCompletedStatus(node.status)) return "completed";
-  if (isBlockedStatus(node.status)) return "blocked";
-  if (!areGatingPrerequisitesTerminal(node, parentOf, memo, inProgress)) {
-    return "waiting";
-  }
-  return "active";
-}
-
-/**
- * Group-state fold (GRAPH_SEMANTICS_SPEC.md Layer A) over the children's
- * derived states. Precedence (decreasing):
- * In Progress > Completed > Cancelled/Invalidated > Planned.
- */
-function deriveGroupState(childStates: EngineNodeState[]): EngineNodeState {
-  if (childStates.length === 0) return "idle";
-  const isLive = (state: EngineNodeState): boolean =>
-    state === "active" ||
-    state === "in-progress" ||
-    state === "awaiting" ||
-    state === "interrupted" ||
-    state === "blocked";
-  if (childStates.some(isLive)) return "in-progress";
-  if (childStates.every((state) => state === "completed")) return "completed";
-  if (childStates.every((state) => state === "cancelled")) return "cancelled";
-  if (childStates.every((state) => state === "invalidated")) {
-    return "invalidated";
-  }
-  if (
-    childStates.every(
-      (state) => state === "cancelled" || state === "invalidated",
-    )
-  ) {
-    return childStates.some((state) => state === "invalidated")
-      ? "invalidated"
-      : "cancelled";
-  }
-  // Mixed completed/planned with no live work: not finished, no active frontier
-  // — render as waiting (Planned).
-  return "waiting";
-}
-
-/**
- * True when every gating prerequisite of a node — its own `depends_on`
- * predecessors plus the predecessors of each containment ancestor — is in a
- * terminal DERIVED state. Uses derived states (not stored status) so group
- * prerequisites resolve correctly under the derived model.
- */
-function areGatingPrerequisitesTerminal(
-  node: EngineNode,
-  parentOf: ParentOf,
-  memo: Map<EngineNode, EngineNodeState>,
-  inProgress: Set<EngineNode>,
-): boolean {
-  const isTerminal = (state: EngineNodeState): boolean =>
-    state === "completed" ||
-    state === "interrupted" ||
-    state === "invalidated" ||
-    state === "cancelled";
-  const seen = new Set<EngineNode>();
-  let current: EngineNode | null = node;
-  while (current && !seen.has(current)) {
-    seen.add(current);
-    for (const predecessor of current.predecessors) {
-      if (isImpactNode(predecessor)) continue;
-      const state = deriveNodeState(predecessor, parentOf, memo, inProgress);
-      if (!isTerminal(state)) return false;
-    }
-    current = parentOf(current);
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-//  Frontier, lineage, hygiene
-// ---------------------------------------------------------------------------
-
-/**
- * A leaf is on the frontier when it is actionable now: a work leaf (not a
- * group/container) whose derived state is the live edge — active/awaiting/
- * blocked/interrupted — never completed/cancelled/invalidated/waiting.
- */
-export function isFrontierLeaf(node: EngineNode): boolean {
-  if (node.children.length > 0) return false;
-  if (node.kind === "group") return false;
-  if (isImpactNode(node)) return false;
-  return (
-    node.state === "active" ||
-    node.state === "awaiting" ||
-    node.state === "blocked" ||
-    node.state === "interrupted"
-  );
-}
-
-export function getFrontier(nodes: EngineNode[]): EngineNode[] {
-  return nodes.filter((node) => isFrontierLeaf(node));
 }
 
 /**
@@ -508,10 +351,7 @@ export function buildFrontierGraph(raw: FrontierRawNode[]): FrontierNode[] {
     compensatesTargets: [],
   }));
 
-  const byIdentity = new Map<string, FrontierNode>();
-  for (const node of nodes) {
-    for (const identity of node.identities) byIdentity.set(identity, node);
-  }
+  const byIdentity = indexNodeIdentities(nodes, (node) => node.identities);
 
   for (const node of nodes) {
     if (node.parentKey) {
@@ -541,10 +381,6 @@ export function buildFrontierGraph(raw: FrontierRawNode[]): FrontierNode[] {
   assignNodeKinds(nodes);
   deriveStates(nodes, (node) => (node as FrontierNode).parent);
   return nodes;
-}
-
-export function getFrontierNodes(nodes: FrontierNode[]): FrontierNode[] {
-  return nodes.filter((node) => isFrontierLeaf(node));
 }
 
 export function getFrontierLineage(node: FrontierNode): string[] {

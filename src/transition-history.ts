@@ -14,6 +14,10 @@ export interface TransitionEvent {
   causedBy: "human" | "agent";
   source: string;
   reason?: string;
+  by?: string;
+  evidence?: string[];
+  batchId?: string;
+  reverses?: string;
 }
 
 /** Maps a target status to the canonical event `kind`. */
@@ -47,6 +51,10 @@ export function buildTransitionEvent(params: {
   source: string;
   causedBy?: "human" | "agent";
   reason?: string;
+  by?: string;
+  evidence?: string[];
+  batchId?: string;
+  reverses?: string;
 }): TransitionEvent {
   const event: TransitionEvent = {
     id: generateTransitionEventId(),
@@ -60,5 +68,9 @@ export function buildTransitionEvent(params: {
     source: params.source,
   };
   if (params.reason) event.reason = params.reason;
+  if (params.by) event.by = params.by;
+  if (params.evidence) event.evidence = [...params.evidence];
+  if (params.batchId) event.batchId = params.batchId;
+  if (params.reverses) event.reverses = params.reverses;
   return event;
 }

@@ -36,9 +36,9 @@ const GRAPH_STATE_VISUALS: Record<
     label: "In progress",
   },
   active: {
-    icon: "lucide-circle-play",
-    color: "var(--color-cyan, #398e9d)",
-    label: "Ready",
+    icon: "lucide-circle-arrow-right",
+    color: "var(--color-blue, #3e83c5)",
+    label: "In progress",
   },
   waiting: {
     icon: "lucide-lock",
@@ -58,7 +58,7 @@ const GRAPH_STATE_VISUALS: Record<
   idle: {
     icon: "lucide-circle",
     color: "var(--text-muted, #888888)",
-    label: "No work",
+    label: "No recorded status",
   },
 };
 
@@ -110,6 +110,52 @@ export function getOverviewDescendants<Node extends EngineNode>(
   };
   visit(node);
   return descendants;
+}
+
+export interface OverviewTransitionStep {
+  key: string;
+  parentKey: string;
+  depth: number;
+  delay: number;
+  duration: number;
+}
+
+export function planOverviewTransition<Node extends EngineNode>(
+  root: Node,
+  changed: ReadonlySet<string>,
+  rendered: ReadonlySet<string>,
+  keyOf: (node: Node) => string,
+  expanding: boolean,
+): OverviewTransitionStep[] {
+  const rootKey = keyOf(root);
+  const seen = new Set([rootKey]);
+  const queue = [{ node: root, key: rootKey, depth: 0 }];
+  const steps: OverviewTransitionStep[] = [];
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index];
+    for (const child of getOverviewChildren(current.node)) {
+      const key = keyOf(child);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const visible = rendered.has(key);
+      const depth = current.depth + (visible ? 1 : 0);
+      if (visible && changed.has(key))
+        steps.push({
+          key,
+          parentKey: current.key,
+          depth,
+          delay: 0,
+          duration: 180,
+        });
+      queue.push({ node: child, key: visible ? key : current.key, depth });
+    }
+  }
+  const maximumDepth = Math.max(1, ...steps.map((step) => step.depth));
+  const stagger = Math.min(160, 480 / maximumDepth);
+  return steps.map((step) => ({
+    ...step,
+    delay: (expanding ? step.depth - 1 : maximumDepth - step.depth) * stagger,
+  }));
 }
 
 export interface OverviewScope<Node extends EngineNode> {
@@ -363,9 +409,7 @@ export function projectOverview<Node extends EngineNode>(
   nodes: Node[],
   collapsed: ReadonlySet<Node>,
 ): { roots: Node[]; visible: Node[] } {
-  const candidates = nodes.filter(
-    (node) => !isCompensationNode(node) || node.state !== "idle",
-  );
+  const candidates = nodes;
   const available = new Set<EngineNode>(candidates);
   const incoming = new Set<EngineNode>();
   for (const node of candidates) {

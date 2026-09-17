@@ -1,52 +1,64 @@
-# Task Management (Obsidian Base Board)
+# Maintaining Dustin's Work Graph
 
-This repository uses the [Base Board](https://github.com/mderazon/obsidian-base-board) Obsidian plugin to manage tasks via Kanban boards. The Kanban board is purely a visual layer on top of standard markdown files and frontmatter.
+This is an editable agent playbook, not a workflow engine. Use
+[GRAPH_SEMANTICS_SPEC.md](GRAPH_SEMANTICS_SPEC.md) for data meanings and
+[GRAPH_AGENT_MCP_PLAN.md](GRAPH_AGENT_MCP_PLAN.md) for local commands.
 
-When instructed to "create a task", "update a task", or "move a task", you must directly create or edit standard Markdown files in the designated tasks folder and manage their YAML frontmatter.
+## Interpret an Update
 
-### Understanding the Board Schema
+1. Read the active Base configuration, named notes, recent history, and relevant
+   evidence. Use stable IDs/full paths; distinguish duplicate titles.
+2. Separate observed activity from planned work, suggestions, unresolved issues,
+   and decisions. Preserve the user's exact uncertainty.
+3. Name only the records and fields supported by the update. Starting one item
+   does not prove predecessors completed; failure does not prove successors are
+   cancelled. Containers can have independent assertions.
+4. Keep detailed domain reasoning in Markdown. Add queryable fields only when
+   a view needs them. Never invent an approval or historical timestamp.
+5. Query fresh revisions, propose a small explicit batch with attribution,
+   reason and evidence, inspect its before/after preview, then apply within the
+   user's graph-maintenance authorization. Requery and verify the result.
 
-Before creating or moving a task, you should **first locate and read the `.base` file** for the active board in this repository.
-This configuration file dictates the **exact frontmatter property name** used for columns (e.g., `status`, `stage`) and the **exact string values** allowed for those columns (e.g., `Todo`, `In Progress`, `Done`).
+## Partial Progress and Decisions
 
-**Never guess the column names, property keys, or status values.** Always use the precise strings defined in the board's `.base` configuration.
+For "Stage is mostly deployed and sufficiently baked, but west is broken;
+promote Canary": keep Stage incomplete, retain/create the residual issue only
+when the update authorizes it, and record the promotion rationale/evidence on
+Canary or in a linked note. An action-specific assessment may be satisfied or
+waived only when that assessment was actually stated. Set Canary In Progress
+without changing other statuses. Do not insert a mandatory approval node.
 
-### Creating a Task
+Retries and parallel activities can coexist. Record a new attempt in Markdown,
+an explicit retry note, or appropriate custom metadata; do not reset an entire
+branch or rewrite older outcomes to make a neat progression.
 
-To create a new task:
+## Suggested Next
 
-1. Create a new markdown file named after the task title (e.g., `Tasks/Task Title.md`).
-2. Include the YAML frontmatter at the top of the file, populating the properties according to the exact schema found in the `.base` file:
+Suggestions are persisted `suggested_next` entries with scope, rank, reason,
+author, timestamp, and evidence. Explain why the item is useful next. They do
+not exclude concurrent work or expire automatically. Remove/reorder entries
+explicitly, using a reviewed batch when more than one note is affected.
+Never promote an old daily-priority bucket or a dependency graph into fresh
+recommendations without contextual review.
 
-```yaml
----
-status: Todo
-order: 1
----
-```
+Recovery links can motivate suggestions. Do not mark recovery active, hide it,
+or declare it complete merely because another task failed or recovered.
 
-3. Add any task details, checklists, or descriptions in the markdown body below the frontmatter.
+## Conflicts and Corrections
 
-### Moving a Task / Changing Status
+On a revision conflict, reread the note and revise the proposal; do not force
+the old content over a new edit. Undo uses a field-level inverse and appends
+reversal history. Preserve failures and partial receipts. For uncertain legacy
+dependencies/container statuses, retain the migration's source values and flag
+the issue until Dustin or new evidence resolves it.
 
-If you are asked to move a task to a different column:
+Before migration, produce an inventory and verified backups of notes, Bases,
+and plugin data. Use the native app path for an open vault. Do not use browser
+tests to mutate real notes. Do not infer history from file timestamps.
 
-1. Open the specific task's markdown file.
-2. Update the appropriate frontmatter property (e.g., `status`) to match the exact exact spelling and casing of the new column as defined in the `.base` configuration.
-3. (Optional) If asked to prioritize it, adjust the `order` property so it appears at the top (lower number = higher up).
+## Production Is Separate
 
-### Example
-
-If the `.base` file dictates the board is grouped by `status` with available columns `[Todo, In Progress, Done]`, and the user says: "Create a critical task to fix the login bug and set it to In Progress."
-
-You should create the Markdown file:
-
-```markdown
----
-status: In Progress
-priority: High
-order: 1
----
-
-Investigate the login bug happening on production.
-```
+A graph update, recommendation, status, or assessment is not permission to
+deploy, change flags, push code, or merge a PR. Apply the production system's
+normal authorization and safeguards separately. No hosted model, scheduler,
+or new MCP service is needed to maintain this graph from VS Code.
